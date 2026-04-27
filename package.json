@@ -7,9 +7,9 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "db:generate": "wrangler d1 migrations create danvers_opportunity_agent",
-    "migrate:local": "wrangler d1 migrations apply danvers_opportunity_agent --local",
-    "migrate:remote": "wrangler d1 migrations apply danvers_opportunity_agent --remote"
+    "db:generate": "wrangler d1 migrations create OPPORTUNITY",
+    "migrate:local": "wrangler d1 migrations apply OPPORTUNITY --local",
+    "migrate:remote": "wrangler d1 migrations apply OPPORTUNITY --remote"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260416.0",
@@ -17,4 +17,3 @@
     "wrangler": "^4.13.2"
   }
 }
-
