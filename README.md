@@ -64,6 +64,7 @@ npm run migrate:local
 - `GET /api/summary` returns the current dashboard summary metrics.
 - `GET /api/sites` returns the current watchlist dataset.
 - `GET /api/signals` returns the live agenda signal feed.
+- `GET /api/briefs` returns lightweight case briefs derived from agenda postings and simple packet parsing.
 - `GET /ingest-info` shows current ingestion readiness.
 - `POST /ingest` currently returns a `501` response until queue and database bindings are configured.
 - A weekday cron trigger is enabled and writes a log entry for now.

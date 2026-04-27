@@ -41,6 +41,29 @@ interface AgendaSignal {
   source: string;
 }
 
+interface CaseBrief {
+  id: string;
+  board: AgendaSignal["board"];
+  meetingDate: string;
+  title: string;
+  agendaUrl: string;
+  likelySite: string;
+  addresses: string[];
+  signalType: string;
+  rationale: string;
+  confidence: "high" | "medium" | "low";
+  source: string;
+}
+
+interface DashboardPayload {
+  generatedAt: string;
+  summary: SummaryMetric[];
+  sites: OpportunitySite[];
+  activity: ActivityItem[];
+  signals: AgendaSignal[];
+  briefs: CaseBrief[];
+}
+
 const AGENDA_CENTER_URL = "https://www.danversma.gov/AgendaCenter";
 
 const SITES: OpportunitySite[] = [
@@ -126,13 +149,13 @@ const ACTIVITIES: ActivityItem[] = [
   },
   {
     time: "09:15",
-    title: "Structured data model added",
-    detail: "The dashboard now runs off reusable site records and summary calculations instead of hard-coded tiles.",
+    title: "Source connector added",
+    detail: "The dashboard now pulls Planning Board and ZBA agenda postings directly from the Danvers Agenda Center.",
   },
   {
     time: "Next",
-    title: "Source enrichment",
-    detail: "Planning Board and ZBA agenda postings are now the first live source feed. The next step is extracting site-level details from those packets.",
+    title: "Case extraction layer",
+    detail: "This build attempts lightweight packet parsing so staff can see likely sites and project clues, not just meeting titles.",
   },
 ];
 
@@ -171,6 +194,7 @@ function buildStatusPayload() {
         api: true,
         dashboard: true,
         agendaSignals: true,
+        caseExtraction: true,
         scheduledChecks: true,
         database: false,
         queue: false,
@@ -192,10 +216,61 @@ function normalizeWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function buildSummaryMetrics(sites: OpportunitySite[], signals: AgendaSignal[]): SummaryMetric[] {
+function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+function formatSignalType(text: string): string {
+  const lowered = text.toLowerCase();
+  if (lowered.includes("mixed-use")) return "mixed-use redevelopment";
+  if (lowered.includes("special permit")) return "special permit";
+  if (lowered.includes("variance")) return "variance request";
+  if (lowered.includes("site plan")) return "site plan review";
+  if (lowered.includes("sign")) return "signage change";
+  return "board filing";
+}
+
+function inferRationale(signal: AgendaSignal, addresses: string[], packetText: string): string {
+  const lowered = `${signal.title} ${packetText}`.toLowerCase();
+
+  if (lowered.includes("mixed-use")) {
+    return "Packet text points to a mixed-use or adaptive reuse concept that could affect downtown or corridor development strategy.";
+  }
+  if (lowered.includes("special permit")) {
+    return "Special permit language suggests a live land-use action worth staff review for timing, zoning path, and fiscal implications.";
+  }
+  if (lowered.includes("variance")) {
+    return "Variance language signals a site-specific development constraint or design change that may indicate a more active property.";
+  }
+  if (addresses.length) {
+    return "The agenda packet appears to reference a specific address, which makes this a stronger candidate for site-level review.";
+  }
+  return "Board posting is live, but the packet parser only found limited structured clues, so this item still needs manual review.";
+}
+
+function inferConfidence(addresses: string[], packetText: string): CaseBrief["confidence"] {
+  if (addresses.length >= 2) return "high";
+  if (addresses.length === 1 || packetText.toLowerCase().includes("special permit")) return "medium";
+  return "low";
+}
+
+function extractAddresses(text: string): string[] {
+  const matches = text.match(/\b\d{1,5}\s+[A-Z][A-Za-z0-9.'-]*(?:\s+[A-Z][A-Za-z0-9.'-]*){0,4}\s+(?:Street|St|Road|Rd|Avenue|Ave|Lane|Ln|Drive|Dr|Boulevard|Blvd|Way|Court|Ct|Terrace|Ter|Place|Pl|Highway|Hwy|Circle|Cir)\b/g) ?? [];
+  const deduped = Array.from(new Set(matches.map((value) => normalizeWhitespace(value))));
+  return deduped.slice(0, 4);
+}
+
+function buildSummaryMetrics(
+  sites: OpportunitySite[],
+  signals: AgendaSignal[],
+  briefs: CaseBrief[],
+): SummaryMetric[] {
   const advancing = sites.filter((site) => site.readiness === "Advancing").length;
   const averageScore = Math.round(sites.reduce((sum, site) => sum + site.score, 0) / sites.length);
-  const corridors = new Set(sites.map((site) => site.corridor)).size;
+  const confidentBriefs = briefs.filter((brief) => brief.confidence !== "low").length;
 
   return [
     {
@@ -211,14 +286,14 @@ function buildSummaryMetrics(sites: OpportunitySite[], signals: AgendaSignal[]):
       tone: "cool",
     },
     {
-      label: "Advancing",
-      value: String(advancing),
-      detail: "opportunities with clearer near-term action paths",
+      label: "Case Briefs",
+      value: String(confidentBriefs),
+      detail: "items with at least one stronger clue from packet text or address patterns",
     },
     {
       label: "Average Score",
       value: String(averageScore),
-      detail: `${corridors} corridors represented in the current watchlist`,
+      detail: `${advancing} current watchlist items marked advancing`,
     },
   ];
 }
@@ -366,13 +441,66 @@ async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
   }
 }
 
-function buildDashboardPayload(signals: AgendaSignal[]) {
+async function fetchPacketText(url: string): Promise<string> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
+      },
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      return "";
+    }
+
+    const bytes = await response.arrayBuffer();
+    const decoded = new TextDecoder("latin1").decode(bytes);
+    return normalizeWhitespace(decoded);
+  } catch {
+    return "";
+  }
+}
+
+async function buildCaseBriefs(signals: AgendaSignal[]): Promise<CaseBrief[]> {
+  const briefs = await Promise.all(
+    signals.slice(0, 6).map(async (signal) => {
+      const packetText = await fetchPacketText(signal.agendaUrl);
+      const addresses = extractAddresses(packetText);
+      const likelySite = addresses[0] ?? `${signal.board} agenda item`;
+      const titleAndPacket = normalizeWhitespace(`${signal.title} ${packetText}`);
+
+      return {
+        id: slugify(`${signal.board}-${signal.meetingDate}-${signal.title}`),
+        board: signal.board,
+        meetingDate: signal.meetingDate,
+        title: signal.title,
+        agendaUrl: signal.agendaUrl,
+        likelySite,
+        addresses,
+        signalType: formatSignalType(titleAndPacket),
+        rationale: inferRationale(signal, addresses, packetText),
+        confidence: inferConfidence(addresses, packetText),
+        source: signal.source,
+      };
+    }),
+  );
+
+  return briefs;
+}
+
+async function buildDashboardPayload(signals: AgendaSignal[]): Promise<DashboardPayload> {
+  const briefs = await buildCaseBriefs(signals);
   return {
     generatedAt: new Date().toISOString(),
-    summary: buildSummaryMetrics(SITES, signals),
+    summary: buildSummaryMetrics(SITES, signals, briefs),
     sites: SITES,
     activity: ACTIVITIES,
     signals,
+    briefs,
   };
 }
 
@@ -426,7 +554,29 @@ function renderSignalMarkup(signals: AgendaSignal[]): string {
     .join("");
 }
 
-function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): string {
+function renderBriefMarkup(briefs: CaseBrief[]): string {
+  return briefs
+    .map(
+      (brief) => `
+        <li class="brief-item">
+          <div class="brief-topline">
+            <span>${escapeHtml(brief.board)}</span>
+            <span>${escapeHtml(brief.confidence)}</span>
+          </div>
+          <p class="brief-site">${escapeHtml(brief.likelySite)}</p>
+          <p class="brief-type">${escapeHtml(brief.signalType)}</p>
+          <p class="brief-rationale">${escapeHtml(brief.rationale)}</p>
+          <div class="brief-meta">
+            <span>${escapeHtml(brief.meetingDate)}</span>
+            <a href="${escapeHtml(brief.agendaUrl)}" target="_blank" rel="noreferrer">Open agenda</a>
+          </div>
+        </li>
+      `,
+    )
+    .join("");
+}
+
+function renderDashboard(payload: DashboardPayload): string {
   const generatedAt = new Date(payload.generatedAt).toLocaleString("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
@@ -658,6 +808,7 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
       }
 
       .watchlist,
+      .briefs,
       .signals,
       .activity,
       .insight-band {
@@ -758,6 +909,7 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
         gap: 16px;
       }
 
+      .brief-list,
       .signal-list,
       .activity-list {
         display: grid;
@@ -767,12 +919,14 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
         list-style: none;
       }
 
+      .brief-item,
       .signal-item,
       .activity-item {
         padding-top: 14px;
         border-top: 1px solid var(--line);
       }
 
+      .brief-topline,
       .signal-meta {
         display: flex;
         justify-content: space-between;
@@ -783,6 +937,31 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
         letter-spacing: 0.04em;
       }
 
+      .brief-site {
+        margin: 8px 0 0;
+        font-size: 1.05rem;
+      }
+
+      .brief-type {
+        margin: 6px 0 0;
+        color: var(--accent);
+      }
+
+      .brief-rationale,
+      .signal-source {
+        margin: 8px 0 0;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      .brief-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin-top: 10px;
+        font-size: 0.92rem;
+      }
+
       .signal-link {
         display: block;
         margin-top: 8px;
@@ -790,14 +969,9 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
         line-height: 1.45;
       }
 
-      .signal-link:hover {
+      .signal-link:hover,
+      .brief-meta a:hover {
         color: var(--accent);
-      }
-
-      .signal-source {
-        margin: 8px 0 0;
-        color: var(--muted);
-        font-size: 0.92rem;
       }
 
       .activity-item {
@@ -947,6 +1121,7 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
             <a class="nav-item" href="/api/summary">Summary API</a>
             <a class="nav-item" href="/api/sites">Sites API</a>
             <a class="nav-item" href="/api/signals">Signals API</a>
+            <a class="nav-item" href="/api/briefs">Case Briefs API</a>
             <a class="nav-item" href="/api/status">System Status</a>
           </nav>
         </div>
@@ -961,13 +1136,13 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
             <p class="eyebrow">Staff Dashboard</p>
             <h2>See where change may be becoming opportunity.</h2>
             <p>
-              This version now includes one live public source feed from Danvers itself. The watchlist is still seeded,
-              but the dashboard now surfaces current Planning Board and ZBA postings that can feed future site-level review.
+              This version now includes one live public source feed from Danvers itself plus a lightweight case-extraction layer.
+              The tool is beginning to move from meeting notices toward site-specific review leads.
             </p>
           </div>
           <div class="topbar-meta">
             <div>Worker name: <strong>opportunity</strong></div>
-            <div>Mode: dashboard plus live agenda signals</div>
+            <div>Mode: dashboard plus case briefs</div>
             <div>Data store: seeded watchlist, live public feed</div>
           </div>
         </header>
@@ -982,7 +1157,7 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
               <div>
                 <p class="eyebrow">Watchlist</p>
                 <h3>Current review lanes</h3>
-                <p>The controls below let staff narrow the list by corridor, status, or keyword while source detail work is still underway.</p>
+                <p>The controls below let staff narrow the list by corridor, status, or keyword while the source-matching layer matures.</p>
               </div>
               <span class="status-pill">Explainable alerts only</span>
             </div>
@@ -1015,6 +1190,19 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
           </div>
 
           <div class="side-stack">
+            <section class="panel briefs">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Case Briefs</p>
+                  <h3>Likely site signals</h3>
+                  <p>These briefs combine live agenda postings with simple packet parsing to pull out likely locations and project types.</p>
+                </div>
+              </div>
+              <ul id="brief-list" class="brief-list">
+                ${renderBriefMarkup(payload.briefs)}
+              </ul>
+            </section>
+
             <section class="panel signals">
               <div class="panel-head">
                 <div>
@@ -1045,20 +1233,20 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
 
         <section class="panel insight-band" style="margin-top:16px;">
           <p class="eyebrow">Decision Support</p>
-          <h3>What this first connector unlocks</h3>
-          <p>Danvers now has a live feed of development-relevant public meeting postings. The next step is turning agenda packets into site-specific, explainable alerts.</p>
+          <h3>What this next layer unlocks</h3>
+          <p>Danvers now has not only a live feed of development-relevant public meetings, but also first-pass briefs that can be triaged into parcels, corridors, and follow-up actions.</p>
           <div class="insight-grid">
             <div class="insight">
-              <strong>Signal Intake</strong>
-              <p>Use board postings as a regular early-warning layer for redevelopment proposals, variance requests, and corridor change.</p>
+              <strong>Early Read</strong>
+              <p>Board packets can now be screened for address-like patterns and common land-use terms before staff opens every file manually.</p>
             </div>
             <div class="insight">
               <strong>Targeting</strong>
-              <p>Link agenda items to parcels and corridors once packet-level parsing is added, starting with Planning Board and ZBA cases.</p>
+              <p>Likely sites and project types create a cleaner bridge to future parcel matching, D1 storage, and explainable alert scoring.</p>
             </div>
             <div class="insight">
               <strong>Town Action</strong>
-              <p>Give staff a clearer rhythm for what to watch, when to intervene, and where local policy or infrastructure action could matter.</p>
+              <p>Staff can begin sorting which postings are merely administrative and which may deserve zoning, infrastructure, or redevelopment attention.</p>
             </div>
           </div>
         </section>
@@ -1073,6 +1261,7 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
       const corridorFilter = document.getElementById("corridor-filter");
       const statusFilter = document.getElementById("status-filter");
       const signalList = document.getElementById("signal-list");
+      const briefList = document.getElementById("brief-list");
 
       function escapeHtml(value) {
         return value
@@ -1123,6 +1312,18 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
         }).join("");
       }
 
+      function renderBriefs(briefs) {
+        briefList.innerHTML = briefs.map((brief) => {
+          return '<li class="brief-item">' +
+            '<div class="brief-topline"><span>' + escapeHtml(brief.board) + '</span><span>' + escapeHtml(brief.confidence) + '</span></div>' +
+            '<p class="brief-site">' + escapeHtml(brief.likelySite) + '</p>' +
+            '<p class="brief-type">' + escapeHtml(brief.signalType) + '</p>' +
+            '<p class="brief-rationale">' + escapeHtml(brief.rationale) + '</p>' +
+            '<div class="brief-meta"><span>' + escapeHtml(brief.meetingDate) + '</span><a href="' + escapeHtml(brief.agendaUrl) + '" target="_blank" rel="noreferrer">Open agenda</a></div>' +
+          '</li>';
+        }).join("");
+      }
+
       function applyFilters() {
         const term = searchInput.value.trim().toLowerCase();
         const corridor = corridorFilter.value;
@@ -1144,6 +1345,7 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
       populateFilters(initialData.sites);
       renderRows(initialData.sites);
       renderSignals(initialData.signals);
+      renderBriefs(initialData.briefs);
 
       searchInput.addEventListener("input", applyFilters);
       corridorFilter.addEventListener("change", applyFilters);
@@ -1160,6 +1362,18 @@ function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): str
         .catch(() => {
           // Keep the server-rendered signal list in place if refresh fails.
         });
+
+      fetch("/api/briefs")
+        .then((response) => response.json())
+        .then((data) => {
+          if (Array.isArray(data.briefs)) {
+            initialData.briefs = data.briefs;
+            renderBriefs(initialData.briefs);
+          }
+        })
+        .catch(() => {
+          // Keep the server-rendered case briefs in place if refresh fails.
+        });
     </script>
   </body>
 </html>`;
@@ -1171,7 +1385,8 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/") {
       const signals = await fetchAgendaSignals();
-      return new Response(renderDashboard(buildDashboardPayload(signals)), {
+      const payload = await buildDashboardPayload(signals);
+      return new Response(renderDashboard(payload), {
         headers: {
           "content-type": "text/html; charset=utf-8",
         },
@@ -1189,14 +1404,6 @@ export default {
       });
     }
 
-    if (request.method === "GET" && url.pathname === "/api/summary") {
-      const signals = await fetchAgendaSignals();
-      return Response.json({
-        summary: buildSummaryMetrics(SITES, signals),
-        updatedAt: new Date().toISOString(),
-      });
-    }
-
     if (request.method === "GET" && url.pathname === "/api/signals") {
       const signals = await fetchAgendaSignals();
       return Response.json({
@@ -1206,12 +1413,31 @@ export default {
       });
     }
 
+    if (request.method === "GET" && url.pathname === "/api/briefs") {
+      const signals = await fetchAgendaSignals();
+      const briefs = await buildCaseBriefs(signals);
+      return Response.json({
+        briefs,
+        source: AGENDA_CENTER_URL,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/summary") {
+      const signals = await fetchAgendaSignals();
+      const briefs = await buildCaseBriefs(signals);
+      return Response.json({
+        summary: buildSummaryMetrics(SITES, signals, briefs),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
     if (request.method === "GET" && url.pathname === "/ingest-info") {
       return Response.json(
         {
           enabled: false,
           detail: "Queue and database bindings are not configured yet.",
-          nextStep: "Attach D1 and extract site-level details from Planning Board and ZBA agenda packets.",
+          nextStep: "Attach D1 and persist case briefs, then map briefs to parcels and corridors.",
         },
         { status: 200 },
       );
