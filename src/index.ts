@@ -1,4 +1,5 @@
 import {
+  listParcelReviewQueue,
   matchAndPersistOpportunities,
   upsertParcels,
   type OpportunityParcelInput,
@@ -1686,6 +1687,26 @@ export default {
         matched: results.filter((result) => result.matchType !== "no_match").length,
         reviewNeeded: results.filter((result) => result.needsReview).length,
         results,
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opportunities/review") {
+      if (!env.OPPORTUNITYDB) {
+        return missingDatabaseResponse();
+      }
+
+      const limitParam = Number(url.searchParams.get("limit") ?? "25");
+      const needsReviewOnly = url.searchParams.get("needsReviewOnly") !== "false";
+      const queue = await listParcelReviewQueue(env.OPPORTUNITYDB, {
+        limit: Number.isFinite(limitParam) ? limitParam : 25,
+        needsReviewOnly,
+      });
+
+      return Response.json({
+        ok: true,
+        count: queue.length,
+        needsReviewOnly,
+        results: queue,
       });
     }
 
