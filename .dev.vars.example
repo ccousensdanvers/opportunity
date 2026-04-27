@@ -1,0 +1,6 @@
+# Copy this file to .dev.vars for local development.
+
+APP_ENV=development
+ALERT_THRESHOLD=70
+SOURCE_USER_AGENT=danvers-opportunity-agent/0.1
+
