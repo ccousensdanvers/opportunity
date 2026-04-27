@@ -52,20 +52,21 @@ interface MatchRule {
 
 export interface ParcelReviewItem {
   opportunityId: string;
-  parcelId: number;
-  matchType: Exclude<ParcelMatchType, "no_match">;
+  parcelId: number | null;
+  matchType: ParcelMatchType;
   confidence: number;
   inputValue: string | null;
   matchedValue: string | null;
   needsReview: boolean;
   createdAt: string;
   updatedAt: string;
+  input: OpportunityParcelInput;
   parcel: {
     mapLot: string | null;
     address: string | null;
     ownerName: string | null;
     zoningDistrict: string | null;
-  };
+  } | null;
 }
 
 const ADDRESS_SYNONYMS: Record<string, string> = {
@@ -285,6 +286,12 @@ function buildMatchRules(input: OpportunityParcelInput): MatchRule[] {
   ];
 }
 
+function buildNoMatchInputValue(input: OpportunityParcelInput): string | null {
+  return normalizeMapLot(input.mapLot)
+    ?? normalizeAddress(input.address)
+    ?? normalizeOwnerName(input.ownerName);
+}
+
 export async function matchOpportunityToParcel(
   db: D1Database,
   input: OpportunityParcelInput,
@@ -323,7 +330,7 @@ export async function matchOpportunityToParcel(
     parcelId: null,
     matchType: "no_match",
     confidence: 0,
-    inputValue: null,
+    inputValue: buildNoMatchInputValue(input),
     matchedValue: null,
     needsReview: true,
   };
@@ -334,10 +341,6 @@ export async function matchAndPersistOpportunity(
   input: OpportunityParcelInput,
 ): Promise<ParcelMatchResult> {
   const match = await matchOpportunityToParcel(db, input);
-
-  if (!match.parcelId) {
-    return match;
-  }
 
   await db
     .prepare(
@@ -350,8 +353,9 @@ export async function matchAndPersistOpportunity(
         input_value,
         matched_value,
         needs_review,
+        raw_input_json,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(opportunity_id) DO UPDATE SET
         parcel_id = excluded.parcel_id,
         match_type = excluded.match_type,
@@ -359,6 +363,7 @@ export async function matchAndPersistOpportunity(
         input_value = excluded.input_value,
         matched_value = excluded.matched_value,
         needs_review = excluded.needs_review,
+        raw_input_json = excluded.raw_input_json,
         updated_at = CURRENT_TIMESTAMP
       `,
     )
@@ -370,6 +375,7 @@ export async function matchAndPersistOpportunity(
       match.inputValue,
       match.matchedValue,
       match.needsReview ? 1 : 0,
+      JSON.stringify(input),
     )
     .run();
 
@@ -409,6 +415,7 @@ export async function listParcelReviewQueue(
           m.input_value AS inputValue,
           m.matched_value AS matchedValue,
           m.needs_review AS needsReview,
+          m.raw_input_json AS rawInputJson,
           m.created_at AS createdAt,
           m.updated_at AS updatedAt,
           p.map_lot AS mapLot,
@@ -416,7 +423,7 @@ export async function listParcelReviewQueue(
           p.owner_name AS ownerName,
           p.zoning_district AS zoningDistrict
         FROM opportunity_parcel_matches m
-        JOIN parcels p ON p.id = m.parcel_id
+        LEFT JOIN parcels p ON p.id = m.parcel_id
         ORDER BY
           m.needs_review DESC,
           m.confidence ASC,
@@ -434,6 +441,7 @@ export async function listParcelReviewQueue(
           m.input_value AS inputValue,
           m.matched_value AS matchedValue,
           m.needs_review AS needsReview,
+          m.raw_input_json AS rawInputJson,
           m.created_at AS createdAt,
           m.updated_at AS updatedAt,
           p.map_lot AS mapLot,
@@ -441,7 +449,7 @@ export async function listParcelReviewQueue(
           p.owner_name AS ownerName,
           p.zoning_district AS zoningDistrict
         FROM opportunity_parcel_matches m
-        JOIN parcels p ON p.id = m.parcel_id
+        LEFT JOIN parcels p ON p.id = m.parcel_id
         WHERE m.needs_review = 1
         ORDER BY
           m.confidence ASC,
@@ -452,12 +460,13 @@ export async function listParcelReviewQueue(
 
   const { results } = await statement.bind(limit).all<{
     opportunityId: string;
-    parcelId: number;
-    matchType: Exclude<ParcelMatchType, "no_match">;
+    parcelId: number | null;
+    matchType: ParcelMatchType;
     confidence: number;
     inputValue: string | null;
     matchedValue: string | null;
     needsReview: number;
+    rawInputJson: string;
     createdAt: string;
     updatedAt: string;
     mapLot: string | null;
@@ -476,11 +485,14 @@ export async function listParcelReviewQueue(
     needsReview: Boolean(row.needsReview),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
-    parcel: {
-      mapLot: row.mapLot,
-      address: row.address,
-      ownerName: row.ownerName,
-      zoningDistrict: row.zoningDistrict,
-    },
+    input: JSON.parse(row.rawInputJson) as OpportunityParcelInput,
+    parcel: row.parcelId
+      ? {
+          mapLot: row.mapLot,
+          address: row.address,
+          ownerName: row.ownerName,
+          zoningDistrict: row.zoningDistrict,
+        }
+      : null,
   }));
 }
