@@ -49,7 +49,7 @@ npm run dev
 
 4. Create the D1 database and queue resources once you are ready to enable persistence and background ingestion.
 
-5. Re-enable the `d1_databases` and `queues` bindings in `wrangler.jsonc`, then apply migrations:
+5. Add the real `OPPORTUNITYDB` D1 binding values in `wrangler.jsonc`, then apply migrations:
 
 ```bash
 npm run migrate:local
@@ -66,7 +66,9 @@ npm run migrate:local
 - `GET /api/signals` returns the live agenda signal feed.
 - `GET /api/briefs` returns lightweight case briefs derived from agenda postings and simple packet parsing.
 - `GET /ingest-info` shows current ingestion readiness.
-- `POST /ingest` currently returns a `501` response until queue and database bindings are configured.
+- `POST /api/parcels/upsert` upserts parcel records and parcel aliases into D1.
+- `POST /api/opportunities/match` matches opportunity records to parcels and stores the result in D1.
+- `POST /ingest` records a manual ingestion run when D1 is configured.
 - A weekday cron trigger is enabled and writes a log entry for now.
 
 ## Initial Priorities
