@@ -77,6 +77,34 @@ interface DashboardPayload {
 }
 
 const AGENDA_CENTER_URL = "https://www.danversma.gov/AgendaCenter";
+const DANVERS_PARCELS_LAYER_URL =
+  "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
+const DANVERS_PARCELS_PAGE_SIZE = 1000;
+
+interface DanversParcelAttributes {
+  MAP_PAR_ID?: string | null;
+  GIS_ID?: string | null;
+  Location?: string | null;
+  StreetName?: string | null;
+  LUCDescription?: string | null;
+  YearBuilt?: string | null;
+}
+
+interface DanversParcelFeature {
+  attributes?: DanversParcelAttributes;
+}
+
+interface DanversParcelQueryResponse {
+  features?: DanversParcelFeature[];
+  exceededTransferLimit?: boolean;
+}
+
+interface IngestRunSummary {
+  parcelsIngested: number;
+  opportunitiesPrepared: number;
+  matched: number;
+  reviewNeeded: number;
+}
 
 const SITES: OpportunitySite[] = [
   {
@@ -195,6 +223,45 @@ function buildIngestMessage(trigger: IngestTrigger): IngestMessage {
   };
 }
 
+async function startIngestionRun(
+  db: D1Database,
+  trigger: IngestTrigger,
+): Promise<number | null> {
+  const result = await db
+    .prepare(
+      `
+      INSERT INTO ingestion_runs (trigger, requested_at, status)
+      VALUES (?, ?, ?)
+      `,
+    )
+    .bind(trigger, new Date().toISOString(), "accepted")
+    .run();
+
+  const runId = Number((result as { meta?: { last_row_id?: number } }).meta?.last_row_id);
+  return Number.isFinite(runId) ? runId : null;
+}
+
+async function finishIngestionRun(
+  db: D1Database,
+  runId: number | null,
+  status: "completed" | "failed",
+): Promise<void> {
+  if (!runId) {
+    return;
+  }
+
+  await db
+    .prepare(
+      `
+      UPDATE ingestion_runs
+      SET status = ?
+      WHERE id = ?
+      `,
+    )
+    .bind(status, runId)
+    .run();
+}
+
 function buildStatusPayload(env?: Env) {
   return {
     service: "danvers-opportunity-agent",
@@ -229,6 +296,28 @@ function missingDatabaseResponse() {
 
 async function readJson<T>(request: Request): Promise<T> {
   return (await request.json()) as T;
+}
+
+async function fetchJson<T>(url: string, timeoutMs = 8000): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Request failed with ${response.status}`);
+    }
+
+    return (await response.json()) as T;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function escapeHtml(value: string): string {
@@ -689,6 +778,113 @@ async function buildCaseBriefs(signals: AgendaSignal[]): Promise<CaseBrief[]> {
   );
 
   return briefs;
+}
+
+function buildDanversParcelQueryUrl(resultOffset: number): string {
+  const params = new URLSearchParams({
+    where: "1=1",
+    returnGeometry: "false",
+    outFields: "MAP_PAR_ID,GIS_ID,Location,StreetName,LUCDescription,YearBuilt",
+    orderByFields: "OBJECTID ASC",
+    resultOffset: String(resultOffset),
+    resultRecordCount: String(DANVERS_PARCELS_PAGE_SIZE),
+    f: "json",
+  });
+
+  return `${DANVERS_PARCELS_LAYER_URL}?${params.toString()}`;
+}
+
+function buildParcelAliases(attributes: DanversParcelAttributes): ParcelUpsertInput["aliases"] {
+  const aliases: NonNullable<ParcelUpsertInput["aliases"]> = [];
+
+  if (attributes.GIS_ID) {
+    aliases.push({ type: "map_lot", value: attributes.GIS_ID, confidence: 0.9 });
+  }
+
+  if (attributes.StreetName && attributes.Location && attributes.Location !== attributes.StreetName) {
+    aliases.push({ type: "address", value: attributes.StreetName, confidence: 0.5 });
+  }
+
+  return aliases.length ? aliases : undefined;
+}
+
+function mapDanversParcelFeatureToInput(feature: DanversParcelFeature): ParcelUpsertInput | null {
+  const attributes = feature.attributes;
+  const mapLot = attributes?.MAP_PAR_ID?.trim();
+
+  if (!mapLot) {
+    return null;
+  }
+
+  return {
+    mapLot,
+    address: attributes.Location?.trim() || attributes.StreetName?.trim() || null,
+    aliases: buildParcelAliases(attributes),
+  };
+}
+
+async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
+  const parcels: ParcelUpsertInput[] = [];
+  const seenMapLots = new Set<string>();
+  let resultOffset = 0;
+
+  while (true) {
+    const payload = await fetchJson<DanversParcelQueryResponse>(
+      buildDanversParcelQueryUrl(resultOffset),
+      15000,
+    );
+    const features = payload.features ?? [];
+
+    for (const feature of features) {
+      const parcel = mapDanversParcelFeatureToInput(feature);
+      if (!parcel || seenMapLots.has(parcel.mapLot)) {
+        continue;
+      }
+
+      seenMapLots.add(parcel.mapLot);
+      parcels.push(parcel);
+    }
+
+    if (!payload.exceededTransferLimit || features.length === 0) {
+      break;
+    }
+
+    resultOffset += features.length;
+  }
+
+  return parcels;
+}
+
+function buildOpportunityInputsFromBriefs(briefs: CaseBrief[]): OpportunityParcelInput[] {
+  return briefs.flatMap((brief) => {
+    const addresses = brief.addresses
+      .map((address) => normalizeWhitespace(address))
+      .filter(Boolean);
+
+    return addresses.map((address, index) => ({
+      id: `${brief.id}::address-${index + 1}`,
+      address,
+    }));
+  });
+}
+
+async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
+  const parcels = await fetchDanversParcels();
+  await upsertParcels(db, parcels);
+
+  const signals = await fetchAgendaSignals();
+  const briefs = await buildCaseBriefs(signals);
+  const opportunities = buildOpportunityInputsFromBriefs(briefs);
+  const results = opportunities.length
+    ? await matchAndPersistOpportunities(db, opportunities)
+    : [];
+
+  return {
+    parcelsIngested: parcels.length,
+    opportunitiesPrepared: opportunities.length,
+    matched: results.filter((result) => result.matchType !== "no_match").length,
+    reviewNeeded: results.filter((result) => result.needsReview).length,
+  };
 }
 
 async function buildDashboardPayload(signals: AgendaSignal[]): Promise<DashboardPayload> {
@@ -1636,10 +1832,10 @@ export default {
         {
           enabled: Boolean(env.OPPORTUNITYDB),
           detail: env.OPPORTUNITYDB
-            ? "D1 binding is available for parcel ingest and parcel matching."
+            ? "D1 binding is available for automated parcel ingest and parcel matching."
             : "D1 binding is not configured yet.",
           nextStep: env.OPPORTUNITYDB
-            ? "Apply migrations, ingest parcel data, then match opportunities to parcels."
+            ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, and match them to parcels."
             : "Attach D1 and persist case briefs, then map briefs to parcels and corridors.",
         },
         { status: 200 },
@@ -1722,20 +1918,31 @@ export default {
         );
       }
 
-      await env.OPPORTUNITYDB.prepare(
-        `
-        INSERT INTO ingestion_runs (trigger, requested_at, status)
-        VALUES (?, ?, ?)
-        `,
-      )
-        .bind("manual", new Date().toISOString(), "accepted")
-        .run();
+      const runId = await startIngestionRun(env.OPPORTUNITYDB, "manual");
 
-      return Response.json({
-        accepted: true,
-        message: buildIngestMessage("manual"),
-        detail: "Manual ingest request recorded in D1.",
-      });
+      try {
+        const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
+
+        return Response.json({
+          accepted: true,
+          message: buildIngestMessage("manual"),
+          detail:
+            "Manual ingest completed: Danvers parcels refreshed, case briefs rebuilt, and opportunities matched.",
+          summary,
+        });
+      } catch (error) {
+        await finishIngestionRun(env.OPPORTUNITYDB, runId, "failed");
+
+        return Response.json(
+          {
+            accepted: false,
+            message: buildIngestMessage("manual"),
+            error: error instanceof Error ? error.message : "Ingest failed.",
+          },
+          { status: 500 },
+        );
+      }
     }
 
     return new Response("Not Found", { status: 404 });
@@ -1745,14 +1952,36 @@ export default {
     const timestamp = new Date().toISOString();
 
     if (env.OPPORTUNITYDB) {
-      await env.OPPORTUNITYDB.prepare(
-        `
-        INSERT INTO ingestion_runs (trigger, requested_at, status)
-        VALUES (?, ?, ?)
-        `,
-      )
-        .bind("scheduled", timestamp, "accepted")
-        .run();
+      const runId = await startIngestionRun(env.OPPORTUNITYDB, "scheduled");
+
+      try {
+        const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
+
+        console.log(
+          JSON.stringify({
+            event: "scheduled-run",
+            cron: controller.cron,
+            at: timestamp,
+            databaseConfigured: true,
+            summary,
+          }),
+        );
+        return;
+      } catch (error) {
+        await finishIngestionRun(env.OPPORTUNITYDB, runId, "failed");
+
+        console.error(
+          JSON.stringify({
+            event: "scheduled-run-failed",
+            cron: controller.cron,
+            at: timestamp,
+            databaseConfigured: true,
+            error: error instanceof Error ? error.message : "Unknown ingest failure",
+          }),
+        );
+        throw error;
+      }
     }
 
     console.log(
