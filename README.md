@@ -41,19 +41,33 @@ npm install
 cp .dev.vars.example .dev.vars
 ```
 
-3. Create a D1 database and update `wrangler.jsonc` with its IDs.
-
-4. Run local development:
+3. Run the bootstrap Worker locally:
 
 ```bash
 npm run dev
 ```
 
-5. Apply migrations:
+4. Create the D1 database and queue resources once you are ready to enable persistence and background ingestion.
+
+5. Re-enable the `d1_databases` and `queues` bindings in `wrangler.jsonc`, then apply migrations:
 
 ```bash
 npm run migrate:local
 ```
+
+## Current Routes
+
+- `GET /` returns the internal dashboard shell.
+- The dashboard includes live client-side filtering against the Worker's site dataset.
+- The dashboard also shows a live public signal feed from Danvers Agenda Center for Planning Board and ZBA agenda postings.
+- `GET /api/status` returns the service status payload as JSON.
+- `GET /api/summary` returns the current dashboard summary metrics.
+- `GET /api/sites` returns the current watchlist dataset.
+- `GET /api/signals` returns the live agenda signal feed.
+- `GET /api/briefs` returns lightweight case briefs derived from agenda postings and simple packet parsing.
+- `GET /ingest-info` shows current ingestion readiness.
+- `POST /ingest` currently returns a `501` response until queue and database bindings are configured.
+- A weekday cron trigger is enabled and writes a log entry for now.
 
 ## Initial Priorities
 
@@ -61,4 +75,3 @@ npm run migrate:local
 - normalize changes into `events`
 - score affected `sites`
 - surface alerts in a lightweight internal dashboard
-
