@@ -1,22 +1,30 @@
 type IngestTrigger = "manual" | "scheduled";
+type SiteStatus = "Needs staff review" | "Policy setup" | "Market scan" | "Infrastructure check";
+type Readiness = "Early" | "Emerging" | "Advancing";
 
 interface IngestMessage {
   trigger: IngestTrigger;
   requestedAt: string;
 }
 
-interface DashboardMetric {
+interface OpportunitySite {
+  id: string;
+  site: string;
+  corridor: string;
+  signal: string;
+  focus: string;
+  status: SiteStatus;
+  readiness: Readiness;
+  score: number;
+  source: string;
+  updatedAt: string;
+}
+
+interface SummaryMetric {
   label: string;
   value: string;
   detail: string;
   tone?: "neutral" | "warm" | "cool";
-}
-
-interface WatchItem {
-  site: string;
-  signal: string;
-  focus: string;
-  status: string;
 }
 
 interface ActivityItem {
@@ -24,6 +32,99 @@ interface ActivityItem {
   title: string;
   detail: string;
 }
+
+const SITES: OpportunitySite[] = [
+  {
+    id: "maple-industrial-edge",
+    site: "Maple Street Industrial Edge",
+    corridor: "Industrial District",
+    signal: "ownership change watch",
+    focus: "access, parcel assembly, reuse fit",
+    status: "Needs staff review",
+    readiness: "Emerging",
+    score: 82,
+    source: "staff seed list",
+    updatedAt: "2026-04-27",
+  },
+  {
+    id: "downtown-upper-floors",
+    site: "Downtown Upper Floors",
+    corridor: "Downtown",
+    signal: "small-scale adaptive reuse",
+    focus: "code path, mixed-use economics",
+    status: "Policy setup",
+    readiness: "Early",
+    score: 68,
+    source: "downtown reuse watch",
+    updatedAt: "2026-04-27",
+  },
+  {
+    id: "route-114-retail-cluster",
+    site: "Route 114 Retail Cluster",
+    corridor: "Route 114",
+    signal: "tenant turnover",
+    focus: "tax base retention, repositioning",
+    status: "Market scan",
+    readiness: "Emerging",
+    score: 74,
+    source: "retail scan",
+    updatedAt: "2026-04-26",
+  },
+  {
+    id: "endicott-flex-space",
+    site: "Endicott Corridor Flex Space",
+    corridor: "Endicott",
+    signal: "industrial demand pressure",
+    focus: "site readiness, utilities, zoning",
+    status: "Infrastructure check",
+    readiness: "Advancing",
+    score: 79,
+    source: "industrial demand watch",
+    updatedAt: "2026-04-25",
+  },
+  {
+    id: "cabot-redevelopment-strip",
+    site: "Cabot Redevelopment Strip",
+    corridor: "Cabot",
+    signal: "underused frontage",
+    focus: "corridor image, reuse strategy, fiscal upside",
+    status: "Needs staff review",
+    readiness: "Emerging",
+    score: 77,
+    source: "corridor screening",
+    updatedAt: "2026-04-24",
+  },
+  {
+    id: "north-shore-commerce-node",
+    site: "North Shore Commerce Node",
+    corridor: "Route 128/95 Access",
+    signal: "regional demand alignment",
+    focus: "competitiveness, employer fit, visibility",
+    status: "Market scan",
+    readiness: "Advancing",
+    score: 71,
+    source: "regional comparison",
+    updatedAt: "2026-04-23",
+  },
+];
+
+const ACTIVITIES: ActivityItem[] = [
+  {
+    time: "08:30",
+    title: "Worker deployment stabilized",
+    detail: "Cloudflare Worker now serves an internal dashboard instead of a raw bootstrap response.",
+  },
+  {
+    time: "09:15",
+    title: "Initial data model added",
+    detail: "The dashboard now runs off reusable site records and summary calculations instead of hard-coded tiles.",
+  },
+  {
+    time: "Next",
+    title: "First source connector",
+    detail: "Next build should swap seeded records for one public source feed with explainable alert logic.",
+  },
+];
 
 function buildIngestMessage(trigger: IngestTrigger): IngestMessage {
   return {
@@ -50,122 +151,109 @@ function buildStatusPayload() {
   };
 }
 
-function renderDashboard(): string {
-  const generatedAt = new Date().toLocaleString("en-US", {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone: "America/New_York",
-  });
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
 
-  const metrics: DashboardMetric[] = [
+function buildSummaryMetrics(sites: OpportunitySite[]): SummaryMetric[] {
+  const freshSignals = sites.filter((site) => site.updatedAt >= "2026-04-24").length;
+  const advancing = sites.filter((site) => site.readiness === "Advancing").length;
+  const averageScore = Math.round(sites.reduce((sum, site) => sum + site.score, 0) / sites.length);
+  const corridors = new Set(sites.map((site) => site.corridor)).size;
+
+  return [
     {
       label: "Priority Sites",
-      value: "12",
-      detail: "active properties under staff watch",
+      value: String(sites.length),
+      detail: "active properties or corridor segments under review",
       tone: "warm",
     },
     {
       label: "Fresh Signals",
-      value: "4",
-      detail: "items needing review this week",
+      value: String(freshSignals),
+      detail: "records updated in the last few days",
       tone: "cool",
     },
     {
-      label: "Redevelopment Corridors",
-      value: "3",
-      detail: "Cabot, Endicott, and Route 114",
+      label: "Advancing",
+      value: String(advancing),
+      detail: "opportunities with clearer near-term action paths",
     },
     {
-      label: "Readiness",
-      value: "Bootstrap",
-      detail: "worker live, data connectors pending",
+      label: "Average Score",
+      value: String(averageScore),
+      detail: `${corridors} corridors represented in the current watchlist`,
     },
   ];
+}
 
-  const watchItems: WatchItem[] = [
-    {
-      site: "Maple Street Industrial Edge",
-      signal: "ownership change watch",
-      focus: "access, parcel assembly, reuse fit",
-      status: "Needs staff review",
-    },
-    {
-      site: "Downtown Upper Floors",
-      signal: "small-scale adaptive reuse",
-      focus: "code path, mixed-use economics",
-      status: "Policy setup",
-    },
-    {
-      site: "Route 114 Retail Cluster",
-      signal: "tenant turnover",
-      focus: "tax base retention, repositioning",
-      status: "Market scan",
-    },
-    {
-      site: "Endicott Corridor Flex Space",
-      signal: "industrial demand pressure",
-      focus: "site readiness, utilities, zoning",
-      status: "Infrastructure check",
-    },
-  ];
+function buildDashboardPayload() {
+  return {
+    generatedAt: new Date().toISOString(),
+    summary: buildSummaryMetrics(SITES),
+    sites: SITES,
+    activity: ACTIVITIES,
+  };
+}
 
-  const activities: ActivityItem[] = [
-    {
-      time: "08:30",
-      title: "Worker deployment stabilized",
-      detail: "Cloudflare Worker now serves the dashboard shell instead of a raw bootstrap response.",
-    },
-    {
-      time: "09:15",
-      title: "Migration scaffold prepared",
-      detail: "Initial tables exist for parcels, sites, events, alerts, notes, and ingestion runs.",
-    },
-    {
-      time: "Next",
-      title: "Source connector pass",
-      detail: "Next build should add one public signal feed and persist explainable alerts.",
-    },
-  ];
-
-  const metricMarkup = metrics
-    .map((metric) => {
+function renderMetricMarkup(metrics: SummaryMetric[]): string {
+  return metrics
+    .map((metric, index) => {
       const toneClass = metric.tone ? `metric metric-${metric.tone}` : "metric";
       return `
-        <section class="${toneClass}">
-          <p class="eyebrow">${metric.label}</p>
-          <p class="metric-value">${metric.value}</p>
-          <p class="metric-detail">${metric.detail}</p>
+        <section class="${toneClass}" style="animation-delay:${index * 70}ms">
+          <p class="eyebrow">${escapeHtml(metric.label)}</p>
+          <p class="metric-value">${escapeHtml(metric.value)}</p>
+          <p class="metric-detail">${escapeHtml(metric.detail)}</p>
         </section>
       `;
     })
     .join("");
+}
 
-  const watchMarkup = watchItems
-    .map(
-      (item) => `
-        <tr>
-          <td>${item.site}</td>
-          <td>${item.signal}</td>
-          <td>${item.focus}</td>
-          <td><span class="status-pill">${item.status}</span></td>
-        </tr>
-      `,
-    )
-    .join("");
-
-  const activityMarkup = activities
+function renderActivityMarkup(items: ActivityItem[]): string {
+  return items
     .map(
       (item) => `
         <li class="activity-item">
-          <p class="activity-time">${item.time}</p>
+          <p class="activity-time">${escapeHtml(item.time)}</p>
           <div>
-            <p class="activity-title">${item.title}</p>
-            <p class="activity-detail">${item.detail}</p>
+            <p class="activity-title">${escapeHtml(item.title)}</p>
+            <p class="activity-detail">${escapeHtml(item.detail)}</p>
           </div>
         </li>
       `,
     )
     .join("");
+}
+
+function renderDashboard(): string {
+  const payload = buildDashboardPayload();
+  const generatedAt = new Date(payload.generatedAt).toLocaleString("en-US", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: "America/New_York",
+  });
+
+  const initialTableRows = SITES.map(
+    (item) => `
+      <tr>
+        <td>
+          <strong>${escapeHtml(item.site)}</strong>
+          <div class="cell-subtle">${escapeHtml(item.corridor)}</div>
+        </td>
+        <td>${escapeHtml(item.signal)}</td>
+        <td>${escapeHtml(item.focus)}</td>
+        <td>${escapeHtml(String(item.score))}</td>
+        <td><span class="status-pill">${escapeHtml(item.status)}</span></td>
+      </tr>
+    `,
+  ).join("");
 
   return `<!doctype html>
 <html lang="en">
@@ -176,8 +264,8 @@ function renderDashboard(): string {
     <style>
       :root {
         --bg: #f3f1eb;
-        --surface: rgba(255, 252, 247, 0.88);
-        --surface-strong: rgba(255, 252, 247, 0.96);
+        --surface: rgba(255, 252, 247, 0.9);
+        --surface-strong: rgba(255, 252, 247, 0.97);
         --ink: #1e2321;
         --muted: #5e655f;
         --line: rgba(34, 42, 38, 0.12);
@@ -188,9 +276,7 @@ function renderDashboard(): string {
         --shadow: 0 24px 60px rgba(26, 36, 33, 0.08);
       }
 
-      * {
-        box-sizing: border-box;
-      }
+      * { box-sizing: border-box; }
 
       body {
         margin: 0;
@@ -207,6 +293,10 @@ function renderDashboard(): string {
         text-decoration: none;
       }
 
+      button, input {
+        font: inherit;
+      }
+
       .shell {
         display: grid;
         grid-template-columns: 260px minmax(0, 1fr);
@@ -219,7 +309,7 @@ function renderDashboard(): string {
         justify-content: space-between;
         padding: 32px 24px 28px;
         border-right: 1px solid var(--line);
-        background: rgba(247, 243, 236, 0.78);
+        background: rgba(247, 243, 236, 0.8);
         backdrop-filter: blur(18px);
       }
 
@@ -237,7 +327,6 @@ function renderDashboard(): string {
         background: var(--accent);
         color: #f8f5ef;
         font-size: 18px;
-        letter-spacing: 0.04em;
       }
 
       .brand h1 {
@@ -246,7 +335,9 @@ function renderDashboard(): string {
         font-weight: 600;
       }
 
-      .brand p {
+      .brand p,
+      .rail-footer,
+      .subtle {
         margin: 0;
         color: var(--muted);
         line-height: 1.5;
@@ -275,7 +366,6 @@ function renderDashboard(): string {
       .rail-footer {
         display: grid;
         gap: 8px;
-        color: var(--muted);
         font-size: 0.92rem;
       }
 
@@ -292,7 +382,7 @@ function renderDashboard(): string {
       }
 
       .topbar-copy {
-        max-width: 720px;
+        max-width: 760px;
       }
 
       .eyebrow {
@@ -305,7 +395,7 @@ function renderDashboard(): string {
 
       .topbar h2 {
         margin: 0;
-        font-size: clamp(2rem, 4vw, 3.6rem);
+        font-size: clamp(2rem, 4vw, 3.7rem);
         line-height: 0.96;
         font-weight: 600;
       }
@@ -345,18 +435,6 @@ function renderDashboard(): string {
         animation: rise 560ms ease forwards;
       }
 
-      .metric:nth-child(2) {
-        animation-delay: 70ms;
-      }
-
-      .metric:nth-child(3) {
-        animation-delay: 140ms;
-      }
-
-      .metric:nth-child(4) {
-        animation-delay: 210ms;
-      }
-
       .metric-warm {
         background: linear-gradient(180deg, rgba(175, 94, 47, 0.1), var(--surface-strong));
       }
@@ -379,7 +457,7 @@ function renderDashboard(): string {
 
       .workspace {
         display: grid;
-        grid-template-columns: minmax(0, 1.3fr) minmax(280px, 0.7fr);
+        grid-template-columns: minmax(0, 1.4fr) minmax(300px, 0.6fr);
         gap: 16px;
         align-items: start;
       }
@@ -391,8 +469,10 @@ function renderDashboard(): string {
         box-shadow: var(--shadow);
       }
 
-      .watchlist {
-        padding: 18px 20px 10px;
+      .watchlist,
+      .activity,
+      .insight-band {
+        padding: 18px 20px 20px;
       }
 
       .watchlist-head,
@@ -420,6 +500,24 @@ function renderDashboard(): string {
         line-height: 1.5;
       }
 
+      .controls {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        gap: 10px;
+        margin-bottom: 14px;
+      }
+
+      .search,
+      .select {
+        width: 100%;
+        min-height: 42px;
+        padding: 0 14px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: rgba(255, 252, 247, 0.9);
+        color: var(--ink);
+      }
+
       table {
         width: 100%;
         border-collapse: collapse;
@@ -445,6 +543,11 @@ function renderDashboard(): string {
         line-height: 1.5;
       }
 
+      .cell-subtle {
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
       .status-pill {
         display: inline-flex;
         align-items: center;
@@ -456,13 +559,14 @@ function renderDashboard(): string {
         white-space: nowrap;
       }
 
+      .empty {
+        padding: 22px 0 8px;
+        color: var(--muted);
+      }
+
       .side-stack {
         display: grid;
         gap: 16px;
-      }
-
-      .activity {
-        padding: 18px 20px;
       }
 
       .activity-list {
@@ -501,7 +605,6 @@ function renderDashboard(): string {
       }
 
       .insight-band {
-        padding: 20px;
         overflow: hidden;
         position: relative;
       }
@@ -565,9 +668,13 @@ function renderDashboard(): string {
         }
 
         .metrics,
-        .workspace,
         .insight-grid {
           grid-template-columns: 1fr 1fr;
+        }
+
+        .workspace,
+        .controls {
+          grid-template-columns: 1fr;
         }
 
         .topbar {
@@ -586,13 +693,9 @@ function renderDashboard(): string {
         }
 
         .metrics,
-        .workspace,
-        .insight-grid {
-          grid-template-columns: 1fr;
-        }
-
+        .insight-grid,
         .nav-group {
-          grid-template-columns: 1fr 1fr;
+          grid-template-columns: 1fr;
         }
 
         .activity-item {
@@ -620,16 +723,15 @@ function renderDashboard(): string {
           </div>
           <nav class="nav-group" aria-label="Primary">
             <a class="nav-item active" href="/">Overview</a>
+            <a class="nav-item" href="/api/summary">Summary API</a>
+            <a class="nav-item" href="/api/sites">Sites API</a>
             <a class="nav-item" href="/api/status">System Status</a>
             <a class="nav-item" href="/ingest-info">Ingestion</a>
-            <span class="nav-item">Sites</span>
-            <span class="nav-item">Events</span>
-            <span class="nav-item">Alerts</span>
           </nav>
         </div>
         <div class="rail-footer">
-          <span>Shell generated ${generatedAt}</span>
-          <span>Next step: connect one public source and save explainable alerts.</span>
+          <span>Shell generated ${escapeHtml(generatedAt)}</span>
+          <span>Next step: connect one public source and replace seeded records with explainable live signals.</span>
         </div>
       </aside>
       <main class="main">
@@ -638,19 +740,19 @@ function renderDashboard(): string {
             <p class="eyebrow">Staff Dashboard</p>
             <h2>See where change may be becoming opportunity.</h2>
             <p>
-              This first shell is designed for daily scanning. It highlights where Danvers staff may want to
-              review a property, corridor, or market shift before it becomes a missed opening.
+              This version is still lightweight, but it now behaves like a real internal workspace:
+              the summary, table, and filters all run off the same site dataset and API routes.
             </p>
           </div>
           <div class="topbar-meta">
             <div>Worker name: <strong>opportunity</strong></div>
-            <div>Mode: dashboard shell</div>
-            <div>Data store: not connected yet</div>
+            <div>Mode: dashboard shell plus APIs</div>
+            <div>Data store: seeded records</div>
           </div>
         </header>
 
-        <section class="metrics" aria-label="Top metrics">
-          ${metricMarkup}
+        <section class="metrics" aria-label="Top metrics" id="summary-metrics">
+          ${renderMetricMarkup(payload.summary)}
         </section>
 
         <section class="workspace">
@@ -659,23 +761,36 @@ function renderDashboard(): string {
               <div>
                 <p class="eyebrow">Watchlist</p>
                 <h3>Current review lanes</h3>
-                <p>Not live data yet. This layout shows the operating surface we can begin wiring into real signals.</p>
+                <p>The controls below let staff narrow the list by corridor, status, or keyword before connectors are live.</p>
               </div>
               <span class="status-pill">Explainable alerts only</span>
             </div>
+
+            <div class="controls">
+              <input id="search-input" class="search" type="search" placeholder="Search sites, corridors, or signals" />
+              <select id="corridor-filter" class="select" aria-label="Filter by corridor">
+                <option value="all">All corridors</option>
+              </select>
+              <select id="status-filter" class="select" aria-label="Filter by status">
+                <option value="all">All statuses</option>
+              </select>
+            </div>
+
             <table>
               <thead>
                 <tr>
                   <th>Site</th>
                   <th>Signal</th>
                   <th>Focus</th>
+                  <th>Score</th>
                   <th>Status</th>
                 </tr>
               </thead>
-              <tbody>
-                ${watchMarkup}
+              <tbody id="watchlist-body">
+                ${initialTableRows}
               </tbody>
             </table>
+            <div id="empty-state" class="empty" hidden>No sites match the current filter.</div>
           </div>
 
           <div class="side-stack">
@@ -688,14 +803,14 @@ function renderDashboard(): string {
                 </div>
               </div>
               <ul class="activity-list">
-                ${activityMarkup}
+                ${renderActivityMarkup(payload.activity)}
               </ul>
             </section>
 
             <section class="panel insight-band">
               <p class="eyebrow">Decision Support</p>
-              <h3>What this shell is meant to support</h3>
-              <p>Fast municipal triage around commercial tax base, site readiness, and corridor-level intervention choices.</p>
+              <h3>What this version can already do</h3>
+              <p>Give Danvers staff one place to scan seeded opportunities, sort by score, and review which corridors deserve follow-up first.</p>
               <div class="insight-grid">
                 <div class="insight">
                   <strong>Tax Base</strong>
@@ -703,11 +818,11 @@ function renderDashboard(): string {
                 </div>
                 <div class="insight">
                   <strong>Readiness</strong>
-                  <p>Track whether a site’s real blocker is zoning, utilities, parcel conditions, or market uncertainty.</p>
+                  <p>Separate early ideas from sites that look closer to realistic intervention or market traction.</p>
                 </div>
                 <div class="insight">
                   <strong>Action</strong>
-                  <p>Separate what the Town can move directly from what depends on owners, utilities, or outside partners.</p>
+                  <p>Keep the interface ready for explainable source-driven alerts instead of black-box recommendations.</p>
                 </div>
               </div>
             </section>
@@ -715,6 +830,92 @@ function renderDashboard(): string {
         </section>
       </main>
     </div>
+    <script>
+      const initialData = ${JSON.stringify(payload)};
+
+      const watchlistBody = document.getElementById("watchlist-body");
+      const emptyState = document.getElementById("empty-state");
+      const searchInput = document.getElementById("search-input");
+      const corridorFilter = document.getElementById("corridor-filter");
+      const statusFilter = document.getElementById("status-filter");
+
+      function escapeHtml(value) {
+        return value
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function populateFilters(sites) {
+        const corridors = [...new Set(sites.map((site) => site.corridor))].sort();
+        const statuses = [...new Set(sites.map((site) => site.status))].sort();
+
+        corridorFilter.innerHTML = '<option value="all">All corridors</option>' +
+          corridors.map((corridor) => '<option value="' + escapeHtml(corridor) + '">' + escapeHtml(corridor) + '</option>').join("");
+
+        statusFilter.innerHTML = '<option value="all">All statuses</option>' +
+          statuses.map((status) => '<option value="' + escapeHtml(status) + '">' + escapeHtml(status) + '</option>').join("");
+      }
+
+      function renderRows(sites) {
+        if (!sites.length) {
+          watchlistBody.innerHTML = "";
+          emptyState.hidden = false;
+          return;
+        }
+
+        emptyState.hidden = true;
+        watchlistBody.innerHTML = sites.map((item) => {
+          return '<tr>' +
+            '<td><strong>' + escapeHtml(item.site) + '</strong><div class="cell-subtle">' + escapeHtml(item.corridor) + '</div></td>' +
+            '<td>' + escapeHtml(item.signal) + '</td>' +
+            '<td>' + escapeHtml(item.focus) + '</td>' +
+            '<td>' + escapeHtml(String(item.score)) + '</td>' +
+            '<td><span class="status-pill">' + escapeHtml(item.status) + '</span></td>' +
+          '</tr>';
+        }).join("");
+      }
+
+      function applyFilters() {
+        const term = searchInput.value.trim().toLowerCase();
+        const corridor = corridorFilter.value;
+        const status = statusFilter.value;
+
+        const filtered = initialData.sites.filter((site) => {
+          const matchesTerm = !term || [site.site, site.corridor, site.signal, site.focus]
+            .join(" ")
+            .toLowerCase()
+            .includes(term);
+          const matchesCorridor = corridor === "all" || site.corridor === corridor;
+          const matchesStatus = status === "all" || site.status === status;
+          return matchesTerm && matchesCorridor && matchesStatus;
+        });
+
+        renderRows(filtered);
+      }
+
+      populateFilters(initialData.sites);
+      renderRows(initialData.sites);
+
+      searchInput.addEventListener("input", applyFilters);
+      corridorFilter.addEventListener("change", applyFilters);
+      statusFilter.addEventListener("change", applyFilters);
+
+      fetch("/api/sites")
+        .then((response) => response.json())
+        .then((data) => {
+          if (Array.isArray(data.sites)) {
+            initialData.sites = data.sites;
+            populateFilters(initialData.sites);
+            renderRows(initialData.sites);
+          }
+        })
+        .catch(() => {
+          // Keep the server-rendered seed data in place if the fetch fails.
+        });
+    </script>
   </body>
 </html>`;
 }
@@ -735,11 +936,26 @@ export default {
       return Response.json(buildStatusPayload());
     }
 
+    if (request.method === "GET" && url.pathname === "/api/sites") {
+      return Response.json({
+        sites: SITES,
+        count: SITES.length,
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/summary") {
+      return Response.json({
+        summary: buildSummaryMetrics(SITES),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
     if (request.method === "GET" && url.pathname === "/ingest-info") {
       return Response.json(
         {
           enabled: false,
           detail: "Queue and database bindings are not configured yet.",
+          nextStep: "Attach D1 and the first public source connector.",
         },
         { status: 200 },
       );
