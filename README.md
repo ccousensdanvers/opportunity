@@ -41,19 +41,25 @@ npm install
 cp .dev.vars.example .dev.vars
 ```
 
-3. Create a D1 database and update `wrangler.jsonc` with its IDs.
-
-4. Run local development:
+3. Run the bootstrap Worker locally:
 
 ```bash
 npm run dev
 ```
 
-5. Apply migrations:
+4. Create the D1 database and queue resources once you are ready to enable persistence and background ingestion.
+
+5. Re-enable the `d1_databases` and `queues` bindings in `wrangler.jsonc`, then apply migrations:
 
 ```bash
 npm run migrate:local
 ```
+
+## Bootstrap Behavior
+
+- `GET /` returns a health-style response so the initial Cloudflare deployment has a valid Worker to build.
+- `POST /ingest` currently returns a `501` response until queue and database bindings are configured.
+- A weekday cron trigger is enabled and writes a log entry for now.
 
 ## Initial Priorities
 
@@ -61,4 +67,3 @@ npm run migrate:local
 - normalize changes into `events`
 - score affected `sites`
 - surface alerts in a lightweight internal dashboard
-
