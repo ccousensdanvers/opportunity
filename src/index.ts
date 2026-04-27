@@ -1,6 +1,17 @@
+import {
+  matchAndPersistOpportunities,
+  upsertParcels,
+  type OpportunityParcelInput,
+  type ParcelUpsertInput,
+} from "./parcel-matching";
+
 type IngestTrigger = "manual" | "scheduled";
 type SiteStatus = "Needs staff review" | "Policy setup" | "Market scan" | "Infrastructure check";
 type Readiness = "Early" | "Emerging" | "Advancing";
+
+interface Env {
+  OPPORTUNITYDB?: D1Database;
+}
 
 interface IngestMessage {
   trigger: IngestTrigger;
@@ -183,7 +194,7 @@ function buildIngestMessage(trigger: IngestTrigger): IngestMessage {
   };
 }
 
-function buildStatusPayload() {
+function buildStatusPayload(env?: Env) {
   return {
     service: "danvers-opportunity-agent",
     status: "ok",
@@ -196,11 +207,27 @@ function buildStatusPayload() {
         agendaSignals: true,
         caseExtraction: true,
         scheduledChecks: true,
-        database: false,
+        database: Boolean(env?.OPPORTUNITYDB),
         queue: false,
       },
     },
   };
+}
+
+function missingDatabaseResponse() {
+  return Response.json(
+    {
+      ok: false,
+      error: "OPPORTUNITYDB binding is not configured.",
+      nextStep:
+        "Add the OPPORTUNITYDB D1 binding in wrangler.jsonc and apply migrations.",
+    },
+    { status: 503 },
+  );
+}
+
+async function readJson<T>(request: Request): Promise<T> {
+  return (await request.json()) as T;
 }
 
 function escapeHtml(value: string): string {
@@ -1551,7 +1578,7 @@ function renderDashboard(payload: DashboardPayload): string {
 }
 
 export default {
-  async fetch(request: Request): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
@@ -1565,7 +1592,7 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/api/status") {
-      return Response.json(buildStatusPayload());
+      return Response.json(buildStatusPayload(env));
     }
 
     if (request.method === "GET" && url.pathname === "/api/sites") {
@@ -1606,35 +1633,114 @@ export default {
     if (request.method === "GET" && url.pathname === "/ingest-info") {
       return Response.json(
         {
-          enabled: false,
-          detail: "Queue and database bindings are not configured yet.",
-          nextStep: "Attach D1 and persist case briefs, then map briefs to parcels and corridors.",
+          enabled: Boolean(env.OPPORTUNITYDB),
+          detail: env.OPPORTUNITYDB
+            ? "D1 binding is available for parcel ingest and parcel matching."
+            : "D1 binding is not configured yet.",
+          nextStep: env.OPPORTUNITYDB
+            ? "Apply migrations, ingest parcel data, then match opportunities to parcels."
+            : "Attach D1 and persist case briefs, then map briefs to parcels and corridors.",
         },
         { status: 200 },
       );
     }
 
+    if (request.method === "POST" && url.pathname === "/api/parcels/upsert") {
+      if (!env.OPPORTUNITYDB) {
+        return missingDatabaseResponse();
+      }
+
+      const body = await readJson<{ parcels?: ParcelUpsertInput[] }>(request);
+      if (!Array.isArray(body.parcels)) {
+        return Response.json(
+          { ok: false, error: "Request body must include a parcels array." },
+          { status: 400 },
+        );
+      }
+
+      await upsertParcels(env.OPPORTUNITYDB, body.parcels);
+
+      return Response.json({
+        ok: true,
+        ingested: body.parcels.length,
+      });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/opportunities/match") {
+      if (!env.OPPORTUNITYDB) {
+        return missingDatabaseResponse();
+      }
+
+      const body = await readJson<{ opportunities?: OpportunityParcelInput[] }>(request);
+      if (!Array.isArray(body.opportunities)) {
+        return Response.json(
+          { ok: false, error: "Request body must include an opportunities array." },
+          { status: 400 },
+        );
+      }
+
+      const results = await matchAndPersistOpportunities(env.OPPORTUNITYDB, body.opportunities);
+
+      return Response.json({
+        ok: true,
+        matched: results.filter((result) => result.matchType !== "no_match").length,
+        reviewNeeded: results.filter((result) => result.needsReview).length,
+        results,
+      });
+    }
+
     if (request.method === "POST" && url.pathname === "/ingest") {
-      return Response.json(
-        {
-          accepted: false,
-          message: buildIngestMessage("manual"),
-          detail: "Queue and database bindings are not configured yet.",
-        },
-        { status: 501 },
-      );
+      if (!env.OPPORTUNITYDB) {
+        return Response.json(
+          {
+            accepted: false,
+            message: buildIngestMessage("manual"),
+            detail: "Queue and database bindings are not configured yet.",
+          },
+          { status: 501 },
+        );
+      }
+
+      await env.OPPORTUNITYDB.prepare(
+        `
+        INSERT INTO ingestion_runs (trigger, requested_at, status)
+        VALUES (?, ?, ?)
+        `,
+      )
+        .bind("manual", new Date().toISOString(), "accepted")
+        .run();
+
+      return Response.json({
+        accepted: true,
+        message: buildIngestMessage("manual"),
+        detail: "Manual ingest request recorded in D1.",
+      });
     }
 
     return new Response("Not Found", { status: 404 });
   },
 
-  async scheduled(controller: { cron: string }): Promise<void> {
+  async scheduled(controller: { cron: string }, env: Env): Promise<void> {
+    const timestamp = new Date().toISOString();
+
+    if (env.OPPORTUNITYDB) {
+      await env.OPPORTUNITYDB.prepare(
+        `
+        INSERT INTO ingestion_runs (trigger, requested_at, status)
+        VALUES (?, ?, ?)
+        `,
+      )
+        .bind("scheduled", timestamp, "accepted")
+        .run();
+    }
+
     console.log(
       JSON.stringify({
         event: "scheduled-run",
         cron: controller.cron,
-        at: new Date().toISOString(),
+        at: timestamp,
+        databaseConfigured: Boolean(env.OPPORTUNITYDB),
       }),
     );
   },
-};
+}
