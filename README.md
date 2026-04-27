@@ -55,9 +55,11 @@ npm run dev
 npm run migrate:local
 ```
 
-## Bootstrap Behavior
+## Current Routes
 
-- `GET /` returns a health-style response so the initial Cloudflare deployment has a valid Worker to build.
+- `GET /` returns the internal dashboard shell.
+- `GET /api/status` returns the service status payload as JSON.
+- `GET /ingest-info` shows current ingestion readiness.
 - `POST /ingest` currently returns a `501` response until queue and database bindings are configured.
 - A weekday cron trigger is enabled and writes a log entry for now.
 
