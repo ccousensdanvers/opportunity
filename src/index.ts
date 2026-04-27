@@ -33,6 +33,16 @@ interface ActivityItem {
   detail: string;
 }
 
+interface AgendaSignal {
+  board: "Planning Board" | "Zoning Board of Appeals";
+  meetingDate: string;
+  title: string;
+  agendaUrl: string;
+  source: string;
+}
+
+const AGENDA_CENTER_URL = "https://www.danversma.gov/AgendaCenter";
+
 const SITES: OpportunitySite[] = [
   {
     id: "maple-industrial-edge",
@@ -116,13 +126,30 @@ const ACTIVITIES: ActivityItem[] = [
   },
   {
     time: "09:15",
-    title: "Initial data model added",
+    title: "Structured data model added",
     detail: "The dashboard now runs off reusable site records and summary calculations instead of hard-coded tiles.",
   },
   {
     time: "Next",
-    title: "First source connector",
-    detail: "Next build should swap seeded records for one public source feed with explainable alert logic.",
+    title: "Source enrichment",
+    detail: "Planning Board and ZBA agenda postings are now the first live source feed. The next step is extracting site-level details from those packets.",
+  },
+];
+
+const FALLBACK_SIGNALS: AgendaSignal[] = [
+  {
+    board: "Planning Board",
+    meetingDate: "May 27, 2025",
+    title: "Planning Board Members",
+    agendaUrl: "https://www.danversma.gov/AgendaCenter/ViewFile/Agenda/_05272025-1453",
+    source: "danvers agenda center fallback",
+  },
+  {
+    board: "Zoning Board of Appeals",
+    meetingDate: "Jun 9, 2025",
+    title: "Zoning Board of Appeals Members",
+    agendaUrl: "https://www.danversma.gov/AgendaCenter/ViewFile/Agenda/_06092025-1461",
+    source: "danvers agenda center fallback",
   },
 ];
 
@@ -143,6 +170,7 @@ function buildStatusPayload() {
       capabilities: {
         api: true,
         dashboard: true,
+        agendaSignals: true,
         scheduledChecks: true,
         database: false,
         queue: false,
@@ -160,8 +188,11 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
-function buildSummaryMetrics(sites: OpportunitySite[]): SummaryMetric[] {
-  const freshSignals = sites.filter((site) => site.updatedAt >= "2026-04-24").length;
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function buildSummaryMetrics(sites: OpportunitySite[], signals: AgendaSignal[]): SummaryMetric[] {
   const advancing = sites.filter((site) => site.readiness === "Advancing").length;
   const averageScore = Math.round(sites.reduce((sum, site) => sum + site.score, 0) / sites.length);
   const corridors = new Set(sites.map((site) => site.corridor)).size;
@@ -174,9 +205,9 @@ function buildSummaryMetrics(sites: OpportunitySite[]): SummaryMetric[] {
       tone: "warm",
     },
     {
-      label: "Fresh Signals",
-      value: String(freshSignals),
-      detail: "records updated in the last few days",
+      label: "Live Agenda Signals",
+      value: String(signals.length),
+      detail: "recent Planning Board and ZBA postings from Danvers Agenda Center",
       tone: "cool",
     },
     {
@@ -192,12 +223,156 @@ function buildSummaryMetrics(sites: OpportunitySite[]): SummaryMetric[] {
   ];
 }
 
-function buildDashboardPayload() {
+class HeadingCollector {
+  private active = false;
+  private text = "";
+
+  constructor(private onComplete: (value: string) => void) {}
+
+  element(element: Element) {
+    this.active = true;
+    this.text = "";
+    element.onEndTag(() => {
+      this.active = false;
+      this.onComplete(normalizeWhitespace(this.text));
+      this.text = "";
+    });
+  }
+
+  text(text: Text) {
+    if (this.active) {
+      this.text += text.text;
+    }
+  }
+}
+
+class AgendaLinkCollector {
+  private active = false;
+  private href = "";
+  private text = "";
+
+  constructor(
+    private getBoard: () => string | null,
+    private getMeetingDate: () => string | null,
+    private onSignal: (signal: AgendaSignal) => void,
+  ) {}
+
+  element(element: Element) {
+    const href = element.getAttribute("href");
+    if (!href || !href.includes("/AgendaCenter/ViewFile/Agenda/")) {
+      return;
+    }
+
+    this.active = true;
+    this.href = href.startsWith("http") ? href : `https://www.danversma.gov${href}`;
+    this.text = "";
+
+    element.onEndTag(() => {
+      this.active = false;
+      const board = this.getBoard();
+      const meetingDate = this.getMeetingDate();
+      const title = normalizeWhitespace(this.text);
+
+      if (!board || !meetingDate || !title || title === "Agenda" || title === "Previous Versions") {
+        this.href = "";
+        this.text = "";
+        return;
+      }
+
+      if (board !== "Planning Board" && board !== "Zoning Board of Appeals") {
+        this.href = "";
+        this.text = "";
+        return;
+      }
+
+      this.onSignal({
+        board,
+        meetingDate,
+        title,
+        agendaUrl: this.href,
+        source: "danvers agenda center",
+      });
+
+      this.href = "";
+      this.text = "";
+    });
+  }
+
+  text(text: Text) {
+    if (this.active) {
+      this.text += text.text;
+    }
+  }
+}
+
+async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+    const response = await fetch(AGENDA_CENTER_URL, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
+      },
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      throw new Error(`Agenda Center request failed with ${response.status}`);
+    }
+
+    const html = await response.text();
+    let currentBoard: string | null = null;
+    let currentDate: string | null = null;
+    const signals: AgendaSignal[] = [];
+    const seen = new Set<string>();
+
+    const boardCollector = new HeadingCollector((value) => {
+      currentBoard = value || null;
+      currentDate = null;
+    });
+    const dateCollector = new HeadingCollector((value) => {
+      currentDate = value || null;
+    });
+    const linkCollector = new AgendaLinkCollector(
+      () => currentBoard,
+      () => currentDate,
+      (signal) => {
+        const key = `${signal.board}|${signal.meetingDate}|${signal.agendaUrl}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          signals.push(signal);
+        }
+      },
+    );
+
+    await new HTMLRewriter()
+      .on("h2", boardCollector)
+      .on("h3", dateCollector)
+      .on("a", linkCollector)
+      .transform(new Response(html))
+      .text();
+
+    const filtered = signals
+      .filter(
+        (signal) =>
+          signal.board === "Planning Board" || signal.board === "Zoning Board of Appeals",
+      )
+      .slice(0, 8);
+
+    return filtered.length ? filtered : FALLBACK_SIGNALS;
+  } catch {
+    return FALLBACK_SIGNALS;
+  }
+}
+
+function buildDashboardPayload(signals: AgendaSignal[]) {
   return {
     generatedAt: new Date().toISOString(),
-    summary: buildSummaryMetrics(SITES),
+    summary: buildSummaryMetrics(SITES, signals),
     sites: SITES,
     activity: ACTIVITIES,
+    signals,
   };
 }
 
@@ -232,28 +407,48 @@ function renderActivityMarkup(items: ActivityItem[]): string {
     .join("");
 }
 
-function renderDashboard(): string {
-  const payload = buildDashboardPayload();
+function renderSignalMarkup(signals: AgendaSignal[]): string {
+  return signals
+    .map(
+      (signal) => `
+        <li class="signal-item">
+          <div class="signal-meta">
+            <span>${escapeHtml(signal.board)}</span>
+            <span>${escapeHtml(signal.meetingDate)}</span>
+          </div>
+          <a class="signal-link" href="${escapeHtml(signal.agendaUrl)}" target="_blank" rel="noreferrer">
+            ${escapeHtml(signal.title)}
+          </a>
+          <p class="signal-source">${escapeHtml(signal.source)}</p>
+        </li>
+      `,
+    )
+    .join("");
+}
+
+function renderDashboard(payload: ReturnType<typeof buildDashboardPayload>): string {
   const generatedAt = new Date(payload.generatedAt).toLocaleString("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
     timeZone: "America/New_York",
   });
 
-  const initialTableRows = SITES.map(
-    (item) => `
-      <tr>
-        <td>
-          <strong>${escapeHtml(item.site)}</strong>
-          <div class="cell-subtle">${escapeHtml(item.corridor)}</div>
-        </td>
-        <td>${escapeHtml(item.signal)}</td>
-        <td>${escapeHtml(item.focus)}</td>
-        <td>${escapeHtml(String(item.score))}</td>
-        <td><span class="status-pill">${escapeHtml(item.status)}</span></td>
-      </tr>
-    `,
-  ).join("");
+  const initialTableRows = payload.sites
+    .map(
+      (item) => `
+        <tr>
+          <td>
+            <strong>${escapeHtml(item.site)}</strong>
+            <div class="cell-subtle">${escapeHtml(item.corridor)}</div>
+          </td>
+          <td>${escapeHtml(item.signal)}</td>
+          <td>${escapeHtml(item.focus)}</td>
+          <td>${escapeHtml(String(item.score))}</td>
+          <td><span class="status-pill">${escapeHtml(item.status)}</span></td>
+        </tr>
+      `,
+    )
+    .join("");
 
   return `<!doctype html>
 <html lang="en">
@@ -288,14 +483,8 @@ function renderDashboard(): string {
         font-family: Georgia, "Times New Roman", serif;
       }
 
-      a {
-        color: inherit;
-        text-decoration: none;
-      }
-
-      button, input {
-        font: inherit;
-      }
+      a { color: inherit; text-decoration: none; }
+      button, input { font: inherit; }
 
       .shell {
         display: grid;
@@ -336,8 +525,7 @@ function renderDashboard(): string {
       }
 
       .brand p,
-      .rail-footer,
-      .subtle {
+      .rail-footer {
         margin: 0;
         color: var(--muted);
         line-height: 1.5;
@@ -457,7 +645,7 @@ function renderDashboard(): string {
 
       .workspace {
         display: grid;
-        grid-template-columns: minmax(0, 1.4fr) minmax(300px, 0.6fr);
+        grid-template-columns: minmax(0, 1.4fr) minmax(320px, 0.6fr);
         gap: 16px;
         align-items: start;
       }
@@ -470,13 +658,14 @@ function renderDashboard(): string {
       }
 
       .watchlist,
+      .signals,
       .activity,
       .insight-band {
         padding: 18px 20px 20px;
       }
 
       .watchlist-head,
-      .activity-head {
+      .panel-head {
         display: flex;
         align-items: flex-end;
         justify-content: space-between;
@@ -485,7 +674,7 @@ function renderDashboard(): string {
       }
 
       .watchlist-head h3,
-      .activity-head h3,
+      .panel-head h3,
       .insight-band h3 {
         margin: 0;
         font-size: 1.35rem;
@@ -493,7 +682,7 @@ function renderDashboard(): string {
       }
 
       .watchlist-head p,
-      .activity-head p,
+      .panel-head p,
       .insight-band p {
         margin: 6px 0 0;
         color: var(--muted);
@@ -569,20 +758,52 @@ function renderDashboard(): string {
         gap: 16px;
       }
 
+      .signal-list,
       .activity-list {
         display: grid;
-        gap: 16px;
+        gap: 14px;
         padding: 0;
         margin: 0;
         list-style: none;
+      }
+
+      .signal-item,
+      .activity-item {
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+
+      .signal-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 0.82rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .signal-link {
+        display: block;
+        margin-top: 8px;
+        color: var(--ink);
+        line-height: 1.45;
+      }
+
+      .signal-link:hover {
+        color: var(--accent);
+      }
+
+      .signal-source {
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 0.92rem;
       }
 
       .activity-item {
         display: grid;
         grid-template-columns: 56px minmax(0, 1fr);
         gap: 14px;
-        padding-top: 16px;
-        border-top: 1px solid var(--line);
       }
 
       .activity-time {
@@ -725,13 +946,13 @@ function renderDashboard(): string {
             <a class="nav-item active" href="/">Overview</a>
             <a class="nav-item" href="/api/summary">Summary API</a>
             <a class="nav-item" href="/api/sites">Sites API</a>
+            <a class="nav-item" href="/api/signals">Signals API</a>
             <a class="nav-item" href="/api/status">System Status</a>
-            <a class="nav-item" href="/ingest-info">Ingestion</a>
           </nav>
         </div>
         <div class="rail-footer">
           <span>Shell generated ${escapeHtml(generatedAt)}</span>
-          <span>Next step: connect one public source and replace seeded records with explainable live signals.</span>
+          <span>First live source: Danvers Agenda Center for Planning Board and Zoning Board postings.</span>
         </div>
       </aside>
       <main class="main">
@@ -740,14 +961,14 @@ function renderDashboard(): string {
             <p class="eyebrow">Staff Dashboard</p>
             <h2>See where change may be becoming opportunity.</h2>
             <p>
-              This version is still lightweight, but it now behaves like a real internal workspace:
-              the summary, table, and filters all run off the same site dataset and API routes.
+              This version now includes one live public source feed from Danvers itself. The watchlist is still seeded,
+              but the dashboard now surfaces current Planning Board and ZBA postings that can feed future site-level review.
             </p>
           </div>
           <div class="topbar-meta">
             <div>Worker name: <strong>opportunity</strong></div>
-            <div>Mode: dashboard shell plus APIs</div>
-            <div>Data store: seeded records</div>
+            <div>Mode: dashboard plus live agenda signals</div>
+            <div>Data store: seeded watchlist, live public feed</div>
           </div>
         </header>
 
@@ -761,7 +982,7 @@ function renderDashboard(): string {
               <div>
                 <p class="eyebrow">Watchlist</p>
                 <h3>Current review lanes</h3>
-                <p>The controls below let staff narrow the list by corridor, status, or keyword before connectors are live.</p>
+                <p>The controls below let staff narrow the list by corridor, status, or keyword while source detail work is still underway.</p>
               </div>
               <span class="status-pill">Explainable alerts only</span>
             </div>
@@ -794,8 +1015,21 @@ function renderDashboard(): string {
           </div>
 
           <div class="side-stack">
+            <section class="panel signals">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Live Source Feed</p>
+                  <h3>Recent agenda postings</h3>
+                  <p>Direct from Danvers Agenda Center. These are the earliest reliable public signals now wired into the tool.</p>
+                </div>
+              </div>
+              <ul id="signal-list" class="signal-list">
+                ${renderSignalMarkup(payload.signals)}
+              </ul>
+            </section>
+
             <section class="panel activity">
-              <div class="activity-head">
+              <div class="panel-head">
                 <div>
                   <p class="eyebrow">Activity</p>
                   <h3>Build notes</h3>
@@ -806,26 +1040,26 @@ function renderDashboard(): string {
                 ${renderActivityMarkup(payload.activity)}
               </ul>
             </section>
+          </div>
+        </section>
 
-            <section class="panel insight-band">
-              <p class="eyebrow">Decision Support</p>
-              <h3>What this version can already do</h3>
-              <p>Give Danvers staff one place to scan seeded opportunities, sort by score, and review which corridors deserve follow-up first.</p>
-              <div class="insight-grid">
-                <div class="insight">
-                  <strong>Tax Base</strong>
-                  <p>Flag sites where turnover, reuse, or vacancy could affect long-term valuation and business activity.</p>
-                </div>
-                <div class="insight">
-                  <strong>Readiness</strong>
-                  <p>Separate early ideas from sites that look closer to realistic intervention or market traction.</p>
-                </div>
-                <div class="insight">
-                  <strong>Action</strong>
-                  <p>Keep the interface ready for explainable source-driven alerts instead of black-box recommendations.</p>
-                </div>
-              </div>
-            </section>
+        <section class="panel insight-band" style="margin-top:16px;">
+          <p class="eyebrow">Decision Support</p>
+          <h3>What this first connector unlocks</h3>
+          <p>Danvers now has a live feed of development-relevant public meeting postings. The next step is turning agenda packets into site-specific, explainable alerts.</p>
+          <div class="insight-grid">
+            <div class="insight">
+              <strong>Signal Intake</strong>
+              <p>Use board postings as a regular early-warning layer for redevelopment proposals, variance requests, and corridor change.</p>
+            </div>
+            <div class="insight">
+              <strong>Targeting</strong>
+              <p>Link agenda items to parcels and corridors once packet-level parsing is added, starting with Planning Board and ZBA cases.</p>
+            </div>
+            <div class="insight">
+              <strong>Town Action</strong>
+              <p>Give staff a clearer rhythm for what to watch, when to intervene, and where local policy or infrastructure action could matter.</p>
+            </div>
           </div>
         </section>
       </main>
@@ -838,6 +1072,7 @@ function renderDashboard(): string {
       const searchInput = document.getElementById("search-input");
       const corridorFilter = document.getElementById("corridor-filter");
       const statusFilter = document.getElementById("status-filter");
+      const signalList = document.getElementById("signal-list");
 
       function escapeHtml(value) {
         return value
@@ -878,6 +1113,16 @@ function renderDashboard(): string {
         }).join("");
       }
 
+      function renderSignals(signals) {
+        signalList.innerHTML = signals.map((signal) => {
+          return '<li class="signal-item">' +
+            '<div class="signal-meta"><span>' + escapeHtml(signal.board) + '</span><span>' + escapeHtml(signal.meetingDate) + '</span></div>' +
+            '<a class="signal-link" href="' + escapeHtml(signal.agendaUrl) + '" target="_blank" rel="noreferrer">' + escapeHtml(signal.title) + '</a>' +
+            '<p class="signal-source">' + escapeHtml(signal.source) + '</p>' +
+          '</li>';
+        }).join("");
+      }
+
       function applyFilters() {
         const term = searchInput.value.trim().toLowerCase();
         const corridor = corridorFilter.value;
@@ -898,22 +1143,22 @@ function renderDashboard(): string {
 
       populateFilters(initialData.sites);
       renderRows(initialData.sites);
+      renderSignals(initialData.signals);
 
       searchInput.addEventListener("input", applyFilters);
       corridorFilter.addEventListener("change", applyFilters);
       statusFilter.addEventListener("change", applyFilters);
 
-      fetch("/api/sites")
+      fetch("/api/signals")
         .then((response) => response.json())
         .then((data) => {
-          if (Array.isArray(data.sites)) {
-            initialData.sites = data.sites;
-            populateFilters(initialData.sites);
-            renderRows(initialData.sites);
+          if (Array.isArray(data.signals)) {
+            initialData.signals = data.signals;
+            renderSignals(initialData.signals);
           }
         })
         .catch(() => {
-          // Keep the server-rendered seed data in place if the fetch fails.
+          // Keep the server-rendered signal list in place if refresh fails.
         });
     </script>
   </body>
@@ -925,7 +1170,8 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(renderDashboard(), {
+      const signals = await fetchAgendaSignals();
+      return new Response(renderDashboard(buildDashboardPayload(signals)), {
         headers: {
           "content-type": "text/html; charset=utf-8",
         },
@@ -944,8 +1190,18 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/api/summary") {
+      const signals = await fetchAgendaSignals();
       return Response.json({
-        summary: buildSummaryMetrics(SITES),
+        summary: buildSummaryMetrics(SITES, signals),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/signals") {
+      const signals = await fetchAgendaSignals();
+      return Response.json({
+        signals,
+        source: AGENDA_CENTER_URL,
         updatedAt: new Date().toISOString(),
       });
     }
@@ -955,7 +1211,7 @@ export default {
         {
           enabled: false,
           detail: "Queue and database bindings are not configured yet.",
-          nextStep: "Attach D1 and the first public source connector.",
+          nextStep: "Attach D1 and extract site-level details from Planning Board and ZBA agenda packets.",
         },
         { status: 200 },
       );
