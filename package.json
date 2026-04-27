@@ -6,6 +6,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "cf:migrate:local": "bash scripts/run-migrations.sh local",
+    "cf:migrate:remote": "bash scripts/run-migrations.sh remote",
+    "cf:smoke": "bash scripts/smoke-test-ingest.sh",
+    "test:parcel-matching": "node --test test/parcel-matching.test.mjs",
     "typecheck": "tsc --noEmit",
     "db:generate": "wrangler d1 migrations create OPPORTUNITY",
     "migrate:local": "wrangler d1 migrations apply OPPORTUNITY --local",
