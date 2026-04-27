@@ -50,6 +50,24 @@ interface MatchRule {
   query: string;
 }
 
+export interface ParcelReviewItem {
+  opportunityId: string;
+  parcelId: number;
+  matchType: Exclude<ParcelMatchType, "no_match">;
+  confidence: number;
+  inputValue: string | null;
+  matchedValue: string | null;
+  needsReview: boolean;
+  createdAt: string;
+  updatedAt: string;
+  parcel: {
+    mapLot: string | null;
+    address: string | null;
+    ownerName: string | null;
+    zoningDistrict: string | null;
+  };
+}
+
 const ADDRESS_SYNONYMS: Record<string, string> = {
   avenue: "ave",
   av: "ave",
@@ -369,4 +387,100 @@ export async function matchAndPersistOpportunities(
   }
 
   return results;
+}
+
+export async function listParcelReviewQueue(
+  db: D1Database,
+  options: {
+    limit?: number;
+    needsReviewOnly?: boolean;
+  } = {},
+): Promise<ParcelReviewItem[]> {
+  const limit = Math.min(Math.max(options.limit ?? 25, 1), 100);
+
+  const statement = options.needsReviewOnly === false
+    ? db.prepare(
+        `
+        SELECT
+          m.opportunity_id AS opportunityId,
+          m.parcel_id AS parcelId,
+          m.match_type AS matchType,
+          m.confidence AS confidence,
+          m.input_value AS inputValue,
+          m.matched_value AS matchedValue,
+          m.needs_review AS needsReview,
+          m.created_at AS createdAt,
+          m.updated_at AS updatedAt,
+          p.map_lot AS mapLot,
+          p.address AS address,
+          p.owner_name AS ownerName,
+          p.zoning_district AS zoningDistrict
+        FROM opportunity_parcel_matches m
+        JOIN parcels p ON p.id = m.parcel_id
+        ORDER BY
+          m.needs_review DESC,
+          m.confidence ASC,
+          m.updated_at DESC
+        LIMIT ?
+        `,
+      )
+    : db.prepare(
+        `
+        SELECT
+          m.opportunity_id AS opportunityId,
+          m.parcel_id AS parcelId,
+          m.match_type AS matchType,
+          m.confidence AS confidence,
+          m.input_value AS inputValue,
+          m.matched_value AS matchedValue,
+          m.needs_review AS needsReview,
+          m.created_at AS createdAt,
+          m.updated_at AS updatedAt,
+          p.map_lot AS mapLot,
+          p.address AS address,
+          p.owner_name AS ownerName,
+          p.zoning_district AS zoningDistrict
+        FROM opportunity_parcel_matches m
+        JOIN parcels p ON p.id = m.parcel_id
+        WHERE m.needs_review = 1
+        ORDER BY
+          m.confidence ASC,
+          m.updated_at DESC
+        LIMIT ?
+        `,
+      );
+
+  const { results } = await statement.bind(limit).all<{
+    opportunityId: string;
+    parcelId: number;
+    matchType: Exclude<ParcelMatchType, "no_match">;
+    confidence: number;
+    inputValue: string | null;
+    matchedValue: string | null;
+    needsReview: number;
+    createdAt: string;
+    updatedAt: string;
+    mapLot: string | null;
+    address: string | null;
+    ownerName: string | null;
+    zoningDistrict: string | null;
+  }>();
+
+  return (results ?? []).map((row) => ({
+    opportunityId: row.opportunityId,
+    parcelId: row.parcelId,
+    matchType: row.matchType,
+    confidence: row.confidence,
+    inputValue: row.inputValue,
+    matchedValue: row.matchedValue,
+    needsReview: Boolean(row.needsReview),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    parcel: {
+      mapLot: row.mapLot,
+      address: row.address,
+      ownerName: row.ownerName,
+      zoningDistrict: row.zoningDistrict,
+    },
+  }));
 }
