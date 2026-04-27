@@ -55,6 +55,14 @@ npm run dev
 npm run migrate:local
 ```
 
+Helpful shortcuts once `wrangler` is available in your environment:
+
+```bash
+npm run cf:migrate:local
+npm run cf:migrate:remote
+npm run cf:smoke
+```
+
 ## Current Routes
 
 - `GET /` returns the internal dashboard shell.
@@ -67,9 +75,10 @@ npm run migrate:local
 - `GET /api/briefs` returns lightweight case briefs derived from agenda postings and simple packet parsing.
 - `GET /ingest-info` shows current ingestion readiness.
 - `POST /api/parcels/upsert` upserts parcel records and parcel aliases into D1.
-- `POST /api/opportunities/match` matches opportunity records to parcels and stores the result in D1.
-- `POST /ingest` records a manual ingestion run when D1 is configured.
-- A weekday cron trigger is enabled and writes a log entry for now.
+- `POST /api/opportunities/match` matches opportunity records to parcels and stores every result in D1, including unmatched items that need staff review.
+- `GET /api/opportunities/review` returns the current review queue, including low-confidence and no-match items.
+- `POST /ingest` runs the full ingest cycle when D1 is configured: refresh Danvers parcels, rebuild agenda briefs, and match address-bearing opportunities to parcels.
+- A weekday cron trigger runs the same ingest cycle automatically.
 
 ## Initial Priorities
 
@@ -77,3 +86,11 @@ npm run migrate:local
 - normalize changes into `events`
 - score affected `sites`
 - surface alerts in a lightweight internal dashboard
+
+## Automated Parcel Source
+
+The current automated parcel source is the Town of Danvers public ArcGIS parcel layer:
+
+- `https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1`
+
+The Worker pulls parcel identifiers and addresses from that layer during manual and scheduled ingest runs, then matches case-brief addresses against the refreshed parcel table in D1.
