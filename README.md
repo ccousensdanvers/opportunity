@@ -58,7 +58,10 @@ npm run migrate:local
 ## Current Routes
 
 - `GET /` returns the internal dashboard shell.
+- The dashboard includes live client-side filtering against the Worker's site dataset.
 - `GET /api/status` returns the service status payload as JSON.
+- `GET /api/summary` returns the current dashboard summary metrics.
+- `GET /api/sites` returns the current watchlist dataset.
 - `GET /ingest-info` shows current ingestion readiness.
 - `POST /ingest` currently returns a `501` response until queue and database bindings are configured.
 - A weekday cron trigger is enabled and writes a log entry for now.
