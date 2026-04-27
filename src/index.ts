@@ -441,6 +441,173 @@ async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
   }
 }
 
+function isPdfDocument(bytes: Uint8Array, contentType: string | null): boolean {
+  if (contentType?.toLowerCase().includes("pdf")) {
+    return true;
+  }
+
+  if (bytes.length < 4) {
+    return false;
+  }
+
+  return (
+    bytes[0] === 0x25 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x44 &&
+    bytes[3] === 0x46
+  );
+}
+
+function findSequence(bytes: Uint8Array, sequence: number[], startAt = 0): number {
+  outer: for (let index = startAt; index <= bytes.length - sequence.length; index += 1) {
+    for (let offset = 0; offset < sequence.length; offset += 1) {
+      if (bytes[index + offset] !== sequence[offset]) {
+        continue outer;
+      }
+    }
+
+    return index;
+  }
+
+  return -1;
+}
+
+function stripStreamBoundaryWhitespace(bytes: Uint8Array): Uint8Array {
+  let start = 0;
+  let end = bytes.length;
+
+  while (start < end && (bytes[start] === 0x0a || bytes[start] === 0x0d)) {
+    start += 1;
+  }
+
+  while (end > start && (bytes[end - 1] === 0x0a || bytes[end - 1] === 0x0d)) {
+    end -= 1;
+  }
+
+  return bytes.slice(start, end);
+}
+
+async function inflatePdfStream(bytes: Uint8Array): Promise<string> {
+  try {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+    return await new Response(stream).text();
+  } catch {
+    return "";
+  }
+}
+
+function decodePdfLiteralString(value: string): string {
+  let decoded = "";
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+
+    if (character !== "\\") {
+      decoded += character;
+      continue;
+    }
+
+    const next = value[index + 1];
+
+    if (!next) {
+      break;
+    }
+
+    if (/[0-7]/.test(next)) {
+      const octal = value.slice(index + 1, index + 4).match(/^[0-7]{1,3}/)?.[0] ?? next;
+      decoded += String.fromCharCode(Number.parseInt(octal, 8));
+      index += octal.length;
+      continue;
+    }
+
+    const replacements: Record<string, string> = {
+      n: "\n",
+      r: "\r",
+      t: "\t",
+      b: "\b",
+      f: "\f",
+      "(": "(",
+      ")": ")",
+      "\\": "\\",
+    };
+
+    decoded += replacements[next] ?? next;
+    index += 1;
+  }
+
+  return decoded;
+}
+
+function decodePdfHexString(value: string): string {
+  const normalized = value.replace(/[^0-9a-f]/gi, "");
+  const padded = normalized.length % 2 === 0 ? normalized : `${normalized}0`;
+  let decoded = "";
+
+  for (let index = 0; index < padded.length; index += 2) {
+    decoded += String.fromCharCode(Number.parseInt(padded.slice(index, index + 2), 16));
+  }
+
+  return decoded;
+}
+
+function extractPdfStrings(text: string): string[] {
+  const extracted: string[] = [];
+  const literalPattern = /\((?:\\.|[^()\\])*\)/g;
+  const hexPattern = /<([0-9a-fA-F\s]+)>/g;
+
+  for (const match of text.matchAll(literalPattern)) {
+    const value = match[0].slice(1, -1);
+    const decoded = normalizeWhitespace(decodePdfLiteralString(value));
+    if (decoded) {
+      extracted.push(decoded);
+    }
+  }
+
+  for (const match of text.matchAll(hexPattern)) {
+    const decoded = normalizeWhitespace(decodePdfHexString(match[1]));
+    if (decoded) {
+      extracted.push(decoded);
+    }
+  }
+
+  return extracted;
+}
+
+async function extractPdfText(bytes: Uint8Array): Promise<string> {
+  const rawText = new TextDecoder("latin1").decode(bytes);
+  const streamTexts: string[] = [];
+  let searchIndex = 0;
+
+  while (searchIndex < bytes.length) {
+    const streamIndex = findSequence(bytes, [0x73, 0x74, 0x72, 0x65, 0x61, 0x6d], searchIndex);
+    if (streamIndex === -1) {
+      break;
+    }
+
+    const contentStart = streamIndex + 6;
+    const endstreamIndex = findSequence(
+      bytes,
+      [0x65, 0x6e, 0x64, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6d],
+      contentStart,
+    );
+
+    if (endstreamIndex === -1) {
+      break;
+    }
+
+    const rawStream = stripStreamBoundaryWhitespace(bytes.slice(contentStart, endstreamIndex));
+    const inflated = await inflatePdfStream(rawStream);
+    if (inflated) {
+      streamTexts.push(inflated);
+    }
+
+    searchIndex = endstreamIndex + 9;
+  }
+
+  const extracted = extractPdfStrings([rawText, ...streamTexts].join("\n"));
+  return normalizeWhitespace(extracted.join(" "));
+}
+
 async function fetchPacketText(url: string): Promise<string> {
   try {
     const controller = new AbortController();
@@ -457,7 +624,11 @@ async function fetchPacketText(url: string): Promise<string> {
       return "";
     }
 
-    const bytes = await response.arrayBuffer();
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (isPdfDocument(bytes, response.headers.get("content-type"))) {
+      return await extractPdfText(bytes);
+    }
+
     const decoded = new TextDecoder("latin1").decode(bytes);
     return normalizeWhitespace(decoded);
   } catch {
