@@ -4,6 +4,7 @@ import {
   listParcelReviewQueue,
   listParcelMatchesForParcelId,
   matchAndPersistOpportunities,
+  normalizeAddress,
   upsertParcels,
   type ParcelLookupResult,
   type OpportunityParcelInput,
@@ -243,6 +244,14 @@ interface ParcelDetailPayload {
   parcel: ParcelLookupResult | null;
   context: ParcelContext | null;
   relatedMatches: ParcelReviewItem[];
+  relatedBriefs: CaseBrief[];
+  relatedSignals: AgendaSignal[];
+}
+
+interface WatchlistDetailPayload {
+  site: OpportunitySite;
+  relatedBriefs: CaseBrief[];
+  relatedSignals: AgendaSignal[];
 }
 
 interface StrategicBriefRow {
@@ -354,18 +363,18 @@ const SITES: OpportunitySite[] = [
 const ACTIVITIES: ActivityItem[] = [
   {
     time: "08:30",
-    title: "Agenda feed and parcel ingest are wired",
-    detail: "Manual and scheduled runs now pull Danvers parcel records, rebuild agenda-derived briefs, and push likely opportunities into parcel matching.",
+    title: "Parcel context now reaches beyond agenda text",
+    detail: "Manual and scheduled runs now screen brief-linked parcels against Danvers assessor, utility, flood, wetlands, and groundwater layers before writing the strategic brief.",
   },
   {
     time: "09:15",
-    title: "Staff review queue is taking shape",
-    detail: "Low-confidence and no-match results now stay visible in the review endpoint so staff can see which filings still need manual cleanup.",
+    title: "Parcel drilldowns are live",
+    detail: "Staff can open parcel detail pages from case briefs to see ownership, zoning, value, utility context, environmental flags, and related matched opportunity records.",
   },
   {
     time: "Next",
-    title: "Current build focus: parcel-linked triage",
-    detail: "We are turning meeting signals into parcel-level follow-up by tightening brief extraction, matching quality, and the staff-facing review workflow.",
+    title: "Current build focus: connected site workflows",
+    detail: "Next up is tightening watchlist drilldowns and making it easier to move between strategic briefs, parcel pages, and source records without losing context.",
   },
 ];
 
@@ -2088,12 +2097,37 @@ async function buildParcelDetailPayload(address: string, db?: D1Database): Promi
   const context = contexts[0] ?? null;
   const parcel = db ? await findParcelByAddress(db, address) : null;
   const relatedMatches = db && parcel ? await listParcelMatchesForParcelId(db, parcel.id, 10) : [];
+  const signals = await fetchAgendaSignals();
+  const briefs = await buildCaseBriefs(signals);
+  const parcelAddress = parcel?.address ?? context?.address ?? address;
+  const relatedBriefs = buildRelatedParcelBriefs(briefs, parcelAddress);
+  const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
 
   return {
     requestedAddress: address,
     parcel,
     context,
     relatedMatches,
+    relatedBriefs,
+    relatedSignals,
+  };
+}
+
+async function buildWatchlistDetailPayload(siteId: string): Promise<WatchlistDetailPayload | null> {
+  const site = SITES.find((candidate) => candidate.id === siteId);
+  if (!site) {
+    return null;
+  }
+
+  const signals = await fetchAgendaSignals();
+  const briefs = await buildCaseBriefs(signals);
+  const relatedBriefs = buildRelatedWatchlistBriefs(site, briefs);
+  const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
+
+  return {
+    site,
+    relatedBriefs,
+    relatedSignals,
   };
 }
 
@@ -2115,12 +2149,17 @@ function buildParcelDetailHref(address: string): string {
   return `/parcel?${params.toString()}`;
 }
 
+function buildWatchlistDetailHref(siteId: string): string {
+  const params = new URLSearchParams({ id: siteId });
+  return `/watchlist?${params.toString()}`;
+}
+
 function renderTableRows(sites: OpportunitySite[]): string {
   return sites
     .map(
       (site) => `
         <tr>
-          <td><strong>${escapeHtml(site.site)}</strong><div class="cell-subtle">${escapeHtml(site.corridor)}</div></td>
+          <td><strong><a class="watchlist-site-link" href="${escapeHtml(buildWatchlistDetailHref(site.id))}">${escapeHtml(site.site)}</a></strong><div class="cell-subtle">${escapeHtml(site.corridor)}</div></td>
           <td>${escapeHtml(site.signal)}</td>
           <td>${escapeHtml(site.focus)}</td>
           <td>${escapeHtml(String(site.score))}</td>
@@ -2227,6 +2266,92 @@ function formatNumber(value: number | null | undefined): string {
 
 function formatBooleanLabel(value: boolean, yesLabel: string, noLabel: string): string {
   return value ? yesLabel : noLabel;
+}
+
+function buildRelatedParcelBriefs(briefs: CaseBrief[], address: string): CaseBrief[] {
+  const normalizedTarget = normalizeAddress(address);
+  if (!normalizedTarget) {
+    return [];
+  }
+
+  return briefs.filter((brief) =>
+    brief.addresses.some((candidate) => normalizeAddress(candidate) === normalizedTarget),
+  );
+}
+
+function buildRelatedParcelSignals(signals: AgendaSignal[], briefs: CaseBrief[]): AgendaSignal[] {
+  const agendaUrls = new Set(briefs.map((brief) => brief.agendaUrl));
+  return signals.filter((signal) => agendaUrls.has(signal.agendaUrl));
+}
+
+function tokenizeWatchlistText(site: OpportunitySite): string[] {
+  const stopWords = new Set([
+    "street",
+    "route",
+    "corridor",
+    "district",
+    "north",
+    "shore",
+    "upper",
+    "floors",
+    "space",
+    "cluster",
+    "node",
+    "strip",
+    "industrial",
+    "downtown",
+    "retail",
+    "commerce",
+    "redevelopment",
+    "adaptive",
+    "reuse",
+    "watch",
+    "scan",
+  ]);
+
+  return Array.from(
+    new Set(
+      normalizeWhitespace(`${site.site} ${site.corridor} ${site.signal} ${site.focus}`)
+        .toLowerCase()
+        .split(/[^a-z0-9]+/)
+        .filter((token) => token.length >= 4 && !stopWords.has(token)),
+    ),
+  );
+}
+
+function scoreBriefForWatchlist(site: OpportunitySite, brief: CaseBrief): number {
+  const keywords = tokenizeWatchlistText(site);
+  const haystack = normalizeWhitespace(
+    `${brief.title} ${brief.likelySite} ${brief.signalType} ${brief.rationale}`,
+  ).toLowerCase();
+
+  let score = 0;
+  for (const keyword of keywords) {
+    if (haystack.includes(keyword)) {
+      score += 1;
+    }
+  }
+
+  if (brief.confidence === "high") {
+    score += 0.5;
+  } else if (brief.confidence === "medium") {
+    score += 0.25;
+  }
+
+  return score;
+}
+
+function buildRelatedWatchlistBriefs(site: OpportunitySite, briefs: CaseBrief[]): CaseBrief[] {
+  const scored = briefs
+    .map((brief) => ({ brief, score: scoreBriefForWatchlist(site, brief) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  if (scored.length) {
+    return scored.slice(0, 5).map((item) => item.brief);
+  }
+
+  return briefs.slice(0, 3);
 }
 
 function renderStrategicScorecardMarkup(payload: DashboardPayload): string {
@@ -2622,6 +2747,13 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         text-underline-offset: 2px;
       }
 
+      .watchlist-site-link {
+        color: var(--ink);
+        text-decoration-color: rgba(0, 90, 156, 0.35);
+        text-underline-offset: 2px;
+      }
+
+      .watchlist-site-link:hover,
       .brief-site-link:hover {
         color: var(--accent);
       }
@@ -2929,7 +3061,7 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         emptyState.hidden = true;
         watchlistBody.innerHTML = sites.map((item) => {
           return '<tr>' +
-            '<td><strong>' + escapeHtml(item.site) + '</strong><div class="cell-subtle">' + escapeHtml(item.corridor) + '</div></td>' +
+            '<td><strong><a class="watchlist-site-link" href="/watchlist?id=' + encodeURIComponent(item.id) + '">' + escapeHtml(item.site) + '</a></strong><div class="cell-subtle">' + escapeHtml(item.corridor) + '</div></td>' +
             '<td>' + escapeHtml(item.signal) + '</td>' +
             '<td>' + escapeHtml(item.focus) + '</td>' +
             '<td>' + escapeHtml(String(item.score)) + '</td>' +
@@ -2950,9 +3082,13 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
 
       function renderBriefs(briefs) {
         briefList.innerHTML = briefs.map((brief) => {
+          const drilldownAddress = brief.addresses && brief.addresses.length ? brief.addresses[0] : "";
+          const siteMarkup = drilldownAddress
+            ? '<a class="brief-site-link" href="/parcel?address=' + encodeURIComponent(drilldownAddress) + '">' + escapeHtml(brief.likelySite) + '</a>'
+            : escapeHtml(brief.likelySite);
           return '<li class="brief-item">' +
             '<div class="brief-topline"><span>' + escapeHtml(brief.board) + '</span><span>' + escapeHtml(brief.confidence) + '</span></div>' +
-            '<p class="brief-site">' + escapeHtml(brief.likelySite) + '</p>' +
+            '<p class="brief-site">' + siteMarkup + '</p>' +
             '<p class="brief-type">' + escapeHtml(brief.signalType) + '</p>' +
             '<p class="brief-rationale">' + escapeHtml(brief.rationale) + '</p>' +
             '<div class="brief-meta"><span>' + escapeHtml(brief.meetingDate) + '</span><a href="' + escapeHtml(brief.agendaUrl) + '" target="_blank" rel="noreferrer">Open agenda</a></div>' +
@@ -2994,6 +3130,8 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
 function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): string {
   const context = payload.context;
   const title = payload.parcel?.address ?? context?.address ?? payload.requestedAddress;
+  const assessorLink = buildDanversAssessorQueryUrl(title);
+  const parcelQueryLink = buildDanversParcelAddressQueryUrl(title);
   const relatedMatchesMarkup = payload.relatedMatches.length
     ? payload.relatedMatches.map((item) => `
         <li class="detail-list-item">
@@ -3002,6 +3140,22 @@ function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): st
           <span>Updated ${escapeHtml(new Date(item.updatedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" }))}</span>
         </li>`).join("")
     : `<li class="detail-list-item"><strong>No related matched opportunities yet.</strong><p>This parcel has not been tied to stored opportunity records in D1 yet.</p></li>`;
+  const relatedBriefsMarkup = payload.relatedBriefs.length
+    ? payload.relatedBriefs.map((brief) => `
+        <li class="detail-list-item">
+          <strong>${escapeHtml(brief.likelySite)}</strong>
+          <p>${escapeHtml(brief.board)} · ${escapeHtml(brief.meetingDate)} · ${escapeHtml(brief.signalType)}</p>
+          <span><a href="${escapeHtml(brief.agendaUrl)}" target="_blank" rel="noreferrer">Open source</a></span>
+        </li>`).join("")
+    : `<li class="detail-list-item"><strong>No related case briefs found.</strong><p>The current live brief set does not yet include this address explicitly.</p></li>`;
+  const relatedSignalsMarkup = payload.relatedSignals.length
+    ? payload.relatedSignals.map((signal) => `
+        <li class="detail-list-item">
+          <strong>${escapeHtml(signal.title)}</strong>
+          <p>${escapeHtml(signal.board)} · ${escapeHtml(signal.meetingDate)} · ${escapeHtml(formatSourceLabel(signal.source))}</p>
+          <span><a href="${escapeHtml(signal.agendaUrl)}" target="_blank" rel="noreferrer">Open source</a></span>
+        </li>`).join("")
+    : `<li class="detail-list-item"><strong>No related live signals found.</strong><p>The current signal set does not include a direct posting tied to this address.</p></li>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -3107,6 +3261,16 @@ function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): st
         background: rgba(0, 90, 156, 0.1);
         color: var(--accent);
       }
+      .link-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 14px;
+      }
+      .source-link {
+        text-decoration: none;
+        color: var(--accent);
+      }
       @media (max-width: 980px) {
         .grid,
         .detail-grid,
@@ -3179,12 +3343,204 @@ function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): st
           <div style="margin-top: 14px;">
             <span class="status-pill">${escapeHtml(context?.floodZones?.length ? context.floodZones.join(", ") : "No mapped flood zone label")}</span>
           </div>
+          <div class="link-row">
+            <a class="source-link" href="${escapeHtml(parcelQueryLink)}" target="_blank" rel="noreferrer">Open parcel query</a>
+            <a class="source-link" href="${escapeHtml(assessorLink)}" target="_blank" rel="noreferrer">Open assessor query</a>
+          </div>
         </section>
       </div>
       <section class="panel" style="margin-top: 18px;">
         <p class="eyebrow">Related Opportunity Records</p>
         <ul class="detail-list">${relatedMatchesMarkup}</ul>
       </section>
+      <div class="grid" style="margin-top: 18px;">
+        <section class="panel">
+          <p class="eyebrow">Related Case Briefs</p>
+          <ul class="detail-list">${relatedBriefsMarkup}</ul>
+        </section>
+        <section class="panel">
+          <p class="eyebrow">Related Live Signals</p>
+          <ul class="detail-list">${relatedSignalsMarkup}</ul>
+        </section>
+      </div>
+    </div>
+  </body>
+</html>`;
+}
+
+function renderWatchlistDetailPage(payload: WatchlistDetailPayload, nonce: string): string {
+  const relatedBriefsMarkup = payload.relatedBriefs.length
+    ? payload.relatedBriefs.map((brief) => {
+      const address = brief.addresses[0] ?? "";
+      const href = address ? buildParcelDetailHref(address) : brief.agendaUrl;
+      const linkLabel = address ? "Open parcel detail" : "Open source";
+
+      return `
+        <li class="detail-list-item">
+          <strong>${escapeHtml(brief.likelySite)}</strong>
+          <p>${escapeHtml(brief.board)} · ${escapeHtml(brief.meetingDate)} · ${escapeHtml(brief.signalType)}</p>
+          <span><a href="${escapeHtml(href)}"${address ? "" : ' target="_blank" rel="noreferrer"'}>${escapeHtml(linkLabel)}</a></span>
+        </li>`;
+    }).join("")
+    : `<li class="detail-list-item"><strong>No related briefs found.</strong><p>The current live brief set has not been tied to this watchlist item yet.</p></li>`;
+  const relatedSignalsMarkup = payload.relatedSignals.length
+    ? payload.relatedSignals.map((signal) => `
+        <li class="detail-list-item">
+          <strong>${escapeHtml(signal.title)}</strong>
+          <p>${escapeHtml(signal.board)} · ${escapeHtml(signal.meetingDate)} · ${escapeHtml(formatSourceLabel(signal.source))}</p>
+          <span><a href="${escapeHtml(signal.agendaUrl)}" target="_blank" rel="noreferrer">Open source</a></span>
+        </li>`).join("")
+    : `<li class="detail-list-item"><strong>No related signals found.</strong><p>This watchlist item is still mostly being tracked through the seeded staff list.</p></li>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${escapeHtml(payload.site.site)} | Opportunity</title>
+    <style nonce="${escapeHtml(nonce)}">
+      :root {
+        --bg: #eef5fb;
+        --panel: rgba(248, 251, 255, 0.9);
+        --ink: #12324f;
+        --muted: #5d7791;
+        --line: rgba(18, 50, 79, 0.12);
+        --accent: #005a9c;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Georgia, "Times New Roman", serif;
+        background: linear-gradient(180deg, #f3f8fd 0%, #dde9f5 100%);
+        color: var(--ink);
+      }
+      a { color: inherit; }
+      .page {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 28px 22px 48px;
+      }
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: start;
+        margin-bottom: 18px;
+      }
+      .back-link {
+        text-decoration: none;
+        color: var(--accent);
+      }
+      .eyebrow {
+        margin: 0 0 6px;
+        color: var(--muted);
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      h1, h2, h3, p { margin-top: 0; }
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(320px, 0.9fr);
+        gap: 18px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 18px;
+      }
+      .detail-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .detail-card {
+        padding: 14px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.78);
+      }
+      .detail-card strong {
+        display: block;
+        font-size: 1.2rem;
+        margin: 4px 0 6px;
+      }
+      .detail-card span,
+      .detail-card p,
+      .detail-list-item span {
+        color: var(--muted);
+      }
+      .detail-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: grid;
+        gap: 14px;
+      }
+      .detail-list-item {
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+      @media (max-width: 980px) {
+        .grid,
+        .detail-grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="topbar">
+        <div>
+          <p class="eyebrow">Watchlist Drilldown</p>
+          <h1>${escapeHtml(payload.site.site)}</h1>
+          <p>${escapeHtml(payload.site.corridor)} · ${escapeHtml(payload.site.signal)} · ${escapeHtml(payload.site.focus)}</p>
+        </div>
+        <a class="back-link" href="/">Back to dashboard</a>
+      </div>
+      <div class="grid">
+        <section class="panel">
+          <p class="eyebrow">Watchlist Snapshot</p>
+          <div class="detail-grid">
+            <div class="detail-card">
+              <p class="eyebrow">Status</p>
+              <strong>${escapeHtml(payload.site.status)}</strong>
+              <span>Current staff-facing watchlist status</span>
+            </div>
+            <div class="detail-card">
+              <p class="eyebrow">Readiness</p>
+              <strong>${escapeHtml(payload.site.readiness)}</strong>
+              <span>Current readiness posture</span>
+            </div>
+            <div class="detail-card">
+              <p class="eyebrow">Score</p>
+              <strong>${escapeHtml(String(payload.site.score))}</strong>
+              <span>Current seeded watchlist score</span>
+            </div>
+            <div class="detail-card">
+              <p class="eyebrow">Updated</p>
+              <strong>${escapeHtml(payload.site.updatedAt)}</strong>
+              <span>Most recent seed-list update</span>
+            </div>
+          </div>
+        </section>
+        <section class="panel">
+          <p class="eyebrow">Current Interpretation</p>
+          <p>This seeded watchlist item is now linked to the live brief and signal workflow below so staff can move from corridor-level monitoring into parcel-level follow-up where addresses are available.</p>
+        </section>
+      </div>
+      <div class="grid" style="margin-top: 18px;">
+        <section class="panel">
+          <p class="eyebrow">Related Briefs</p>
+          <ul class="detail-list">${relatedBriefsMarkup}</ul>
+        </section>
+        <section class="panel">
+          <p class="eyebrow">Related Signals</p>
+          <ul class="detail-list">${relatedSignalsMarkup}</ul>
+        </section>
+      </div>
     </div>
   </body>
 </html>`;
@@ -3223,6 +3579,24 @@ export default {
       const nonce = generateCspNonce();
       return withSecurityHeaders(
         new Response(renderParcelDetailPage(payload, nonce), {
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+          },
+        }),
+        nonce,
+      );
+    }
+
+    if (request.method === "GET" && url.pathname === "/watchlist") {
+      const siteId = url.searchParams.get("id")?.trim() ?? "";
+      const payload = await buildWatchlistDetailPayload(siteId);
+      if (!payload) {
+        return withSecurityHeaders(new Response("Watchlist item not found", { status: 404 }));
+      }
+
+      const nonce = generateCspNonce();
+      return withSecurityHeaders(
+        new Response(renderWatchlistDetailPage(payload, nonce), {
           headers: {
             "content-type": "text/html; charset=utf-8",
           },
