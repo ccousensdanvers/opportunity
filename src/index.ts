@@ -1640,6 +1640,19 @@ function renderDashboard(payload: DashboardPayload): string {
         align-items: start;
       }
 
+      .watchlist {
+        grid-column: 1;
+      }
+
+      .side-stack {
+        grid-column: 2;
+        grid-row: 1 / span 2;
+      }
+
+      .strategic-panel {
+        grid-column: 1;
+      }
+
       .watchlist-head,
       .panel-head {
         display: flex;
@@ -1895,6 +1908,17 @@ function renderDashboard(payload: DashboardPayload): string {
             <div id="empty-state" class="empty" hidden>No sites match the current filter.</div>
           </div>
 
+          <section class="panel strategic-panel">
+            <p class="eyebrow">Strategic Insights</p>
+            <h3>What the current signal mix suggests for Danvers</h3>
+            <p>
+              These takeaways translate the live agenda feed, watchlist posture, and parcel-review queue into plain-language implications for staff prioritization.
+            </p>
+            <div class="insight-grid">
+              ${strategicInsightsMarkup}
+            </div>
+          </section>
+
           <div class="side-stack">
             <section class="panel">
               <div class="panel-head">
@@ -1926,17 +1950,6 @@ function renderDashboard(payload: DashboardPayload): string {
               </div>
               <ul class="activity-list">${renderActivityMarkup(payload.activity)}</ul>
             </section>
-          </div>
-        </section>
-
-        <section class="panel" style="margin-top: 16px;">
-          <p class="eyebrow">Strategic Insights</p>
-          <h3>What the current signal mix suggests for Danvers</h3>
-          <p>
-            These takeaways translate the live agenda feed, watchlist posture, and parcel-review queue into plain-language implications for staff prioritization.
-          </p>
-          <div class="insight-grid">
-            ${strategicInsightsMarkup}
           </div>
         </section>
       </main>
