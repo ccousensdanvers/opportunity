@@ -79,6 +79,10 @@ interface DashboardPayload {
 const AGENDA_CENTER_URL = "https://www.danversma.gov/AgendaCenter";
 const PLANNING_BOARD_AGENDA_URL = "https://www.danversma.gov/AgendaCenter/Planning-Board-11";
 const ZBA_AGENDA_URL = "https://www.danversma.gov/AgendaCenter/Zoning-Board-of-Appeals-18";
+const PLANNING_BOARD_RSS_URL =
+  "https://www.danversma.gov/RSSFeed.aspx?CID=Planning-Board-11&ModID=65";
+const ZBA_RSS_URL =
+  "https://www.danversma.gov/RSSFeed.aspx?CID=Zoning-Board-of-Appeals-18&ModID=65";
 const DANVERS_PARCELS_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
 const DANVERS_PARCELS_PAGE_SIZE = 1000;
@@ -521,6 +525,29 @@ async function fetchAgendaSignalsForBoard(
   return result.signals;
 }
 
+function extractRssTag(itemXml: string, tagName: string): string | null {
+  const match = itemXml.match(new RegExp(`<${tagName}>([\\s\\S]*?)<\\/${tagName}>`, "i"));
+  if (!match) {
+    return null;
+  }
+
+  return normalizeWhitespace(match[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/i, "$1"));
+}
+
+function formatRssPubDate(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return normalizeWhitespace(value);
+  }
+
+  return parsed.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "America/New_York",
+  });
+}
+
 async function fetchAgendaSignalsForBoardWithDebug(
   board: AgendaSignal["board"],
   url: string,
@@ -548,47 +575,17 @@ async function fetchAgendaSignalsForBoardWithDebug(
       };
     }
 
-    const html = await response.text();
+    const xml = await response.text();
     const signals: AgendaSignal[] = [];
     const seen = new Set<string>();
-    const dateBlocks = Array.from(
-      html.matchAll(/<h3[^>]*>\s*(?:<[^>]+>\s*)*([^<]+?)\s*(?:<\/[^>]+>\s*)*<\/h3>/gi),
-    );
-    const agendaHrefCount = Array.from(
-      html.matchAll(/href=['"][^'"]*\/AgendaCenter\/ViewFile\/Agenda\/[^'"]+['"]/gi),
-    ).length;
-    const meetingDates = dateBlocks
-      .map((match) => normalizeWhitespace(match[1]))
-      .filter((value) => /^[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}/.test(value));
+    const items = Array.from(xml.matchAll(/<item>([\s\S]*?)<\/item>/gi));
 
-    const boardTitles = Array.from(
-      html.matchAll(/<a\b[^>]*>\s*(?:<[^>]+>\s*)*([^<]+?)\s*(?:<\/[^>]+>\s*)*<\/a>/gi),
-    )
-      .map((match) => normalizeWhitespace(match[1]))
-      .filter(
-        (value) =>
-          value &&
-          value !== "Agenda" &&
-          value !== "Previous Versions" &&
-          value !== "Download" &&
-          !value.startsWith("View More") &&
-          !value.startsWith("202"),
-      )
-      .filter((value) => value.toLowerCase().includes(board.toLowerCase().replace(/\s+/g, " ")));
+    for (const [, itemXml] of items) {
+      const title = extractRssTag(itemXml, "title") ?? board;
+      const agendaUrl = extractRssTag(itemXml, "link");
+      const pubDate = extractRssTag(itemXml, "pubDate");
 
-    const agendaUrls = Array.from(
-      html.matchAll(/href=['"]([^'"]*\/AgendaCenter\/ViewFile\/Agenda\/[^'"]+)['"]/gi),
-    ).map((match) =>
-      match[1].startsWith("http") ? match[1] : `https://www.danversma.gov${match[1]}`,
-    );
-
-    const count = Math.min(meetingDates.length, boardTitles.length, agendaUrls.length, 8);
-    for (let index = 0; index < count; index += 1) {
-      const meetingDate = meetingDates[index];
-      const title = boardTitles[index];
-      const agendaUrl = agendaUrls[index];
-
-      if (!meetingDate || !title || !agendaUrl) {
+      if (!agendaUrl || !pubDate) {
         continue;
       }
 
@@ -596,6 +593,7 @@ async function fetchAgendaSignalsForBoardWithDebug(
         continue;
       }
 
+      const meetingDate = formatRssPubDate(pubDate);
       const key = `${board}|${meetingDate}|${agendaUrl}`;
       if (seen.has(key)) {
         continue;
@@ -607,7 +605,7 @@ async function fetchAgendaSignalsForBoardWithDebug(
         meetingDate,
         title,
         agendaUrl,
-        source: "danvers agenda center",
+        source: "danvers agenda rss",
       });
     }
 
@@ -618,9 +616,9 @@ async function fetchAgendaSignalsForBoardWithDebug(
       status: response.status,
       parsedCount: signals.length,
       signals: signals.slice(0, 8),
-      h3Count: dateBlocks.length,
-      agendaHrefCount,
-      htmlSample: html.slice(0, 1200),
+      h3Count: items.length,
+      agendaHrefCount: items.length,
+      htmlSample: xml.slice(0, 1200),
     };
   } catch (error) {
     return {
@@ -636,8 +634,8 @@ async function fetchAgendaSignalsForBoardWithDebug(
 
 async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
   const [planningSignals, zbaSignals] = await Promise.all([
-    fetchAgendaSignalsForBoard("Planning Board", PLANNING_BOARD_AGENDA_URL),
-    fetchAgendaSignalsForBoard("Zoning Board of Appeals", ZBA_AGENDA_URL),
+    fetchAgendaSignalsForBoard("Planning Board", PLANNING_BOARD_RSS_URL),
+    fetchAgendaSignalsForBoard("Zoning Board of Appeals", ZBA_RSS_URL),
   ]);
 
   const signals = [...planningSignals, ...zbaSignals]
@@ -649,8 +647,8 @@ async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
 
 async function fetchAgendaSignalsDebug() {
   const [planningBoard, zoningBoard] = await Promise.all([
-    fetchAgendaSignalsForBoardWithDebug("Planning Board", PLANNING_BOARD_AGENDA_URL),
-    fetchAgendaSignalsForBoardWithDebug("Zoning Board of Appeals", ZBA_AGENDA_URL),
+    fetchAgendaSignalsForBoardWithDebug("Planning Board", PLANNING_BOARD_RSS_URL),
+    fetchAgendaSignalsForBoardWithDebug("Zoning Board of Appeals", ZBA_RSS_URL),
   ]);
 
   const combined = [...planningBoard.signals, ...zoningBoard.signals]
