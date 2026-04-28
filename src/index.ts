@@ -2124,9 +2124,15 @@ async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): 
 }
 
 async function buildParcelDetailPayload(address: string, db?: D1Database): Promise<ParcelDetailPayload> {
-  const contexts = await fetchParcelContextForAddresses([address]);
-  const context = contexts[0] ?? null;
   const parcel = db ? await findParcelByAddress(db, address) : null;
+  const contextAddresses = Array.from(
+    new Set([
+      address,
+      parcel?.address ?? "",
+    ].map((value) => normalizeWhitespace(value)).filter(Boolean)),
+  );
+  const contexts = await fetchParcelContextForAddresses(contextAddresses);
+  const context = contexts[0] ?? null;
   const relatedMatches = db && parcel ? await listParcelMatchesForParcelId(db, parcel.id, 10) : [];
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
