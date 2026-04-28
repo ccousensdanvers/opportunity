@@ -584,12 +584,17 @@ async function fetchAgendaSignalsForBoardWithDebug(
       const title = extractRssTag(itemXml, "title") ?? board;
       const agendaUrl = extractRssTag(itemXml, "link");
       const pubDate = extractRssTag(itemXml, "pubDate");
+      const description = extractRssTag(itemXml, "description") ?? "";
 
       if (!agendaUrl || !pubDate) {
         continue;
       }
 
       if (title.toLowerCase().includes("cancel")) {
+        continue;
+      }
+
+      if (description.toLowerCase().includes("minutes added or updated")) {
         continue;
       }
 
