@@ -80,7 +80,7 @@ const AGENDA_CENTER_URL = "https://www.danversma.gov/AgendaCenter";
 const DANVERS_PARCELS_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
 const DANVERS_PARCELS_PAGE_SIZE = 1000;
-const INGEST_PARCEL_SAMPLE_LIMIT = 10;
+const INGEST_PARCEL_SAMPLE_LIMIT = 20;
 
 interface DanversParcelAttributes {
   MAP_PAR_ID?: string | null;
