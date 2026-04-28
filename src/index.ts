@@ -117,6 +117,9 @@ interface AgendaSignalDebugResult {
   error?: string;
   parsedCount: number;
   signals: AgendaSignal[];
+  h3Count?: number;
+  agendaHrefCount?: number;
+  htmlSample?: string;
 }
 
 const SITES: OpportunitySite[] = [
@@ -551,6 +554,9 @@ async function fetchAgendaSignalsForBoardWithDebug(
     const dateBlocks = Array.from(
       html.matchAll(/<h3[^>]*>\s*(?:<[^>]+>\s*)*([^<]+?)\s*(?:<\/[^>]+>\s*)*<\/h3>([\s\S]*?)(?=<h3\b|$)/gi),
     );
+    const agendaHrefCount = Array.from(
+      html.matchAll(/href=['"][^'"]*\/AgendaCenter\/ViewFile\/Agenda\/[^'"]+['"]/gi),
+    ).length;
 
     for (const [, rawDate, block] of dateBlocks) {
       const meetingDate = normalizeWhitespace(rawDate);
@@ -606,6 +612,9 @@ async function fetchAgendaSignalsForBoardWithDebug(
       status: response.status,
       parsedCount: signals.length,
       signals: signals.slice(0, 8),
+      h3Count: dateBlocks.length,
+      agendaHrefCount,
+      htmlSample: html.slice(0, 1200),
     };
   } catch (error) {
     return {
