@@ -960,8 +960,10 @@ async function fetchPacketText(url: string): Promise<string> {
 async function buildCaseBriefs(signals: AgendaSignal[]): Promise<CaseBrief[]> {
   const briefs = await Promise.all(
     signals.slice(0, 6).map(async (signal) => {
-      const packetText = await fetchPacketText(signal.agendaUrl);
-      const addresses = extractAddresses(packetText);
+      const titleAddresses = extractAddresses(signal.title);
+      const packetText = signal.source === "danvers projects page" ? "" : await fetchPacketText(signal.agendaUrl);
+      const packetAddresses = packetText ? extractAddresses(packetText) : [];
+      const addresses = titleAddresses.length ? titleAddresses : packetAddresses;
       const likelySite = addresses[0] ?? `${signal.board} agenda item`;
       const titleAndPacket = normalizeWhitespace(`${signal.title} ${packetText}`);
 
