@@ -506,7 +506,7 @@ async function fetchAgendaSignalsForBoard(
 ): Promise<AgendaSignal[]> {
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 4000);
+    const timeout = setTimeout(() => controller.abort(), 10000);
     const response = await fetch(url, {
       signal: controller.signal,
       headers: {
@@ -520,34 +520,55 @@ async function fetchAgendaSignalsForBoard(
     }
 
     const html = await response.text();
-    let currentDate: string | null = null;
     const signals: AgendaSignal[] = [];
     const seen = new Set<string>();
-
-    const dateCollector = new HeadingCollector((value) => {
-      currentDate = value || null;
-    });
-    const linkCollector = new AgendaLinkCollector(
-      () => board,
-      () => currentDate,
-      (signal) => {
-        const key = `${signal.board}|${signal.meetingDate}|${signal.agendaUrl}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          signals.push(signal);
-        }
-      },
+    const dateBlocks = Array.from(
+      html.matchAll(/<h3[^>]*>\s*(?:<[^>]+>\s*)*([^<]+?)\s*(?:<\/[^>]+>\s*)*<\/h3>([\s\S]*?)(?=<h3\b|$)/gi),
     );
 
-    await new HTMLRewriter()
-      .on("h3", dateCollector)
-      .on("a", linkCollector)
-      .transform(new Response(html))
-      .text();
+    for (const [, rawDate, block] of dateBlocks) {
+      const meetingDate = normalizeWhitespace(rawDate);
+      if (!meetingDate) {
+        continue;
+      }
 
-    return signals
-      .filter((signal) => !signal.title.toLowerCase().includes("cancel"))
-      .slice(0, 8);
+      const agendaMatch = block.match(
+        /<a[^>]+href="([^"]*\/AgendaCenter\/ViewFile\/Agenda\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/i,
+      );
+
+      if (!agendaMatch) {
+        continue;
+      }
+
+      const agendaUrl = agendaMatch[1].startsWith("http")
+        ? agendaMatch[1]
+        : `https://www.danversma.gov${agendaMatch[1]}`;
+      const title = normalizeWhitespace(agendaMatch[2].replace(/<[^>]+>/g, " "));
+
+      if (!title || title === "Agenda" || title === "Previous Versions") {
+        continue;
+      }
+
+      if (title.toLowerCase().includes("cancel")) {
+        continue;
+      }
+
+      const key = `${board}|${meetingDate}|${agendaUrl}`;
+      if (seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      signals.push({
+        board,
+        meetingDate,
+        title,
+        agendaUrl,
+        source: "danvers agenda center",
+      });
+    }
+
+    return signals.slice(0, 8);
   } catch {
     return [];
   }
