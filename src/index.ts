@@ -552,37 +552,43 @@ async function fetchAgendaSignalsForBoardWithDebug(
     const signals: AgendaSignal[] = [];
     const seen = new Set<string>();
     const dateBlocks = Array.from(
-      html.matchAll(/<h3[^>]*>\s*(?:<[^>]+>\s*)*([^<]+?)\s*(?:<\/[^>]+>\s*)*<\/h3>([\s\S]*?)(?=<h3\b|$)/gi),
+      html.matchAll(/<h3[^>]*>\s*(?:<[^>]+>\s*)*([^<]+?)\s*(?:<\/[^>]+>\s*)*<\/h3>/gi),
     );
     const agendaHrefCount = Array.from(
       html.matchAll(/href=['"][^'"]*\/AgendaCenter\/ViewFile\/Agenda\/[^'"]+['"]/gi),
     ).length;
+    const meetingDates = dateBlocks
+      .map((match) => normalizeWhitespace(match[1]))
+      .filter((value) => /^[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}/.test(value));
 
-    for (const [, rawDate, block] of dateBlocks) {
-      const meetingDate = normalizeWhitespace(rawDate);
-      if (!meetingDate) {
-        continue;
-      }
-
-      const agendaUrlMatch = block.match(
-        /href=['"]([^'"]*\/AgendaCenter\/ViewFile\/Agenda\/[^'"]+)['"]/i,
-      );
-      if (!agendaUrlMatch) {
-        continue;
-      }
-
-      const titleCandidates = Array.from(
-        block.matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi),
+    const boardTitles = Array.from(
+      html.matchAll(/<a\b[^>]*>\s*(?:<[^>]+>\s*)*([^<]+?)\s*(?:<\/[^>]+>\s*)*<\/a>/gi),
+    )
+      .map((match) => normalizeWhitespace(match[1]))
+      .filter(
+        (value) =>
+          value &&
+          value !== "Agenda" &&
+          value !== "Previous Versions" &&
+          value !== "Download" &&
+          !value.startsWith("View More") &&
+          !value.startsWith("202"),
       )
-        .map((match) => normalizeWhitespace(match[1].replace(/<[^>]+>/g, " ")))
-        .filter((value) => value && value !== "Agenda" && value !== "Previous Versions");
+      .filter((value) => value.toLowerCase().includes(board.toLowerCase().replace(/\s+/g, " ")));
 
-      const title = titleCandidates[0] ?? board;
-      const agendaUrl = agendaUrlMatch[1].startsWith("http")
-        ? agendaUrlMatch[1]
-        : `https://www.danversma.gov${agendaUrlMatch[1]}`;
+    const agendaUrls = Array.from(
+      html.matchAll(/href=['"]([^'"]*\/AgendaCenter\/ViewFile\/Agenda\/[^'"]+)['"]/gi),
+    ).map((match) =>
+      match[1].startsWith("http") ? match[1] : `https://www.danversma.gov${match[1]}`,
+    );
 
-      if (!title) {
+    const count = Math.min(meetingDates.length, boardTitles.length, agendaUrls.length, 8);
+    for (let index = 0; index < count; index += 1) {
+      const meetingDate = meetingDates[index];
+      const title = boardTitles[index];
+      const agendaUrl = agendaUrls[index];
+
+      if (!meetingDate || !title || !agendaUrl) {
         continue;
       }
 
