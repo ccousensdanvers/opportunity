@@ -106,6 +106,10 @@ interface StrategicBrief {
     caseBriefs: number;
     matched: number;
     needsReview: number;
+    assessedParcels?: number;
+    businessZonedParcels?: number;
+    floodConstrainedParcels?: number;
+    olderBuildingStockParcels?: number;
   };
   sourceCount: number;
 }
@@ -120,6 +124,10 @@ const ZBA_RSS_URL =
 const PROJECTS_PAGE_URL = "https://www.danversma.gov/235/Projects";
 const DANVERS_PARCELS_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
+const DANVERS_ASSESSOR_TABLE_URL =
+  "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/45/query";
+const DANVERS_FIRM_LAYER_URL =
+  "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/44/query";
 const DANVERS_PARCELS_PAGE_SIZE = 1000;
 const INGEST_PARCEL_SAMPLE_LIMIT = 250;
 
@@ -139,6 +147,62 @@ interface DanversParcelFeature {
 interface DanversParcelQueryResponse {
   features?: DanversParcelFeature[];
   exceededTransferLimit?: boolean;
+}
+
+interface ArcGisFeature<TAttributes = Record<string, unknown>, TGeometry = Record<string, unknown>> {
+  attributes?: TAttributes;
+  geometry?: TGeometry;
+}
+
+interface ArcGisQueryResponse<TAttributes = Record<string, unknown>, TGeometry = Record<string, unknown>> {
+  features?: Array<ArcGisFeature<TAttributes, TGeometry>>;
+  exceededTransferLimit?: boolean;
+}
+
+interface DanversAssessorAttributes {
+  PROP_ID?: string | null;
+  SITE_ADDR?: string | null;
+  LOCATION?: string | null;
+  FULL_LOCATION?: string | null;
+  OWNER1?: string | null;
+  OWN_CO?: string | null;
+  ZONING?: string | null;
+  TOTAL_VAL?: number | null;
+  LAND_VAL?: number | null;
+  BLDG_VAL?: number | null;
+  LOT_SIZE?: number | null;
+  YEAR_BUILT?: number | null;
+  USE_CODE?: number | null;
+  LOC_ID?: string | null;
+}
+
+interface DanversParcelGeometry {
+  rings?: number[][][];
+  spatialReference?: {
+    wkid?: number;
+    latestWkid?: number;
+  };
+}
+
+interface DanversFloodAttributes {
+  FLD_ZONE?: string | null;
+  SFHA_TF?: string | null;
+  STATIC_BFE?: number | null;
+  DEPTH?: number | null;
+}
+
+interface ParcelContext {
+  address: string;
+  ownerName: string | null;
+  zoning: string | null;
+  totalValue: number | null;
+  landValue: number | null;
+  buildingValue: number | null;
+  lotSize: number | null;
+  yearBuilt: number | null;
+  useCode: number | null;
+  floodZones: string[];
+  specialFloodHazard: boolean;
 }
 
 interface StrategicBriefRow {
@@ -349,6 +413,7 @@ function buildStatusPayload(env?: Env) {
         database: Boolean(env?.OPPORTUNITYDB),
         queue: Boolean(env?.OPPORTUNITYDB),
         strategicBriefs: Boolean(env?.OPPORTUNITYDB),
+        parcelContext: true,
       },
     },
   };
@@ -1153,6 +1218,7 @@ function buildStrategicBrief(
   signals: AgendaSignal[],
   briefs: CaseBrief[],
   reviewSummary: DashboardPayload["reviewSummary"],
+  parcelContexts: ParcelContext[] = [],
 ): StrategicBrief {
   const planningBoardBriefs = briefs.filter((brief) => brief.board === "Planning Board").length;
   const zbaBriefs = briefs.filter((brief) => brief.board === "Zoning Board of Appeals").length;
@@ -1162,6 +1228,12 @@ function buildStrategicBrief(
   const reviewShare = reviewSummary.total
     ? Math.round((reviewSummary.needsReview / reviewSummary.total) * 100)
     : 0;
+  const businessZonedParcels = parcelContexts.filter((context) => isBusinessZoning(context.zoning)).length;
+  const floodConstrainedParcels = parcelContexts.filter((context) => context.specialFloodHazard).length;
+  const olderBuildingStockParcels = parcelContexts.filter((context) => isOlderBuildingStock(context)).length;
+  const underbuiltBusinessParcels = parcelContexts.filter(
+    (context) => isBusinessZoning(context.zoning) && isLikelyUnderbuiltParcel(context),
+  ).length;
 
   let boardTitle = "Board activity is split across both review lanes";
   let boardDetail =
@@ -1185,13 +1257,28 @@ function buildStrategicBrief(
       : "Parcel-linked review records are not yet built up in the database, so the next value comes from continuing ingest and building a more complete site-level queue.";
 
   const postureTitle =
-    advancingSites >= 2
-      ? "Several tracked Danvers sites are moving beyond early watchlist status"
-      : "Most tracked opportunities are still in an early-read posture";
+    parcelContexts.length && businessZonedParcels > 0
+      ? "Brief-linked parcels are starting to show a real business-location pattern"
+      : advancingSites >= 2
+        ? "Several tracked Danvers sites are moving beyond early watchlist status"
+        : "Most tracked opportunities are still in an early-read posture";
   const postureDetail =
-    confidentBriefs > 0
-      ? `${advancingSites} sites are marked advancing, the average watchlist score is ${averageScore}, and ${confidentBriefs} briefs now include medium or high confidence clues. Danvers can start prioritizing corridor-specific response, not just broad monitoring.`
-      : `${advancingSites} sites are marked advancing, but the current extraction layer still produces limited high-confidence clues. Better source coverage and parcel validation should come before heavier policy moves.`;
+    parcelContexts.length && businessZonedParcels > 0
+      ? `${businessZonedParcels} of ${parcelContexts.length} brief-linked parcels fall in business-oriented zoning, ${olderBuildingStockParcels} show older building stock, and ${underbuiltBusinessParcels} look potentially underbuilt based on land-versus-building value. That is a stronger redevelopment screen than agenda text alone.`
+      : confidentBriefs > 0
+        ? `${advancingSites} sites are marked advancing, the average watchlist score is ${averageScore}, and ${confidentBriefs} briefs now include medium or high confidence clues. Danvers can start prioritizing corridor-specific response, not just broad monitoring.`
+        : `${advancingSites} sites are marked advancing, but the current extraction layer still produces limited high-confidence clues. Better source coverage and parcel validation should come before heavier policy moves.`;
+
+  const constraintInsightTitle =
+    floodConstrainedParcels > 0
+      ? "Some active leads also show clear physical constraints"
+      : "The current lead set does not yet show major flood-driven screening pressure";
+  const constraintInsightDetail =
+    floodConstrainedParcels > 0
+      ? `${floodConstrainedParcels} brief-linked parcels intersect special flood hazard areas. Those sites may still matter, but they should be treated as higher-friction redevelopment candidates needing earlier diligence.`
+      : parcelContexts.length
+        ? "The first parcel-context pass did not flag special flood hazard areas for the assessed lead set, which improves the odds that the current queue contains workable follow-up candidates."
+        : "Flood and assessor screening have not yet returned parcel context for the current queue, so constraints still need to be checked case by case.";
 
   const recommendations: StrategicRecommendation[] = [
     {
@@ -1215,9 +1302,24 @@ function buildStrategicBrief(
           : "Those filings can reveal where zoning, site constraints, or reuse issues are slowing investment before projects mature.",
     },
     {
-      action: "Use the advancing watchlist to focus business-retention and redevelopment follow-up.",
+      action:
+        businessZonedParcels > 0
+          ? "Use business-zoned brief-linked parcels as the first redevelopment follow-up list."
+          : "Use the advancing watchlist to focus business-retention and redevelopment follow-up.",
       whyItMatters:
-        "The combination of site readiness, case-brief confidence, and corridor context gives Danvers a practical shortlist for staff outreach and internal coordination.",
+        businessZonedParcels > 0
+          ? "That shortlist now has parcel context behind it, which makes staff outreach and internal coordination more targeted and more defensible."
+          : "The combination of site readiness, case-brief confidence, and corridor context gives Danvers a practical shortlist for staff outreach and internal coordination.",
+    },
+    {
+      action:
+        floodConstrainedParcels > 0
+          ? "Separate flood-constrained leads from easier near-term candidates."
+          : "Keep adding parcel screening so constraints can be ruled in or out earlier.",
+      whyItMatters:
+        floodConstrainedParcels > 0
+          ? "That prevents the Town from spending the same level of attention on straightforward sites and more complex resilience- or permitting-heavy sites."
+          : "The next jump in recommendation quality will come from consistently screening physical and regulatory constraints before staff time is spent.",
     },
   ];
 
@@ -1225,7 +1327,7 @@ function buildStrategicBrief(
     generatedAt,
     trigger,
     title: "Danvers Strategic Brief",
-    summary: `This briefing reflects ${signals.length} live agenda signals, ${briefs.length} case briefs, and ${reviewSummary.matched} parcel-linked opportunities. It is intended as decision support for Danvers economic development follow-up.`,
+    summary: `This briefing reflects ${signals.length} live agenda signals, ${briefs.length} case briefs, ${reviewSummary.matched} parcel-linked opportunities, and ${parcelContexts.length} parcel-context checks from Danvers assessor and flood data. It is intended as decision support for Danvers economic development follow-up.`,
     insights: [
       {
         eyebrow: "Strategic Insight",
@@ -1242,6 +1344,11 @@ function buildStrategicBrief(
         title: postureTitle,
         detail: postureDetail,
       },
+      {
+        eyebrow: "Constraints",
+        title: constraintInsightTitle,
+        detail: constraintInsightDetail,
+      },
     ],
     recommendations,
     metrics: {
@@ -1249,8 +1356,12 @@ function buildStrategicBrief(
       caseBriefs: briefs.length,
       matched: reviewSummary.matched,
       needsReview: reviewSummary.needsReview,
+      assessedParcels: parcelContexts.length,
+      businessZonedParcels,
+      floodConstrainedParcels,
+      olderBuildingStockParcels,
     },
-    sourceCount: signals.length + briefs.length,
+    sourceCount: signals.length + briefs.length + parcelContexts.length,
   };
 }
 
@@ -1366,6 +1477,9 @@ async function createAndPersistStrategicBrief(
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
   const reviewSummary = await fetchDashboardReviewSummary(db);
+  const parcelContexts = await fetchParcelContextForAddresses(
+    Array.from(new Set(briefs.flatMap((brief) => brief.addresses))),
+  );
   const brief = buildStrategicBrief(
     new Date().toISOString(),
     trigger,
@@ -1373,6 +1487,7 @@ async function createAndPersistStrategicBrief(
     signals,
     briefs,
     reviewSummary,
+    parcelContexts,
   );
   await persistStrategicBrief(db, brief);
   return brief;
@@ -1404,22 +1519,29 @@ function toTitleCase(value: string): string {
     .join(" ");
 }
 
-function buildDanversParcelAddressQueryUrl(address: string): string {
-  const variants = Array.from(
+function buildArcGisAddressVariants(address: string): string[] {
+  return Array.from(
     new Set([
       normalizeWhitespace(address),
       normalizeWhitespace(address).toUpperCase(),
       toTitleCase(normalizeWhitespace(address)),
     ].filter(Boolean)),
   );
+}
 
-  const where = variants
+function buildDanversParcelWhereClause(address: string): string {
+  const variants = buildArcGisAddressVariants(address);
+
+  return variants
     .map((value) => {
       const escaped = escapeArcGisWhereLiteral(value);
       return `(Location = '${escaped}' OR StreetName = '${escaped}')`;
     })
     .join(" OR ");
+}
 
+function buildDanversParcelAddressQueryUrl(address: string): string {
+  const where = buildDanversParcelWhereClause(address);
   const params = new URLSearchParams({
     where,
     returnGeometry: "false",
@@ -1428,6 +1550,53 @@ function buildDanversParcelAddressQueryUrl(address: string): string {
   });
 
   return `${DANVERS_PARCELS_LAYER_URL}?${params.toString()}`;
+}
+
+function buildDanversAssessorQueryUrl(address: string): string {
+  const variants = buildArcGisAddressVariants(address);
+
+  const where = variants
+    .map((value) => {
+      const escaped = escapeArcGisWhereLiteral(value);
+      return `(SITE_ADDR = '${escaped}' OR LOCATION = '${escaped}' OR FULL_LOCATION = '${escaped}')`;
+    })
+    .join(" OR ");
+
+  const params = new URLSearchParams({
+    where,
+    returnGeometry: "false",
+    outFields:
+      "PROP_ID,SITE_ADDR,LOCATION,FULL_LOCATION,OWNER1,OWN_CO,ZONING,TOTAL_VAL,LAND_VAL,BLDG_VAL,LOT_SIZE,YEAR_BUILT,USE_CODE,LOC_ID",
+    f: "json",
+  });
+
+  return `${DANVERS_ASSESSOR_TABLE_URL}?${params.toString()}`;
+}
+
+function buildDanversParcelGeometryQueryUrl(address: string): string {
+  const params = new URLSearchParams({
+    where: buildDanversParcelWhereClause(address),
+    returnGeometry: "true",
+    outFields: "MAP_PAR_ID,Location,StreetName",
+    outSR: "2249",
+    f: "json",
+  });
+
+  return `${DANVERS_PARCELS_LAYER_URL}?${params.toString()}`;
+}
+
+function buildDanversFloodQueryUrl(geometry: DanversParcelGeometry): string {
+  const params = new URLSearchParams({
+    geometry: JSON.stringify(geometry),
+    geometryType: "esriGeometryPolygon",
+    inSR: String(geometry.spatialReference?.latestWkid ?? geometry.spatialReference?.wkid ?? 2249),
+    spatialRel: "esriSpatialRelIntersects",
+    returnGeometry: "false",
+    outFields: "FLD_ZONE,SFHA_TF,STATIC_BFE,DEPTH",
+    f: "json",
+  });
+
+  return `${DANVERS_FIRM_LAYER_URL}?${params.toString()}`;
 }
 
 function buildParcelAliases(attributes: DanversParcelAttributes): ParcelUpsertInput["aliases"] {
@@ -1521,6 +1690,132 @@ async function fetchDanversParcels(priorityAddresses: string[] = []): Promise<Pa
   return parcels;
 }
 
+function normalizeParcelContextAddress(attributes: DanversAssessorAttributes): string | null {
+  return attributes.SITE_ADDR?.trim()
+    || attributes.LOCATION?.trim()
+    || attributes.FULL_LOCATION?.trim()
+    || null;
+}
+
+function normalizeFloodZoneLabel(value?: string | null): string | null {
+  const normalized = normalizeWhitespace(value ?? "");
+  return normalized || null;
+}
+
+function isBusinessZoning(zoning?: string | null): boolean {
+  const normalized = (zoning ?? "").trim().toUpperCase();
+  return normalized.startsWith("C")
+    || normalized.startsWith("I")
+    || normalized === "HC"
+    || normalized === "HCD"
+    || normalized === "VIL";
+}
+
+function isOlderBuildingStock(context: ParcelContext): boolean {
+  return typeof context.yearBuilt === "number" && context.yearBuilt > 0 && context.yearBuilt <= 1980;
+}
+
+function isLikelyUnderbuiltParcel(context: ParcelContext): boolean {
+  if (
+    typeof context.landValue !== "number"
+    || typeof context.buildingValue !== "number"
+    || context.landValue <= 0
+    || context.buildingValue < 0
+  ) {
+    return false;
+  }
+
+  return context.landValue >= context.buildingValue;
+}
+
+async function fetchParcelFloodContext(address: string): Promise<{
+  floodZones: string[];
+  specialFloodHazard: boolean;
+}> {
+  try {
+    const parcelPayload = await fetchJson<ArcGisQueryResponse<Record<string, unknown>, DanversParcelGeometry>>(
+      buildDanversParcelGeometryQueryUrl(address),
+      15000,
+    );
+    const parcelGeometry = parcelPayload.features?.find((feature) => feature.geometry?.rings)?.geometry;
+
+    if (!parcelGeometry) {
+      return { floodZones: [], specialFloodHazard: false };
+    }
+
+    const floodPayload = await fetchJson<ArcGisQueryResponse<DanversFloodAttributes>>(
+      buildDanversFloodQueryUrl(parcelGeometry),
+      15000,
+    );
+    const zones = Array.from(
+      new Set(
+        (floodPayload.features ?? [])
+          .map((feature) => normalizeFloodZoneLabel(feature.attributes?.FLD_ZONE))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    );
+    const specialFloodHazard = (floodPayload.features ?? []).some(
+      (feature) => normalizeWhitespace(feature.attributes?.SFHA_TF ?? "").toUpperCase() === "T",
+    );
+
+    return { floodZones: zones, specialFloodHazard };
+  } catch {
+    return { floodZones: [], specialFloodHazard: false };
+  }
+}
+
+async function fetchParcelContextForAddresses(addresses: string[]): Promise<ParcelContext[]> {
+  const contexts: ParcelContext[] = [];
+  const seenAddresses = new Set<string>();
+
+  for (const rawAddress of addresses) {
+    const address = normalizeWhitespace(rawAddress);
+    if (!address || seenAddresses.has(address.toLowerCase())) {
+      continue;
+    }
+
+    seenAddresses.add(address.toLowerCase());
+
+    try {
+      const assessorPayload = await fetchJson<ArcGisQueryResponse<DanversAssessorAttributes>>(
+        buildDanversAssessorQueryUrl(address),
+        15000,
+      );
+      const feature = (assessorPayload.features ?? []).find(
+        (candidate) => Boolean(normalizeParcelContextAddress(candidate.attributes ?? {})),
+      );
+
+      if (!feature?.attributes) {
+        continue;
+      }
+
+      const normalizedAddress = normalizeParcelContextAddress(feature.attributes);
+      if (!normalizedAddress) {
+        continue;
+      }
+
+      const flood = await fetchParcelFloodContext(normalizedAddress);
+      contexts.push({
+        address: normalizedAddress,
+        ownerName: feature.attributes.OWNER1?.trim() || feature.attributes.OWN_CO?.trim() || null,
+        zoning: feature.attributes.ZONING?.trim() || null,
+        totalValue: typeof feature.attributes.TOTAL_VAL === "number" ? feature.attributes.TOTAL_VAL : null,
+        landValue: typeof feature.attributes.LAND_VAL === "number" ? feature.attributes.LAND_VAL : null,
+        buildingValue: typeof feature.attributes.BLDG_VAL === "number" ? feature.attributes.BLDG_VAL : null,
+        lotSize: typeof feature.attributes.LOT_SIZE === "number" ? feature.attributes.LOT_SIZE : null,
+        yearBuilt: typeof feature.attributes.YEAR_BUILT === "number" ? feature.attributes.YEAR_BUILT : null,
+        useCode: typeof feature.attributes.USE_CODE === "number" ? feature.attributes.USE_CODE : null,
+        floodZones: flood.floodZones,
+        specialFloodHazard: flood.specialFloodHazard,
+      });
+    } catch {
+      continue;
+    }
+  }
+
+  return contexts;
+}
+
 function buildOpportunityInputs(
   briefs: CaseBrief[],
   parcels: ParcelUpsertInput[],
@@ -1566,9 +1861,12 @@ async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): 
   const briefs = await buildCaseBriefs(signals);
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const latestStoredBrief = await fetchLatestStrategicBrief(db);
+  const parcelContexts = latestStoredBrief
+    ? []
+    : await fetchParcelContextForAddresses(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))));
   const strategicBrief =
     latestStoredBrief ??
-    buildStrategicBrief(new Date().toISOString(), "live", SITES, signals, briefs, reviewSummary);
+    buildStrategicBrief(new Date().toISOString(), "live", SITES, signals, briefs, reviewSummary, parcelContexts);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -2448,10 +2746,10 @@ export default {
           {
             enabled: Boolean(env.OPPORTUNITYDB),
             detail: env.OPPORTUNITYDB
-              ? "D1 binding is available for automated parcel ingest, parcel matching, and stored strategic briefs."
+              ? "D1 binding is available for automated parcel ingest, parcel matching, stored strategic briefs, and parcel-context screening."
               : "D1 binding is not configured yet.",
             nextStep: env.OPPORTUNITYDB
-              ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, match them to parcels, and save a strategic brief for the dashboard."
+              ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, match them to parcels, screen brief-linked parcels against assessor and flood context, and save a strategic brief for the dashboard."
               : "Attach D1 and persist case briefs, then map briefs to parcels, corridors, and recurring strategic briefs.",
           },
           { status: 200 },
