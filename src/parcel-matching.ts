@@ -69,6 +69,14 @@ export interface ParcelReviewItem {
   } | null;
 }
 
+export interface ParcelLookupResult {
+  id: number;
+  mapLot: string | null;
+  address: string | null;
+  ownerName: string | null;
+  zoningDistrict: string | null;
+}
+
 const ADDRESS_SYNONYMS: Record<string, string> = {
   avenue: "ave",
   av: "ave",
@@ -593,4 +601,118 @@ export async function debugLookupParcelAddress(
     exactAliasMatches: exact.results ?? [],
     prefixAliasMatches: prefix.results ?? [],
   };
+}
+
+export async function findParcelByAddress(
+  db: D1Database,
+  rawAddress: string,
+): Promise<ParcelLookupResult | null> {
+  const normalizedAddress = normalizeAddress(rawAddress);
+  if (!normalizedAddress) {
+    return null;
+  }
+
+  const exact = await db.prepare(
+    `
+    SELECT
+      p.id AS id,
+      p.map_lot AS mapLot,
+      p.address AS address,
+      p.owner_name AS ownerName,
+      p.zoning_district AS zoningDistrict
+    FROM parcel_aliases a
+    JOIN parcels p ON p.id = a.parcel_id
+    WHERE a.alias_type = 'address' AND a.alias_value_norm = ?
+    LIMIT 1
+    `,
+  ).bind(normalizedAddress).first<ParcelLookupResult>();
+
+  if (exact) {
+    return exact;
+  }
+
+  return await db.prepare(
+    `
+    SELECT
+      p.id AS id,
+      p.map_lot AS mapLot,
+      p.address AS address,
+      p.owner_name AS ownerName,
+      p.zoning_district AS zoningDistrict
+    FROM parcel_aliases a
+    JOIN parcels p ON p.id = a.parcel_id
+    WHERE a.alias_type = 'address'
+      AND (a.alias_value_norm LIKE ? || '%' OR ? LIKE a.alias_value_norm || '%')
+    ORDER BY LENGTH(a.alias_value_norm) DESC
+    LIMIT 1
+    `,
+  ).bind(normalizedAddress, normalizedAddress).first<ParcelLookupResult>();
+}
+
+export async function listParcelMatchesForParcelId(
+  db: D1Database,
+  parcelId: number,
+  limit = 10,
+): Promise<ParcelReviewItem[]> {
+  const safeLimit = Math.min(Math.max(limit, 1), 25);
+  const { results } = await db.prepare(
+    `
+    SELECT
+      m.opportunity_id AS opportunityId,
+      m.parcel_id AS parcelId,
+      m.match_type AS matchType,
+      m.confidence AS confidence,
+      m.input_value AS inputValue,
+      m.matched_value AS matchedValue,
+      m.needs_review AS needsReview,
+      m.raw_input_json AS rawInputJson,
+      m.created_at AS createdAt,
+      m.updated_at AS updatedAt,
+      p.map_lot AS mapLot,
+      p.address AS address,
+      p.owner_name AS ownerName,
+      p.zoning_district AS zoningDistrict
+    FROM opportunity_parcel_matches m
+    LEFT JOIN parcels p ON p.id = m.parcel_id
+    WHERE m.parcel_id = ?
+    ORDER BY m.updated_at DESC
+    LIMIT ?
+    `,
+  ).bind(parcelId, safeLimit).all<{
+    opportunityId: string;
+    parcelId: number | null;
+    matchType: ParcelMatchType;
+    confidence: number;
+    inputValue: string | null;
+    matchedValue: string | null;
+    needsReview: number;
+    rawInputJson: string;
+    createdAt: string;
+    updatedAt: string;
+    mapLot: string | null;
+    address: string | null;
+    ownerName: string | null;
+    zoningDistrict: string | null;
+  }>();
+
+  return (results ?? []).map((row) => ({
+    opportunityId: row.opportunityId,
+    parcelId: row.parcelId,
+    matchType: row.matchType,
+    confidence: row.confidence,
+    inputValue: row.inputValue,
+    matchedValue: row.matchedValue,
+    needsReview: Boolean(row.needsReview),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    input: JSON.parse(row.rawInputJson) as OpportunityParcelInput,
+    parcel: row.parcelId
+      ? {
+          mapLot: row.mapLot,
+          address: row.address,
+          ownerName: row.ownerName,
+          zoningDistrict: row.zoningDistrict,
+        }
+      : null,
+  }));
 }

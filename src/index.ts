@@ -1,10 +1,14 @@
 import {
   debugLookupParcelAddress,
+  findParcelByAddress,
   listParcelReviewQueue,
+  listParcelMatchesForParcelId,
   matchAndPersistOpportunities,
   upsertParcels,
+  type ParcelLookupResult,
   type OpportunityParcelInput,
   type ParcelUpsertInput,
+  type ParcelReviewItem,
 } from "./parcel-matching";
 
 type IngestTrigger = "manual" | "scheduled";
@@ -232,6 +236,13 @@ interface ParcelContext {
   externalSewerServiceArea: boolean;
   intersectsWetlands: boolean;
   intersectsGroundwaterProtection: boolean;
+}
+
+interface ParcelDetailPayload {
+  requestedAddress: string;
+  parcel: ParcelLookupResult | null;
+  context: ParcelContext | null;
+  relatedMatches: ParcelReviewItem[];
 }
 
 interface StrategicBriefRow {
@@ -2072,6 +2083,20 @@ async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): 
   };
 }
 
+async function buildParcelDetailPayload(address: string, db?: D1Database): Promise<ParcelDetailPayload> {
+  const contexts = await fetchParcelContextForAddresses([address]);
+  const context = contexts[0] ?? null;
+  const parcel = db ? await findParcelByAddress(db, address) : null;
+  const relatedMatches = db && parcel ? await listParcelMatchesForParcelId(db, parcel.id, 10) : [];
+
+  return {
+    requestedAddress: address,
+    parcel,
+    context,
+    relatedMatches,
+  };
+}
+
 function renderMetricMarkup(summary: SummaryMetric[]): string {
   return summary
     .map(
@@ -2083,6 +2108,11 @@ function renderMetricMarkup(summary: SummaryMetric[]): string {
         </article>`,
     )
     .join("");
+}
+
+function buildParcelDetailHref(address: string): string {
+  const params = new URLSearchParams({ address });
+  return `/parcel?${params.toString()}`;
 }
 
 function renderTableRows(sites: OpportunitySite[]): string {
@@ -2103,14 +2133,21 @@ function renderTableRows(sites: OpportunitySite[]): string {
 function renderBriefMarkup(briefs: CaseBrief[]): string {
   return briefs
     .map(
-      (brief) => `
+      (brief) => {
+        const drilldownAddress = brief.addresses[0] ?? "";
+        const siteMarkup = drilldownAddress
+          ? `<a class="brief-site-link" href="${escapeHtml(buildParcelDetailHref(drilldownAddress))}">${escapeHtml(brief.likelySite)}</a>`
+          : escapeHtml(brief.likelySite);
+
+        return `
         <li class="brief-item">
           <div class="brief-topline"><span>${escapeHtml(brief.board)}</span><span>${escapeHtml(brief.confidence)}</span></div>
-          <p class="brief-site">${escapeHtml(brief.likelySite)}</p>
+          <p class="brief-site">${siteMarkup}</p>
           <p class="brief-type">${escapeHtml(brief.signalType)}</p>
           <p class="brief-rationale">${escapeHtml(brief.rationale)}</p>
           <div class="brief-meta"><span>${escapeHtml(brief.meetingDate)} · ${escapeHtml(formatSourceLabel(brief.source))}</span><a href="${escapeHtml(brief.agendaUrl)}" target="_blank" rel="noreferrer">Open source</a></div>
-        </li>`,
+        </li>`;
+      },
     )
     .join("");
 }
@@ -2166,6 +2203,30 @@ function renderStrategicRecommendationsMarkup(payload: DashboardPayload): string
         </li>`,
     )
     .join("");
+}
+
+function formatCurrency(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "Not available";
+  }
+
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: 0,
+  }).format(value);
+}
+
+function formatNumber(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return "Not available";
+  }
+
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+function formatBooleanLabel(value: boolean, yesLabel: string, noLabel: string): string {
+  return value ? yesLabel : noLabel;
 }
 
 function renderStrategicScorecardMarkup(payload: DashboardPayload): string {
@@ -2555,6 +2616,16 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         font-size: 1.05rem;
       }
 
+      .brief-site-link {
+        color: var(--ink);
+        text-decoration-color: rgba(0, 90, 156, 0.35);
+        text-underline-offset: 2px;
+      }
+
+      .brief-site-link:hover {
+        color: var(--accent);
+      }
+
       .brief-type {
         margin: 6px 0 0;
         color: var(--accent);
@@ -2920,6 +2991,205 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
 </html>`;
 }
 
+function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): string {
+  const context = payload.context;
+  const title = payload.parcel?.address ?? context?.address ?? payload.requestedAddress;
+  const relatedMatchesMarkup = payload.relatedMatches.length
+    ? payload.relatedMatches.map((item) => `
+        <li class="detail-list-item">
+          <strong>${escapeHtml(item.input.address ?? item.input.mapLot ?? item.opportunityId)}</strong>
+          <p>${escapeHtml(item.matchType)} · confidence ${escapeHtml(String(item.confidence))}${item.needsReview ? " · needs review" : ""}</p>
+          <span>Updated ${escapeHtml(new Date(item.updatedAt).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" }))}</span>
+        </li>`).join("")
+    : `<li class="detail-list-item"><strong>No related matched opportunities yet.</strong><p>This parcel has not been tied to stored opportunity records in D1 yet.</p></li>`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${escapeHtml(title)} | Opportunity</title>
+    <style nonce="${escapeHtml(nonce)}">
+      :root {
+        --bg: #eef5fb;
+        --panel: rgba(248, 251, 255, 0.9);
+        --ink: #12324f;
+        --muted: #5d7791;
+        --line: rgba(18, 50, 79, 0.12);
+        --accent: #005a9c;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: Georgia, "Times New Roman", serif;
+        background: linear-gradient(180deg, #f3f8fd 0%, #dde9f5 100%);
+        color: var(--ink);
+      }
+      a { color: inherit; }
+      .page {
+        max-width: 1180px;
+        margin: 0 auto;
+        padding: 28px 22px 48px;
+      }
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: start;
+        margin-bottom: 18px;
+      }
+      .back-link {
+        text-decoration: none;
+        color: var(--accent);
+      }
+      .eyebrow {
+        margin: 0 0 6px;
+        color: var(--muted);
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      h1, h2, h3, p { margin-top: 0; }
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+        gap: 18px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 18px;
+      }
+      .detail-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .detail-card {
+        padding: 14px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.78);
+      }
+      .detail-card strong {
+        display: block;
+        font-size: 1.2rem;
+        margin: 4px 0 6px;
+      }
+      .detail-card span,
+      .detail-list-item span,
+      .detail-card p {
+        color: var(--muted);
+      }
+      .detail-list {
+        list-style: none;
+        padding: 0;
+        margin: 0;
+        display: grid;
+        gap: 14px;
+      }
+      .detail-list-item {
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+      .status-row {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        padding: 0 12px;
+        border-radius: 999px;
+        background: rgba(0, 90, 156, 0.1);
+        color: var(--accent);
+      }
+      @media (max-width: 980px) {
+        .grid,
+        .detail-grid,
+        .status-row {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="topbar">
+        <div>
+          <p class="eyebrow">Parcel Drilldown</p>
+          <h1>${escapeHtml(title)}</h1>
+          <p>This page pulls together ownership, zoning, value, and screening context for the selected address.</p>
+        </div>
+        <a class="back-link" href="/">Back to dashboard</a>
+      </div>
+      <div class="grid">
+        <section class="panel">
+          <p class="eyebrow">Parcel Snapshot</p>
+          <div class="detail-grid">
+            <div class="detail-card">
+              <p class="eyebrow">Owner</p>
+              <strong>${escapeHtml(context?.ownerName ?? payload.parcel?.ownerName ?? "Not available")}</strong>
+              <span>Current assessor ownership name</span>
+            </div>
+            <div class="detail-card">
+              <p class="eyebrow">Zoning</p>
+              <strong>${escapeHtml(context?.zoning ?? payload.parcel?.zoningDistrict ?? "Not available")}</strong>
+              <span>Current zoning district</span>
+            </div>
+            <div class="detail-card">
+              <p class="eyebrow">Map-Lot</p>
+              <strong>${escapeHtml(payload.parcel?.mapLot ?? "Not available")}</strong>
+              <span>Stored parcel identifier</span>
+            </div>
+            <div class="detail-card">
+              <p class="eyebrow">Year Built</p>
+              <strong>${escapeHtml(context?.yearBuilt ? String(context.yearBuilt) : "Not available")}</strong>
+              <span>Assessor building year</span>
+            </div>
+            <div class="detail-card">
+              <p class="eyebrow">Total Value</p>
+              <strong>${escapeHtml(formatCurrency(context?.totalValue))}</strong>
+              <span>Assessor total value</span>
+            </div>
+            <div class="detail-card">
+              <p class="eyebrow">Lot Size</p>
+              <strong>${escapeHtml(formatNumber(context?.lotSize))}</strong>
+              <span>Square feet from assessor data</span>
+            </div>
+          </div>
+        </section>
+        <section class="panel">
+          <p class="eyebrow">Readiness and Constraints</p>
+          <div class="status-row">
+            <div class="detail-card">
+              <p class="eyebrow">Utilities</p>
+              <strong>${escapeHtml(formatBooleanLabel(Boolean(context?.hasMappedWaterAccess || context?.hasMappedSewerAccess), "Mapped utility context found", "No mapped utility context found"))}</strong>
+              <span>Water ${escapeHtml(context?.hasMappedWaterAccess ? "yes" : "no")} · Sewer ${escapeHtml(context?.hasMappedSewerAccess ? "yes" : "no")}</span>
+            </div>
+            <div class="detail-card">
+              <p class="eyebrow">Environmental Flags</p>
+              <strong>${escapeHtml(formatBooleanLabel(Boolean(context?.specialFloodHazard || context?.intersectsWetlands || context?.intersectsGroundwaterProtection), "Constraint screening flagged", "No major screening flags found"))}</strong>
+              <span>Flood ${escapeHtml(context?.specialFloodHazard ? "yes" : "no")} · Wetlands ${escapeHtml(context?.intersectsWetlands ? "yes" : "no")} · Groundwater ${escapeHtml(context?.intersectsGroundwaterProtection ? "yes" : "no")}</span>
+            </div>
+          </div>
+          <div style="margin-top: 14px;">
+            <span class="status-pill">${escapeHtml(context?.floodZones?.length ? context.floodZones.join(", ") : "No mapped flood zone label")}</span>
+          </div>
+        </section>
+      </div>
+      <section class="panel" style="margin-top: 18px;">
+        <p class="eyebrow">Related Opportunity Records</p>
+        <ul class="detail-list">${relatedMatchesMarkup}</ul>
+      </section>
+    </div>
+  </body>
+</html>`;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -2938,8 +3208,51 @@ export default {
       );
     }
 
+    if (request.method === "GET" && url.pathname === "/parcel") {
+      const address = url.searchParams.get("address")?.trim() ?? "";
+      if (!address) {
+        return withSecurityHeaders(
+          Response.json(
+            { ok: false, error: "Query string must include an address parameter." },
+            { status: 400 },
+          ),
+        );
+      }
+
+      const payload = await buildParcelDetailPayload(address, env.OPPORTUNITYDB);
+      const nonce = generateCspNonce();
+      return withSecurityHeaders(
+        new Response(renderParcelDetailPage(payload, nonce), {
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+          },
+        }),
+        nonce,
+      );
+    }
+
     if (request.method === "GET" && url.pathname === "/api/status") {
       return withSecurityHeaders(Response.json(buildStatusPayload(env)));
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/parcel-detail") {
+      const address = url.searchParams.get("address")?.trim() ?? "";
+      if (!address) {
+        return withSecurityHeaders(
+          Response.json(
+            { ok: false, error: "Query string must include an address parameter." },
+            { status: 400 },
+          ),
+        );
+      }
+
+      const payload = await buildParcelDetailPayload(address, env.OPPORTUNITYDB);
+      return withSecurityHeaders(
+        Response.json({
+          ok: true,
+          ...payload,
+        }),
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/api/sites") {
