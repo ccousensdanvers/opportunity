@@ -114,6 +114,7 @@ interface StrategicBrief {
     sewerServedParcels?: number;
     externalServiceAreaParcels?: number;
     wetlandConstrainedParcels?: number;
+    groundwaterConstrainedParcels?: number;
   };
   sourceCount: number;
 }
@@ -144,6 +145,8 @@ const DANVERS_FORCE_MAIN_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/38/query";
 const MASSGIS_WETLANDS_LAYER_URL =
   "https://arcgisserver.digital.mass.gov/arcgisserver/rest/services/AGOL/DEP_Wetlands/FeatureServer/0/query";
+const DANVERS_GROUNDWATER_PROTECTION_LAYER_URL =
+  "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/22/query";
 const DANVERS_PARCELS_PAGE_SIZE = 1000;
 const INGEST_PARCEL_SAMPLE_LIMIT = 250;
 
@@ -228,6 +231,7 @@ interface ParcelContext {
   externalWaterServiceArea: boolean;
   externalSewerServiceArea: boolean;
   intersectsWetlands: boolean;
+  intersectsGroundwaterProtection: boolean;
 }
 
 interface StrategicBriefRow {
@@ -1265,6 +1269,9 @@ function buildStrategicBrief(
     (context) => context.externalWaterServiceArea || context.externalSewerServiceArea,
   ).length;
   const wetlandConstrainedParcels = parcelContexts.filter((context) => context.intersectsWetlands).length;
+  const groundwaterConstrainedParcels = parcelContexts.filter(
+    (context) => context.intersectsGroundwaterProtection,
+  ).length;
 
   let boardTitle = "Board activity is split across both review lanes";
   let boardDetail =
@@ -1301,15 +1308,15 @@ function buildStrategicBrief(
         : `${advancingSites} sites are marked advancing, but the current extraction layer still produces limited high-confidence clues. Better source coverage and parcel validation should come before heavier policy moves.`;
 
   const constraintInsightTitle =
-    floodConstrainedParcels > 0 || wetlandConstrainedParcels > 0
+    floodConstrainedParcels > 0 || wetlandConstrainedParcels > 0 || groundwaterConstrainedParcels > 0
       ? "Some active leads also show clear physical constraints"
-      : "The current lead set does not yet show major flood- or wetlands-driven screening pressure";
+      : "The current lead set does not yet show major flood-, wetlands-, or groundwater-driven screening pressure";
   const constraintInsightDetail =
-    floodConstrainedParcels > 0 || wetlandConstrainedParcels > 0
-      ? `${floodConstrainedParcels} brief-linked parcels intersect special flood hazard areas and ${wetlandConstrainedParcels} intersect mapped wetlands. Those sites may still matter, but they should be treated as higher-friction redevelopment candidates needing earlier diligence.`
+    floodConstrainedParcels > 0 || wetlandConstrainedParcels > 0 || groundwaterConstrainedParcels > 0
+      ? `${floodConstrainedParcels} brief-linked parcels intersect special flood hazard areas, ${wetlandConstrainedParcels} intersect mapped wetlands, and ${groundwaterConstrainedParcels} fall within groundwater protection areas. Those sites may still matter, but they should be treated as higher-friction redevelopment candidates needing earlier diligence.`
       : parcelContexts.length
-        ? "The first parcel-context pass did not flag major flood or wetlands screening pressure for the assessed lead set, which improves the odds that the current queue contains workable follow-up candidates."
-        : "Flood, wetlands, and assessor screening have not yet returned parcel context for the current queue, so constraints still need to be checked case by case.";
+        ? "The first parcel-context pass did not flag major flood, wetlands, or groundwater screening pressure for the assessed lead set, which improves the odds that the current queue contains workable follow-up candidates."
+        : "Flood, wetlands, groundwater, and assessor screening have not yet returned parcel context for the current queue, so constraints still need to be checked case by case.";
 
   const utilityInsightTitle =
     waterServedParcels > 0 || sewerServedParcels > 0
@@ -1355,11 +1362,11 @@ function buildStrategicBrief(
     },
     {
       action:
-        floodConstrainedParcels > 0 || wetlandConstrainedParcels > 0
-          ? "Separate flood- and wetlands-constrained leads from easier near-term candidates."
+        floodConstrainedParcels > 0 || wetlandConstrainedParcels > 0 || groundwaterConstrainedParcels > 0
+          ? "Separate flood-, wetlands-, and groundwater-constrained leads from easier near-term candidates."
           : "Keep adding parcel screening so constraints can be ruled in or out earlier.",
       whyItMatters:
-        floodConstrainedParcels > 0 || wetlandConstrainedParcels > 0
+        floodConstrainedParcels > 0 || wetlandConstrainedParcels > 0 || groundwaterConstrainedParcels > 0
           ? "That prevents the Town from spending the same level of attention on straightforward sites and more complex resilience- or permitting-heavy sites."
           : "The next jump in recommendation quality will come from consistently screening physical and regulatory constraints before staff time is spent.",
     },
@@ -1421,6 +1428,7 @@ function buildStrategicBrief(
       sewerServedParcels,
       externalServiceAreaParcels,
       wetlandConstrainedParcels,
+      groundwaterConstrainedParcels,
     },
     sourceCount: signals.length + briefs.length + parcelContexts.length,
   };
@@ -1902,6 +1910,25 @@ async function fetchParcelWetlandsContext(geometry: DanversParcelGeometry): Prom
   }
 }
 
+async function fetchParcelGroundwaterContext(geometry: DanversParcelGeometry): Promise<{
+  intersectsGroundwaterProtection: boolean;
+}> {
+  try {
+    const groundwaterCount = await fetchJson<ArcGisCountResponse>(
+      buildArcGisGeometryCountQueryUrl(DANVERS_GROUNDWATER_PROTECTION_LAYER_URL, geometry),
+      15000,
+    );
+
+    return {
+      intersectsGroundwaterProtection: Number(groundwaterCount.count ?? 0) > 0,
+    };
+  } catch {
+    return {
+      intersectsGroundwaterProtection: false,
+    };
+  }
+}
+
 async function fetchParcelContextForAddresses(addresses: string[]): Promise<ParcelContext[]> {
   const contexts: ParcelContext[] = [];
   const seenAddresses = new Set<string>();
@@ -1951,6 +1978,9 @@ async function fetchParcelContextForAddresses(addresses: string[]): Promise<Parc
       const wetlands = parcelGeometry
         ? await fetchParcelWetlandsContext(parcelGeometry)
         : { intersectsWetlands: false };
+      const groundwater = parcelGeometry
+        ? await fetchParcelGroundwaterContext(parcelGeometry)
+        : { intersectsGroundwaterProtection: false };
       contexts.push({
         address: normalizedAddress,
         ownerName: feature.attributes.OWNER1?.trim() || feature.attributes.OWN_CO?.trim() || null,
@@ -1968,6 +1998,7 @@ async function fetchParcelContextForAddresses(addresses: string[]): Promise<Parc
         externalWaterServiceArea: utility.externalWaterServiceArea,
         externalSewerServiceArea: utility.externalSewerServiceArea,
         intersectsWetlands: wetlands.intersectsWetlands,
+        intersectsGroundwaterProtection: groundwater.intersectsGroundwaterProtection,
       });
     } catch {
       continue;
@@ -2137,6 +2168,47 @@ function renderStrategicRecommendationsMarkup(payload: DashboardPayload): string
     .join("");
 }
 
+function renderStrategicScorecardMarkup(payload: DashboardPayload): string {
+  const metrics = payload.strategicBrief.metrics;
+  const cards = [
+    {
+      label: "Assessed Parcels",
+      value: String(metrics.assessedParcels ?? 0),
+      detail: "brief-linked parcels screened",
+      tone: "neutral",
+    },
+    {
+      label: "Utility Ready",
+      value: String(Math.max(metrics.waterServedParcels ?? 0, metrics.sewerServedParcels ?? 0)),
+      detail: "mapped water or sewer context",
+      tone: "positive",
+    },
+    {
+      label: "Constraint Flags",
+      value: String((metrics.floodConstrainedParcels ?? 0) + (metrics.wetlandConstrainedParcels ?? 0) + (metrics.groundwaterConstrainedParcels ?? 0)),
+      detail: "flood, wetlands, or groundwater flags",
+      tone: "caution",
+    },
+    {
+      label: "Business Zoned",
+      value: String(metrics.businessZonedParcels ?? 0),
+      detail: "commercial or industrial districts",
+      tone: "neutral",
+    },
+  ];
+
+  return cards
+    .map(
+      (card) => `
+        <div class="scorecard-item scorecard-${escapeHtml(card.tone)}">
+          <p class="eyebrow">${escapeHtml(card.label)}</p>
+          <strong>${escapeHtml(card.value)}</strong>
+          <span>${escapeHtml(card.detail)}</span>
+        </div>`,
+    )
+    .join("");
+}
+
 function renderDashboard(payload: DashboardPayload, nonce: string): string {
   const generatedAt = new Date(payload.generatedAt).toLocaleString("en-US", {
     dateStyle: "medium",
@@ -2149,6 +2221,7 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
   const initialTableRows = renderTableRows(payload.sites);
   const strategicInsightsMarkup = renderStrategicInsightsMarkup(payload);
   const strategicRecommendationsMarkup = renderStrategicRecommendationsMarkup(payload);
+  const strategicScorecardMarkup = renderStrategicScorecardMarkup(payload);
   const reviewSummaryMarkup = `
     <div class="review-summary">
       <div class="review-card review-card-match">
@@ -2539,6 +2612,39 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         line-height: 1.55;
       }
 
+      .strategic-scorecard {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+
+      .scorecard-item {
+        padding: 12px 14px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.7);
+      }
+
+      .scorecard-item strong {
+        display: block;
+        font-size: 1.55rem;
+        margin: 2px 0 4px;
+      }
+
+      .scorecard-item span {
+        color: var(--muted);
+        font-size: 0.88rem;
+      }
+
+      .scorecard-positive {
+        background: linear-gradient(180deg, #eef8f2, #dceee4);
+      }
+
+      .scorecard-caution {
+        background: linear-gradient(180deg, #fff8ef, #fce8d5);
+      }
+
       .strategic-meta {
         color: var(--muted);
         font-size: 0.9rem;
@@ -2565,7 +2671,8 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         .workspace,
         .controls,
         .metrics,
-        .insight-grid {
+        .insight-grid,
+        .strategic-scorecard {
           grid-template-columns: 1fr;
         }
 
@@ -2665,6 +2772,7 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
             <p class="eyebrow">Strategic Insights</p>
             <h3>${escapeHtml(payload.strategicBrief.title)}</h3>
             <p class="strategic-summary">${escapeHtml(payload.strategicBrief.summary)}</p>
+            <div class="strategic-scorecard">${strategicScorecardMarkup}</div>
             <div class="strategic-meta">
               Latest brief ${escapeHtml(briefGeneratedAt)} · Trigger ${escapeHtml(payload.strategicBrief.trigger)} · Sources reviewed ${escapeHtml(String(payload.strategicBrief.sourceCount))}
             </div>
@@ -2907,10 +3015,10 @@ export default {
           {
             enabled: Boolean(env.OPPORTUNITYDB),
             detail: env.OPPORTUNITYDB
-              ? "D1 binding is available for automated parcel ingest, parcel matching, stored strategic briefs, and parcel-context screening including flood, wetlands, and utility context."
+              ? "D1 binding is available for automated parcel ingest, parcel matching, stored strategic briefs, and parcel-context screening including flood, wetlands, groundwater, and utility context."
               : "D1 binding is not configured yet.",
             nextStep: env.OPPORTUNITYDB
-              ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, match them to parcels, screen brief-linked parcels against assessor, flood, wetlands, and utility context, and save a strategic brief for the dashboard."
+              ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, match them to parcels, screen brief-linked parcels against assessor, flood, wetlands, groundwater, and utility context, and save a strategic brief for the dashboard."
               : "Attach D1 and persist case briefs, then map briefs to parcels, corridors, and recurring strategic briefs.",
           },
           { status: 200 },
