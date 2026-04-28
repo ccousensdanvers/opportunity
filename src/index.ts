@@ -83,6 +83,7 @@ const PLANNING_BOARD_RSS_URL =
   "https://www.danversma.gov/RSSFeed.aspx?CID=Planning-Board-11&ModID=65";
 const ZBA_RSS_URL =
   "https://www.danversma.gov/RSSFeed.aspx?CID=Zoning-Board-of-Appeals-18&ModID=65";
+const PROJECTS_PAGE_URL = "https://www.danversma.gov/235/Projects";
 const DANVERS_PARCELS_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
 const DANVERS_PARCELS_PAGE_SIZE = 1000;
@@ -559,6 +560,75 @@ function formatRssPubDate(value: string): string {
   });
 }
 
+function looksLikeProjectTitle(value: string): boolean {
+  const normalized = normalizeWhitespace(value);
+  if (!normalized) {
+    return false;
+  }
+
+  if (normalized.length < 6 || normalized.length > 120) {
+    return false;
+  }
+
+  const lowered = normalized.toLowerCase();
+  if (
+    lowered === "projects" ||
+    lowered === "meeting schedule and filing fees" ||
+    lowered.includes("application") ||
+    lowered.includes("site plan") ||
+    lowered.includes("narrative") ||
+    lowered.includes("traffic") ||
+    lowered.includes("lighting") ||
+    lowered.includes("architectural") ||
+    lowered.includes("stormwater") ||
+    lowered.includes("special permit") ||
+    lowered.includes("project page")
+  ) {
+    return false;
+  }
+
+  return /\d/.test(normalized);
+}
+
+async function fetchProjectPageSignals(): Promise<AgendaSignal[]> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const response = await fetch(PROJECTS_PAGE_URL, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
+      },
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const html = await response.text();
+    const titles = Array.from(html.matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi))
+      .map((match) => normalizeWhitespace(match[1].replace(/<[^>]+>/g, " ")))
+      .filter(looksLikeProjectTitle);
+
+    const uniqueTitles = Array.from(new Set(titles)).slice(0, 10);
+    return uniqueTitles.map((title) => ({
+      board: "Planning Board",
+      meetingDate: new Date().toLocaleDateString("en-US", {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        timeZone: "America/New_York",
+      }),
+      title,
+      agendaUrl: PROJECTS_PAGE_URL,
+      source: "danvers projects page",
+    }));
+  } catch {
+    return [];
+  }
+}
+
 async function fetchAgendaSignalsForBoardWithDebug(
   board: AgendaSignal["board"],
   url: string,
@@ -649,14 +719,27 @@ async function fetchAgendaSignalsForBoardWithDebug(
 }
 
 async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
-  const [planningSignals, zbaSignals] = await Promise.all([
+  const [planningSignals, zbaSignals, projectSignals] = await Promise.all([
     fetchAgendaSignalsForBoard("Planning Board", PLANNING_BOARD_RSS_URL),
     fetchAgendaSignalsForBoard("Zoning Board of Appeals", ZBA_RSS_URL),
+    fetchProjectPageSignals(),
   ]);
 
-  const signals = [...planningSignals, ...zbaSignals]
-    .sort((left, right) => right.meetingDate.localeCompare(left.meetingDate))
-    .slice(0, 8);
+  const merged = [...projectSignals, ...planningSignals, ...zbaSignals];
+  const deduped: AgendaSignal[] = [];
+  const seen = new Set<string>();
+
+  for (const signal of merged) {
+    const key = `${signal.board}|${signal.title}|${signal.agendaUrl}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    deduped.push(signal);
+  }
+
+  const signals = deduped.slice(0, 12);
 
   return signals.length ? signals : FALLBACK_SIGNALS;
 }
