@@ -332,6 +332,23 @@ function missingDatabaseResponse() {
   );
 }
 
+function withSecurityHeaders(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set(
+    "content-security-policy",
+    "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+  );
+  headers.set("x-frame-options", "SAMEORIGIN");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("referrer-policy", "strict-origin-when-cross-origin");
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 async function readJson<T>(request: Request): Promise<T> {
   return (await request.json()) as T;
 }
@@ -2064,122 +2081,144 @@ export default {
     if (request.method === "GET" && url.pathname === "/") {
       const signals = await fetchAgendaSignals();
       const payload = await buildDashboardPayload(signals, env.OPPORTUNITYDB);
-      return new Response(renderDashboard(payload), {
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-        },
-      });
+      return withSecurityHeaders(
+        new Response(renderDashboard(payload), {
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+          },
+        }),
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/api/status") {
-      return Response.json(buildStatusPayload(env));
+      return withSecurityHeaders(Response.json(buildStatusPayload(env)));
     }
 
     if (request.method === "GET" && url.pathname === "/api/sites") {
-      return Response.json({
-        sites: SITES,
-        count: SITES.length,
-      });
+      return withSecurityHeaders(
+        Response.json({
+          sites: SITES,
+          count: SITES.length,
+        }),
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/api/signals") {
       const signals = await fetchAgendaSignals();
-      return Response.json({
-        signals,
-        source: AGENDA_CENTER_URL,
-        updatedAt: new Date().toISOString(),
-      });
+      return withSecurityHeaders(
+        Response.json({
+          signals,
+          source: AGENDA_CENTER_URL,
+          updatedAt: new Date().toISOString(),
+        }),
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/api/debug/signals") {
       const debug = await fetchAgendaSignalsDebug();
-      return Response.json({
-        ...debug,
-        updatedAt: new Date().toISOString(),
-      });
+      return withSecurityHeaders(
+        Response.json({
+          ...debug,
+          updatedAt: new Date().toISOString(),
+        }),
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/api/briefs") {
       const signals = await fetchAgendaSignals();
       const briefs = await buildCaseBriefs(signals);
-      return Response.json({
-        briefs,
-        source: AGENDA_CENTER_URL,
-        updatedAt: new Date().toISOString(),
-      });
+      return withSecurityHeaders(
+        Response.json({
+          briefs,
+          source: AGENDA_CENTER_URL,
+          updatedAt: new Date().toISOString(),
+        }),
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/api/summary") {
       const signals = await fetchAgendaSignals();
       const briefs = await buildCaseBriefs(signals);
-      return Response.json({
-        summary: buildSummaryMetrics(SITES, signals, briefs),
-        updatedAt: new Date().toISOString(),
-      });
+      return withSecurityHeaders(
+        Response.json({
+          summary: buildSummaryMetrics(SITES, signals, briefs),
+          updatedAt: new Date().toISOString(),
+        }),
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/ingest-info") {
-      return Response.json(
-        {
-          enabled: Boolean(env.OPPORTUNITYDB),
-          detail: env.OPPORTUNITYDB
-            ? "D1 binding is available for automated parcel ingest and parcel matching."
-            : "D1 binding is not configured yet.",
-          nextStep: env.OPPORTUNITYDB
-            ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, and match them to parcels."
-            : "Attach D1 and persist case briefs, then map briefs to parcels and corridors.",
-        },
-        { status: 200 },
+      return withSecurityHeaders(
+        Response.json(
+          {
+            enabled: Boolean(env.OPPORTUNITYDB),
+            detail: env.OPPORTUNITYDB
+              ? "D1 binding is available for automated parcel ingest and parcel matching."
+              : "D1 binding is not configured yet.",
+            nextStep: env.OPPORTUNITYDB
+              ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, and match them to parcels."
+              : "Attach D1 and persist case briefs, then map briefs to parcels and corridors.",
+          },
+          { status: 200 },
+        ),
       );
     }
 
     if (request.method === "POST" && url.pathname === "/api/parcels/upsert") {
       if (!env.OPPORTUNITYDB) {
-        return missingDatabaseResponse();
+        return withSecurityHeaders(missingDatabaseResponse());
       }
 
       const body = await readJson<{ parcels?: ParcelUpsertInput[] }>(request);
       if (!Array.isArray(body.parcels)) {
-        return Response.json(
-          { ok: false, error: "Request body must include a parcels array." },
-          { status: 400 },
+        return withSecurityHeaders(
+          Response.json(
+            { ok: false, error: "Request body must include a parcels array." },
+            { status: 400 },
+          ),
         );
       }
 
       await upsertParcels(env.OPPORTUNITYDB, body.parcels);
 
-      return Response.json({
-        ok: true,
-        ingested: body.parcels.length,
-      });
+      return withSecurityHeaders(
+        Response.json({
+          ok: true,
+          ingested: body.parcels.length,
+        }),
+      );
     }
 
     if (request.method === "POST" && url.pathname === "/api/opportunities/match") {
       if (!env.OPPORTUNITYDB) {
-        return missingDatabaseResponse();
+        return withSecurityHeaders(missingDatabaseResponse());
       }
 
       const body = await readJson<{ opportunities?: OpportunityParcelInput[] }>(request);
       if (!Array.isArray(body.opportunities)) {
-        return Response.json(
-          { ok: false, error: "Request body must include an opportunities array." },
-          { status: 400 },
+        return withSecurityHeaders(
+          Response.json(
+            { ok: false, error: "Request body must include an opportunities array." },
+            { status: 400 },
+          ),
         );
       }
 
       const results = await matchAndPersistOpportunities(env.OPPORTUNITYDB, body.opportunities);
 
-      return Response.json({
-        ok: true,
-        matched: results.filter((result) => result.matchType !== "no_match").length,
-        reviewNeeded: results.filter((result) => result.needsReview).length,
-        results,
-      });
+      return withSecurityHeaders(
+        Response.json({
+          ok: true,
+          matched: results.filter((result) => result.matchType !== "no_match").length,
+          reviewNeeded: results.filter((result) => result.needsReview).length,
+          results,
+        }),
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/api/opportunities/review") {
       if (!env.OPPORTUNITYDB) {
-        return missingDatabaseResponse();
+        return withSecurityHeaders(missingDatabaseResponse());
       }
 
       const limitParam = Number(url.searchParams.get("limit") ?? "25");
@@ -2189,43 +2228,51 @@ export default {
         needsReviewOnly,
       });
 
-      return Response.json({
-        ok: true,
-        count: queue.length,
-        needsReviewOnly,
-        results: queue,
-      });
+      return withSecurityHeaders(
+        Response.json({
+          ok: true,
+          count: queue.length,
+          needsReviewOnly,
+          results: queue,
+        }),
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/api/debug/parcel-lookup") {
       if (!env.OPPORTUNITYDB) {
-        return missingDatabaseResponse();
+        return withSecurityHeaders(missingDatabaseResponse());
       }
 
       const address = url.searchParams.get("address")?.trim() ?? "";
       if (!address) {
-        return Response.json(
-          { ok: false, error: "Query string must include an address parameter." },
-          { status: 400 },
+        return withSecurityHeaders(
+          Response.json(
+            { ok: false, error: "Query string must include an address parameter." },
+            { status: 400 },
+          ),
         );
       }
 
       const result = await debugLookupParcelAddress(env.OPPORTUNITYDB, address);
-      return Response.json({
-        ok: true,
-        ...result,
-      });
+      return withSecurityHeaders(
+        Response.json({
+          ok: true,
+          ...result,
+        }),
+      );
     }
 
     if (request.method === "POST" && url.pathname === "/ingest") {
       if (!env.OPPORTUNITYDB) {
-        return Response.json(
-          {
-            accepted: false,
-            message: buildIngestMessage("manual"),
-            detail: "Queue and database bindings are not configured yet.",
-          },
-          { status: 501 },
+        return withSecurityHeaders(
+          Response.json(
+            {
+              accepted: false,
+              message: buildIngestMessage("manual"),
+              detail: "Queue and database bindings are not configured yet.",
+            },
+            { status: 501 },
+          ),
         );
       }
 
@@ -2235,28 +2282,32 @@ export default {
         const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
-        return Response.json({
-          accepted: true,
-          message: buildIngestMessage("manual"),
-          detail:
-            "Manual ingest completed: Danvers parcels refreshed, case briefs rebuilt, and opportunities matched.",
-          summary,
-        });
+        return withSecurityHeaders(
+          Response.json({
+            accepted: true,
+            message: buildIngestMessage("manual"),
+            detail:
+              "Manual ingest completed: Danvers parcels refreshed, case briefs rebuilt, and opportunities matched.",
+            summary,
+          }),
+        );
       } catch (error) {
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "failed");
 
-        return Response.json(
-          {
-            accepted: false,
-            message: buildIngestMessage("manual"),
-            error: error instanceof Error ? error.message : "Ingest failed.",
-          },
-          { status: 500 },
+        return withSecurityHeaders(
+          Response.json(
+            {
+              accepted: false,
+              message: buildIngestMessage("manual"),
+              error: error instanceof Error ? error.message : "Ingest failed.",
+            },
+            { status: 500 },
+          ),
         );
       }
     }
 
-    return new Response("Not Found", { status: 404 });
+    return withSecurityHeaders(new Response("Not Found", { status: 404 }));
   },
 
   async scheduled(controller: { cron: string }, env: Env): Promise<void> {
