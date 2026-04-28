@@ -82,6 +82,12 @@ interface DashboardPayload {
   };
 }
 
+interface StrategicInsight {
+  eyebrow: string;
+  title: string;
+  detail: string;
+}
+
 const AGENDA_CENTER_URL = "https://www.danversma.gov/AgendaCenter";
 const PLANNING_BOARD_AGENDA_URL = "https://www.danversma.gov/AgendaCenter/Planning-Board-11";
 const ZBA_AGENDA_URL = "https://www.danversma.gov/AgendaCenter/Zoning-Board-of-Appeals-18";
@@ -1338,12 +1344,86 @@ function renderActivityMarkup(activity: ActivityItem[]): string {
     .join("");
 }
 
+function buildStrategicInsights(payload: DashboardPayload): StrategicInsight[] {
+  const planningBoardBriefs = payload.briefs.filter((brief) => brief.board === "Planning Board").length;
+  const zbaBriefs = payload.briefs.filter((brief) => brief.board === "Zoning Board of Appeals").length;
+  const confidentBriefs = payload.briefs.filter((brief) => brief.confidence !== "low").length;
+  const advancingSites = payload.sites.filter((site) => site.readiness === "Advancing").length;
+  const reviewShare = payload.reviewSummary.total
+    ? Math.round((payload.reviewSummary.needsReview / payload.reviewSummary.total) * 100)
+    : 0;
+  const averageScore = Math.round(
+    payload.sites.reduce((sum, site) => sum + site.score, 0) / payload.sites.length,
+  );
+
+  let boardTitle = "Board activity is split across both review lanes";
+  let boardDetail = "Planning Board and ZBA postings are landing at a similar pace, so staff should watch both boards for redevelopment and policy signals.";
+
+  if (planningBoardBriefs > zbaBriefs) {
+    boardTitle = "Planning Board is setting the near-term project pipeline";
+    boardDetail = `${planningBoardBriefs} of ${payload.briefs.length} current briefs come from Planning Board materials, suggesting most current movement is tied to site planning, subdivision, or formal development review.`;
+  } else if (zbaBriefs > planningBoardBriefs) {
+    boardTitle = "ZBA activity is surfacing the most immediate edge cases";
+    boardDetail = `${zbaBriefs} of ${payload.briefs.length} current briefs come from ZBA materials, which points to a heavier mix of variance, use, and site-constraint questions in the current queue.`;
+  }
+
+  const reviewTitle =
+    payload.reviewSummary.needsReview > 0
+      ? "Staff triage capacity is still a real constraint"
+      : "The parcel review queue is staying under control";
+  const reviewDetail =
+    payload.reviewSummary.total > 0
+      ? `${payload.reviewSummary.needsReview} of ${payload.reviewSummary.total} parcel-match records still need staff review, so the best next gains will come from clearing ambiguous matches and improving confidence on live signals.`
+      : "Parcel-linked review records have not been persisted yet, so the next operational step is turning the live signal feed into a maintained review queue.";
+
+  const postureTitle =
+    advancingSites >= 2
+      ? "Several Danvers sites are moving beyond early watchlist status"
+      : "Most tracked opportunities are still in early positioning mode";
+  const postureDetail =
+    confidentBriefs > 0
+      ? `${advancingSites} sites are marked advancing, the average watchlist score is ${averageScore}, and ${confidentBriefs} current briefs include medium or high confidence clues. That is enough signal to prioritize corridor-specific follow-up rather than broad scanning alone.`
+      : `${advancingSites} sites are marked advancing, but the case-extraction layer is still producing limited high-confidence clues. Near-term value will come from better source coverage and more parcel-linked validation.`;
+
+  return [
+    {
+      eyebrow: "Strategic Insight",
+      title: boardTitle,
+      detail: boardDetail,
+    },
+    {
+      eyebrow: reviewShare > 50 ? "Operational Pressure" : "Review Queue",
+      title: reviewTitle,
+      detail: reviewDetail,
+    },
+    {
+      eyebrow: "Danvers Posture",
+      title: postureTitle,
+      detail: postureDetail,
+    },
+  ];
+}
+
+function renderStrategicInsightsMarkup(payload: DashboardPayload): string {
+  return buildStrategicInsights(payload)
+    .map(
+      (insight) => `
+        <div class="insight">
+          <p class="eyebrow">${escapeHtml(insight.eyebrow)}</p>
+          <strong>${escapeHtml(insight.title)}</strong>
+          <p>${escapeHtml(insight.detail)}</p>
+        </div>`,
+    )
+    .join("");
+}
+
 function renderDashboard(payload: DashboardPayload): string {
   const generatedAt = new Date(payload.generatedAt).toLocaleString("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
   });
   const initialTableRows = renderTableRows(payload.sites);
+  const strategicInsightsMarkup = renderStrategicInsightsMarkup(payload);
   const reviewSummaryMarkup = `
     <div class="review-summary">
       <div class="review-card review-card-match">
@@ -1850,21 +1930,13 @@ function renderDashboard(payload: DashboardPayload): string {
         </section>
 
         <section class="panel" style="margin-top: 16px;">
-          <p class="eyebrow">Decision Support</p>
-          <h3>What this next layer unlocks</h3>
+          <p class="eyebrow">Strategic Insights</p>
+          <h3>What the current signal mix suggests for Danvers</h3>
+          <p>
+            These takeaways translate the live agenda feed, watchlist posture, and parcel-review queue into plain-language implications for staff prioritization.
+          </p>
           <div class="insight-grid">
-            <div class="insight">
-              <strong>Early Read</strong>
-              <p>Board packets can now be screened for address-like patterns and common land-use terms before staff opens every file manually.</p>
-            </div>
-            <div class="insight">
-              <strong>Targeting</strong>
-              <p>Likely sites and project types create a cleaner bridge to future parcel matching, D1 storage, and explainable alert scoring.</p>
-            </div>
-            <div class="insight">
-              <strong>Town Action</strong>
-              <p>Staff can sort which postings are administrative and which may deserve zoning, infrastructure, or redevelopment attention.</p>
-            </div>
+            ${strategicInsightsMarkup}
           </div>
         </section>
       </main>
