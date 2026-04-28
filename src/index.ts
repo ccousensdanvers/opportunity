@@ -558,20 +558,25 @@ async function fetchAgendaSignalsForBoardWithDebug(
         continue;
       }
 
-      const agendaMatch = block.match(
-        /<a[^>]+href="([^"]*\/AgendaCenter\/ViewFile\/Agenda\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/i,
+      const agendaUrlMatch = block.match(
+        /href=['"]([^'"]*\/AgendaCenter\/ViewFile\/Agenda\/[^'"]+)['"]/i,
       );
-
-      if (!agendaMatch) {
+      if (!agendaUrlMatch) {
         continue;
       }
 
-      const agendaUrl = agendaMatch[1].startsWith("http")
-        ? agendaMatch[1]
-        : `https://www.danversma.gov${agendaMatch[1]}`;
-      const title = normalizeWhitespace(agendaMatch[2].replace(/<[^>]+>/g, " "));
+      const titleCandidates = Array.from(
+        block.matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi),
+      )
+        .map((match) => normalizeWhitespace(match[1].replace(/<[^>]+>/g, " ")))
+        .filter((value) => value && value !== "Agenda" && value !== "Previous Versions");
 
-      if (!title || title === "Agenda" || title === "Previous Versions") {
+      const title = titleCandidates[0] ?? board;
+      const agendaUrl = agendaUrlMatch[1].startsWith("http")
+        ? agendaUrlMatch[1]
+        : `https://www.danversma.gov${agendaUrlMatch[1]}`;
+
+      if (!title) {
         continue;
       }
 
