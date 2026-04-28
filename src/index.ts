@@ -402,10 +402,21 @@ function inferConfidence(addresses: string[], packetText: string): CaseBrief["co
 
 function extractAddresses(text: string): string[] {
   const matches = text.match(/\b\d{1,5}\s+[A-Z][A-Za-z0-9.'-]*(?:\s+[A-Z][A-Za-z0-9.'-]*){0,4}\s+(?:Street|St|Road|Rd|Avenue|Ave|Lane|Ln|Drive|Dr|Boulevard|Blvd|Way|Court|Ct|Terrace|Ter|Place|Pl|Highway|Hwy|Circle|Cir)\b/gi) ?? [];
+  const expanded = matches.flatMap((value) => {
+    const normalized = normalizeWhitespace(value);
+    const rangeMatch = normalized.match(/^(\d{1,5})-(\d{1,5})\s+(.+)$/);
+    if (!rangeMatch) {
+      return [normalized];
+    }
+
+    return [
+      `${rangeMatch[1]} ${rangeMatch[3]}`,
+      `${rangeMatch[2]} ${rangeMatch[3]}`,
+    ];
+  });
   const deduped = Array.from(
     new Set(
-      matches
-        .map((value) => normalizeWhitespace(value))
+      expanded
         .filter((value) => !IGNORED_PACKET_ADDRESSES.has(value)),
     ),
   );
