@@ -184,18 +184,18 @@ const SITES: OpportunitySite[] = [
 const ACTIVITIES: ActivityItem[] = [
   {
     time: "08:30",
-    title: "Agenda feed and parcel ingest are wired",
-    detail: "Manual and scheduled runs now pull Danvers parcel records, rebuild agenda-derived briefs, and push likely opportunities into parcel matching.",
+    title: "Automated ingest added",
+    detail: "Manual and scheduled ingest now refresh Danvers parcel records, rebuild agenda briefs, and run parcel matching in one flow.",
   },
   {
     time: "09:15",
-    title: "Staff review queue is taking shape",
-    detail: "Low-confidence and no-match results now stay visible in the review endpoint so staff can see which filings still need manual cleanup.",
+    title: "Review queue expanded",
+    detail: "The review endpoint now keeps low-confidence and no-match items so staff can see what still needs manual cleanup.",
   },
   {
     time: "Next",
-    title: "Current build focus: parcel-linked triage",
-    detail: "We are turning meeting signals into parcel-level follow-up by tightening brief extraction, matching quality, and the staff-facing review workflow.",
+    title: "Parcel sync source wired",
+    detail: "The Worker now pulls parcel identifiers and address aliases from the Town of Danvers public GIS parcel layer during ingest.",
   },
 ];
 
@@ -436,4 +436,1107 @@ class HeadingCollector {
       this.text += text.text;
     }
   }
+}
+
+class AgendaLinkCollector {
+  private active = false;
+  private href = "";
+  private text = "";
+
+  constructor(
+    private getBoard: () => string | null,
+    private getMeetingDate: () => string | null,
+    private onSignal: (signal: AgendaSignal) => void,
+  ) {}
+
+  element(element: Element) {
+    const href = element.getAttribute("href");
+    if (!href || !href.includes("/AgendaCenter/ViewFile/Agenda/")) {
+      return;
+    }
+
+    this.active = true;
+    this.href = href.startsWith("http") ? href : `https://www.danversma.gov${href}`;
+    this.text = "";
+
+    element.onEndTag(() => {
+      this.active = false;
+      const board = this.getBoard();
+      const meetingDate = this.getMeetingDate();
+      const title = normalizeWhitespace(this.text);
+
+      if (!board || !meetingDate || !title || title === "Agenda" || title === "Previous Versions") {
+        this.href = "";
+        this.text = "";
+        return;
+      }
+
+      if (board !== "Planning Board" && board !== "Zoning Board of Appeals") {
+        this.href = "";
+        this.text = "";
+        return;
+      }
+
+      this.onSignal({
+        board,
+        meetingDate,
+        title,
+        agendaUrl: this.href,
+        source: "danvers agenda center",
+      });
+
+      this.href = "";
+      this.text = "";
+    });
+  }
+
+  text(text: Text) {
+    if (this.active) {
+      this.text += text.text;
+    }
+  }
+}
+
+async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+    const response = await fetch(AGENDA_CENTER_URL, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
+      },
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      throw new Error(`Agenda Center request failed with ${response.status}`);
+    }
+
+    const html = await response.text();
+    let currentBoard: string | null = null;
+    let currentDate: string | null = null;
+    const signals: AgendaSignal[] = [];
+    const seen = new Set<string>();
+
+    const boardCollector = new HeadingCollector((value) => {
+      currentBoard = value || null;
+      currentDate = null;
+    });
+    const dateCollector = new HeadingCollector((value) => {
+      currentDate = value || null;
+    });
+    const linkCollector = new AgendaLinkCollector(
+      () => currentBoard,
+      () => currentDate,
+      (signal) => {
+        const key = `${signal.board}|${signal.meetingDate}|${signal.agendaUrl}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          signals.push(signal);
+        }
+      },
+    );
+
+    await new HTMLRewriter()
+      .on("h2", boardCollector)
+      .on("h3", dateCollector)
+      .on("a", linkCollector)
+      .transform(new Response(html))
+      .text();
+
+    const filtered = signals
+      .filter(
+        (signal) =>
+          signal.board === "Planning Board" || signal.board === "Zoning Board of Appeals",
+      )
+      .slice(0, 8);
+
+    return filtered.length ? filtered : FALLBACK_SIGNALS;
+  } catch {
+    return FALLBACK_SIGNALS;
+  }
+}
+
+function isPdfDocument(bytes: Uint8Array, contentType: string | null): boolean {
+  if (contentType?.toLowerCase().includes("pdf")) {
+    return true;
+  }
+
+  if (bytes.length < 4) {
+    return false;
+  }
+
+  return (
+    bytes[0] === 0x25 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x44 &&
+    bytes[3] === 0x46
+  );
+}
+
+function findSequence(bytes: Uint8Array, sequence: number[], startAt = 0): number {
+  outer: for (let index = startAt; index <= bytes.length - sequence.length; index += 1) {
+    for (let offset = 0; offset < sequence.length; offset += 1) {
+      if (bytes[index + offset] !== sequence[offset]) {
+        continue outer;
+      }
+    }
+
+    return index;
+  }
+
+  return -1;
+}
+
+function stripStreamBoundaryWhitespace(bytes: Uint8Array): Uint8Array {
+  let start = 0;
+  let end = bytes.length;
+
+  while (start < end && (bytes[start] === 0x0a || bytes[start] === 0x0d)) {
+    start += 1;
+  }
+
+  while (end > start && (bytes[end - 1] === 0x0a || bytes[end - 1] === 0x0d)) {
+    end -= 1;
+  }
+
+  return bytes.slice(start, end);
+}
+
+async function inflatePdfStream(bytes: Uint8Array): Promise<string> {
+  try {
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate"));
+    return await new Response(stream).text();
+  } catch {
+    return "";
+  }
+}
+
+function decodePdfLiteralString(value: string): string {
+  let decoded = "";
+
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+
+    if (character !== "\\") {
+      decoded += character;
+      continue;
+    }
+
+    const next = value[index + 1];
+
+    if (!next) {
+      break;
+    }
+
+    if (/[0-7]/.test(next)) {
+      const octal = value.slice(index + 1, index + 4).match(/^[0-7]{1,3}/)?.[0] ?? next;
+      decoded += String.fromCharCode(Number.parseInt(octal, 8));
+      index += octal.length;
+      continue;
+    }
+
+    const replacements: Record<string, string> = {
+      n: "\n",
+      r: "\r",
+      t: "\t",
+      b: "\b",
+      f: "\f",
+      "(": "(",
+      ")": ")",
+      "\\": "\\",
+    };
+
+    decoded += replacements[next] ?? next;
+    index += 1;
+  }
+
+  return decoded;
+}
+
+function decodePdfHexString(value: string): string {
+  const normalized = value.replace(/[^0-9a-f]/gi, "");
+  const padded = normalized.length % 2 === 0 ? normalized : `${normalized}0`;
+  let decoded = "";
+
+  for (let index = 0; index < padded.length; index += 2) {
+    decoded += String.fromCharCode(Number.parseInt(padded.slice(index, index + 2), 16));
+  }
+
+  return decoded;
+}
+
+function extractPdfStrings(text: string): string[] {
+  const extracted: string[] = [];
+  const literalPattern = /\((?:\\.|[^()\\])*\)/g;
+  const hexPattern = /<([0-9a-fA-F\s]+)>/g;
+
+  for (const match of text.matchAll(literalPattern)) {
+    const value = match[0].slice(1, -1);
+    const decoded = normalizeWhitespace(decodePdfLiteralString(value));
+    if (decoded) {
+      extracted.push(decoded);
+    }
+  }
+
+  for (const match of text.matchAll(hexPattern)) {
+    const decoded = normalizeWhitespace(decodePdfHexString(match[1]));
+    if (decoded) {
+      extracted.push(decoded);
+    }
+  }
+
+  return extracted;
+}
+
+async function extractPdfText(bytes: Uint8Array): Promise<string> {
+  const rawText = new TextDecoder("latin1").decode(bytes);
+  const streamTexts: string[] = [];
+  let searchIndex = 0;
+
+  while (searchIndex < bytes.length) {
+    const streamIndex = findSequence(bytes, [0x73, 0x74, 0x72, 0x65, 0x61, 0x6d], searchIndex);
+    if (streamIndex === -1) {
+      break;
+    }
+
+    const contentStart = streamIndex + 6;
+    const endstreamIndex = findSequence(
+      bytes,
+      [0x65, 0x6e, 0x64, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6d],
+      contentStart,
+    );
+
+    if (endstreamIndex === -1) {
+      break;
+    }
+
+    const rawStream = stripStreamBoundaryWhitespace(bytes.slice(contentStart, endstreamIndex));
+    const inflated = await inflatePdfStream(rawStream);
+    if (inflated) {
+      streamTexts.push(inflated);
+    }
+
+    searchIndex = endstreamIndex + 9;
+  }
+
+  const extracted = extractPdfStrings([rawText, ...streamTexts].join("\n"));
+  return normalizeWhitespace(extracted.join(" "));
+}
+
+async function fetchPacketText(url: string): Promise<string> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 4000);
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
+      },
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      return "";
+    }
+
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (isPdfDocument(bytes, response.headers.get("content-type"))) {
+      return await extractPdfText(bytes);
+    }
+
+    const decoded = new TextDecoder("latin1").decode(bytes);
+    return normalizeWhitespace(decoded);
+  } catch {
+    return "";
+  }
+}
+
+async function buildCaseBriefs(signals: AgendaSignal[]): Promise<CaseBrief[]> {
+  const briefs = await Promise.all(
+    signals.slice(0, 6).map(async (signal) => {
+      const packetText = await fetchPacketText(signal.agendaUrl);
+      const addresses = extractAddresses(packetText);
+      const likelySite = addresses[0] ?? `${signal.board} agenda item`;
+      const titleAndPacket = normalizeWhitespace(`${signal.title} ${packetText}`);
+
+      return {
+        id: slugify(`${signal.board}-${signal.meetingDate}-${signal.title}`),
+        board: signal.board,
+        meetingDate: signal.meetingDate,
+        title: signal.title,
+        agendaUrl: signal.agendaUrl,
+        likelySite,
+        addresses,
+        signalType: formatSignalType(titleAndPacket),
+        rationale: inferRationale(signal, addresses, packetText),
+        confidence: inferConfidence(addresses, packetText),
+        source: signal.source,
+      };
+    }),
+  );
+
+  return briefs;
+}
+
+function buildDanversParcelQueryUrl(resultOffset: number): string {
+  const params = new URLSearchParams({
+    where: "1=1",
+    returnGeometry: "false",
+    outFields: "MAP_PAR_ID,GIS_ID,Location,StreetName,LUCDescription,YearBuilt",
+    orderByFields: "OBJECTID ASC",
+    resultOffset: String(resultOffset),
+    resultRecordCount: String(DANVERS_PARCELS_PAGE_SIZE),
+    f: "json",
+  });
+
+  return `${DANVERS_PARCELS_LAYER_URL}?${params.toString()}`;
+}
+
+function buildParcelAliases(attributes: DanversParcelAttributes): ParcelUpsertInput["aliases"] {
+  const aliases: NonNullable<ParcelUpsertInput["aliases"]> = [];
+
+  if (attributes.GIS_ID) {
+    aliases.push({ type: "map_lot", value: attributes.GIS_ID, confidence: 0.9 });
+  }
+
+  if (attributes.StreetName && attributes.Location && attributes.Location !== attributes.StreetName) {
+    aliases.push({ type: "address", value: attributes.StreetName, confidence: 0.5 });
+  }
+
+  return aliases.length ? aliases : undefined;
+}
+
+function mapDanversParcelFeatureToInput(feature: DanversParcelFeature): ParcelUpsertInput | null {
+  const attributes = feature.attributes;
+  const mapLot = attributes?.MAP_PAR_ID?.trim();
+
+  if (!mapLot) {
+    return null;
+  }
+
+  return {
+    mapLot,
+    address: attributes.Location?.trim() || attributes.StreetName?.trim() || null,
+    aliases: buildParcelAliases(attributes),
+  };
+}
+
+async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
+  const parcels: ParcelUpsertInput[] = [];
+  const seenMapLots = new Set<string>();
+  let resultOffset = 0;
+
+  while (true) {
+    const payload = await fetchJson<DanversParcelQueryResponse>(
+      buildDanversParcelQueryUrl(resultOffset),
+      15000,
+    );
+    const…2947 tokens truncated…n        padding: 0 12px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        white-space: nowrap;
+      }
+
+      .empty {
+        padding: 22px 0 8px;
+        color: var(--muted);
+      }
+
+      .side-stack {
+        display: grid;
+        gap: 16px;
+      }
+
+      .brief-list,
+      .signal-list,
+      .activity-list {
+        display: grid;
+        gap: 14px;
+        padding: 0;
+        margin: 0;
+        list-style: none;
+      }
+
+      .brief-item,
+      .signal-item,
+      .activity-item {
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+
+      .brief-topline,
+      .signal-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        color: var(--muted);
+        font-size: 0.82rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .brief-site {
+        margin: 8px 0 0;
+        font-size: 1.05rem;
+      }
+
+      .brief-type {
+        margin: 6px 0 0;
+        color: var(--accent);
+      }
+
+      .brief-rationale,
+      .signal-source {
+        margin: 8px 0 0;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      .brief-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 10px;
+        margin-top: 10px;
+        font-size: 0.92rem;
+      }
+
+      .signal-link {
+        display: block;
+        margin-top: 8px;
+        color: var(--ink);
+        line-height: 1.45;
+      }
+
+      .signal-link:hover,
+      .brief-meta a:hover {
+        color: var(--accent);
+      }
+
+      .activity-item {
+        display: grid;
+        grid-template-columns: 56px minmax(0, 1fr);
+        gap: 14px;
+      }
+
+      .activity-time {
+        margin: 0;
+        color: var(--muted);
+        font-size: 0.86rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .activity-title {
+        margin: 0;
+        font-size: 1rem;
+      }
+
+      .activity-detail {
+        margin: 8px 0 0;
+        color: var(--muted);
+        line-height: 1.55;
+      }
+
+      .insight-band {
+        overflow: hidden;
+        position: relative;
+      }
+
+      .insight-band::after {
+        content: "";
+        position: absolute;
+        inset: auto -20% -20% 35%;
+        height: 160px;
+        background: linear-gradient(90deg, rgba(22, 66, 60, 0.05), rgba(175, 94, 47, 0.16));
+        transform: rotate(-6deg);
+      }
+
+      .insight-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
+        margin-top: 16px;
+        position: relative;
+        z-index: 1;
+      }
+
+      .insight {
+        min-height: 108px;
+        padding: 14px;
+        border-radius: 14px;
+        background: rgba(255, 252, 247, 0.74);
+        border: 1px solid rgba(34, 42, 38, 0.08);
+      }
+
+      .insight strong {
+        display: block;
+        margin-bottom: 10px;
+        font-size: 0.84rem;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+
+      .insight p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      @keyframes rise {
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @media (max-width: 1100px) {
+        .shell {
+          grid-template-columns: 1fr;
+        }
+
+        .rail {
+          gap: 22px;
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+        }
+
+        .metrics,
+        .insight-grid {
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .workspace,
+        .controls {
+          grid-template-columns: 1fr;
+        }
+
+        .topbar {
+          flex-direction: column;
+        }
+
+        .topbar-meta {
+          text-align: left;
+        }
+      }
+
+      @media (max-width: 760px) {
+        .main,
+        .rail {
+          padding: 22px 18px;
+        }
+
+        .metrics,
+        .insight-grid,
+        .nav-group {
+          grid-template-columns: 1fr;
+        }
+
+        .activity-item {
+          grid-template-columns: 1fr;
+        }
+
+        th:nth-child(3),
+        td:nth-child(3) {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="rail">
+        <div>
+          <div class="brand">
+            <div class="brand-mark">O</div>
+            <div>
+              <p class="eyebrow">Danvers Economic Development</p>
+              <h1>Opportunity</h1>
+              <p>Internal workspace for tracking redevelopment signals, corridor shifts, and site-level follow-up.</p>
+            </div>
+          </div>
+          <nav class="nav-group" aria-label="Primary">
+            <a class="nav-item active" href="/">Overview</a>
+            <a class="nav-item" href="/api/summary">Summary API</a>
+            <a class="nav-item" href="/api/sites">Sites API</a>
+            <a class="nav-item" href="/api/signals">Signals API</a>
+            <a class="nav-item" href="/api/briefs">Case Briefs API</a>
+            <a class="nav-item" href="/api/status">System Status</a>
+          </nav>
+        </div>
+        <div class="rail-footer">
+          <span>Shell generated ${escapeHtml(generatedAt)}</span>
+          <span>First live source: Danvers Agenda Center for Planning Board and Zoning Board postings.</span>
+        </div>
+      </aside>
+      <main class="main">
+        <header class="topbar">
+          <div class="topbar-copy">
+            <p class="eyebrow">Staff Dashboard</p>
+            <h2>See where change may be becoming opportunity.</h2>
+            <p>
+              This version now includes one live public source feed from Danvers itself plus a lightweight case-extraction layer.
+              The tool is beginning to move from meeting notices toward site-specific review leads.
+            </p>
+          </div>
+          <div class="topbar-meta">
+            <div>Worker name: <strong>opportunity</strong></div>
+            <div>Mode: dashboard plus case briefs</div>
+            <div>Data store: seeded watchlist, live public feed</div>
+          </div>
+        </header>
+
+        <section class="metrics" aria-label="Top metrics" id="summary-metrics">
+          ${renderMetricMarkup(payload.summary)}
+        </section>
+
+        <section class="workspace">
+          <div class="panel watchlist">
+            <div class="watchlist-head">
+              <div>
+                <p class="eyebrow">Watchlist</p>
+                <h3>Current review lanes</h3>
+                <p>The controls below let staff narrow the list by corridor, status, or keyword while the source-matching layer matures.</p>
+              </div>
+              <span class="status-pill">Explainable alerts only</span>
+            </div>
+
+            <div class="controls">
+              <input id="search-input" class="search" type="search" placeholder="Search sites, corridors, or signals" />
+              <select id="corridor-filter" class="select" aria-label="Filter by corridor">
+                <option value="all">All corridors</option>
+              </select>
+              <select id="status-filter" class="select" aria-label="Filter by status">
+                <option value="all">All statuses</option>
+              </select>
+            </div>
+
+            <table>
+              <thead>
+                <tr>
+                  <th>Site</th>
+                  <th>Signal</th>
+                  <th>Focus</th>
+                  <th>Score</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="watchlist-body">
+                ${initialTableRows}
+              </tbody>
+            </table>
+            <div id="empty-state" class="empty" hidden>No sites match the current filter.</div>
+          </div>
+
+          <div class="side-stack">
+            <section class="panel briefs">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Case Briefs</p>
+                  <h3>Likely site signals</h3>
+                  <p>These briefs combine live agenda postings with simple packet parsing to pull out likely locations and project types.</p>
+                </div>
+              </div>
+              <ul id="brief-list" class="brief-list">
+                ${renderBriefMarkup(payload.briefs)}
+              </ul>
+            </section>
+
+            <section class="panel signals">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Live Source Feed</p>
+                  <h3>Recent agenda postings</h3>
+                  <p>Direct from Danvers Agenda Center. These are the earliest reliable public signals now wired into the tool.</p>
+                </div>
+              </div>
+              <ul id="signal-list" class="signal-list">
+                ${renderSignalMarkup(payload.signals)}
+              </ul>
+            </section>
+
+            <section class="panel activity">
+              <div class="panel-head">
+                <div>
+                  <p class="eyebrow">Activity</p>
+                  <h3>Build notes</h3>
+                  <p>What the system is doing now and what comes next.</p>
+                </div>
+              </div>
+              <ul class="activity-list">
+                ${renderActivityMarkup(payload.activity)}
+              </ul>
+            </section>
+          </div>
+        </section>
+
+        <section class="panel insight-band" style="margin-top:16px;">
+          <p class="eyebrow">Decision Support</p>
+          <h3>What this next layer unlocks</h3>
+          <p>Danvers now has not only a live feed of development-relevant public meetings, but also first-pass briefs that can be triaged into parcels, corridors, and follow-up actions.</p>
+          <div class="insight-grid">
+            <div class="insight">
+              <strong>Early Read</strong>
+              <p>Board packets can now be screened for address-like patterns and common land-use terms before staff opens every file manually.</p>
+            </div>
+            <div class="insight">
+              <strong>Targeting</strong>
+              <p>Likely sites and project types create a cleaner bridge to future parcel matching, D1 storage, and explainable alert scoring.</p>
+            </div>
+            <div class="insight">
+              <strong>Town Action</strong>
+              <p>Staff can begin sorting which postings are merely administrative and which may deserve zoning, infrastructure, or redevelopment attention.</p>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script>
+      const initialData = ${JSON.stringify(payload)};
+
+      const watchlistBody = document.getElementById("watchlist-body");
+      const emptyState = document.getElementById("empty-state");
+      const searchInput = document.getElementById("search-input");
+      const corridorFilter = document.getElementById("corridor-filter");
+      const statusFilter = document.getElementById("status-filter");
+      const signalList = document.getElementById("signal-list");
+      const briefList = document.getElementById("brief-list");
+
+      function escapeHtml(value) {
+        return value
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function populateFilters(sites) {
+        const corridors = [...new Set(sites.map((site) => site.corridor))].sort();
+        const statuses = [...new Set(sites.map((site) => site.status))].sort();
+
+        corridorFilter.innerHTML = '<option value="all">All corridors</option>' +
+          corridors.map((corridor) => '<option value="' + escapeHtml(corridor) + '">' + escapeHtml(corridor) + '</option>').join("");
+
+        statusFilter.innerHTML = '<option value="all">All statuses</option>' +
+          statuses.map((status) => '<option value="' + escapeHtml(status) + '">' + escapeHtml(status) + '</option>').join("");
+      }
+
+      function renderRows(sites) {
+        if (!sites.length) {
+          watchlistBody.innerHTML = "";
+          emptyState.hidden = false;
+          return;
+        }
+
+        emptyState.hidden = true;
+        watchlistBody.innerHTML = sites.map((item) => {
+          return '<tr>' +
+            '<td><strong>' + escapeHtml(item.site) + '</strong><div class="cell-subtle">' + escapeHtml(item.corridor) + '</div></td>' +
+            '<td>' + escapeHtml(item.signal) + '</td>' +
+            '<td>' + escapeHtml(item.focus) + '</td>' +
+            '<td>' + escapeHtml(String(item.score)) + '</td>' +
+            '<td><span class="status-pill">' + escapeHtml(item.status) + '</span></td>' +
+          '</tr>';
+        }).join("");
+      }
+
+      function renderSignals(signals) {
+        signalList.innerHTML = signals.map((signal) => {
+          return '<li class="signal-item">' +
+            '<div class="signal-meta"><span>' + escapeHtml(signal.board) + '</span><span>' + escapeHtml(signal.meetingDate) + '</span></div>' +
+            '<a class="signal-link" href="' + escapeHtml(signal.agendaUrl) + '" target="_blank" rel="noreferrer">' + escapeHtml(signal.title) + '</a>' +
+            '<p class="signal-source">' + escapeHtml(signal.source) + '</p>' +
+          '</li>';
+        }).join("");
+      }
+
+      function renderBriefs(briefs) {
+        briefList.innerHTML = briefs.map((brief) => {
+          return '<li class="brief-item">' +
+            '<div class="brief-topline"><span>' + escapeHtml(brief.board) + '</span><span>' + escapeHtml(brief.confidence) + '</span></div>' +
+            '<p class="brief-site">' + escapeHtml(brief.likelySite) + '</p>' +
+            '<p class="brief-type">' + escapeHtml(brief.signalType) + '</p>' +
+            '<p class="brief-rationale">' + escapeHtml(brief.rationale) + '</p>' +
+            '<div class="brief-meta"><span>' + escapeHtml(brief.meetingDate) + '</span><a href="' + escapeHtml(brief.agendaUrl) + '" target="_blank" rel="noreferrer">Open agenda</a></div>' +
+          '</li>';
+        }).join("");
+      }
+
+      function applyFilters() {
+        const term = searchInput.value.trim().toLowerCase();
+        const corridor = corridorFilter.value;
+        const status = statusFilter.value;
+
+        const filtered = initialData.sites.filter((site) => {
+          const matchesTerm = !term || [site.site, site.corridor, site.signal, site.focus]
+            .join(" ")
+            .toLowerCase()
+            .includes(term);
+          const matchesCorridor = corridor === "all" || site.corridor === corridor;
+          const matchesStatus = status === "all" || site.status === status;
+          return matchesTerm && matchesCorridor && matchesStatus;
+        });
+
+        renderRows(filtered);
+      }
+
+      populateFilters(initialData.sites);
+      renderRows(initialData.sites);
+      renderSignals(initialData.signals);
+      renderBriefs(initialData.briefs);
+
+      searchInput.addEventListener("input", applyFilters);
+      corridorFilter.addEventListener("change", applyFilters);
+      statusFilter.addEventListener("change", applyFilters);
+
+      fetch("/api/signals")
+        .then((response) => response.json())
+        .then((data) => {
+          if (Array.isArray(data.signals)) {
+            initialData.signals = data.signals;
+            renderSignals(initialData.signals);
+          }
+        })
+        .catch(() => {
+          // Keep the server-rendered signal list in place if refresh fails.
+        });
+
+      fetch("/api/briefs")
+        .then((response) => response.json())
+        .then((data) => {
+          if (Array.isArray(data.briefs)) {
+            initialData.briefs = data.briefs;
+            renderBriefs(initialData.briefs);
+          }
+        })
+        .catch(() => {
+          // Keep the server-rendered case briefs in place if refresh fails.
+        });
+    </script>
+  </body>
+</html>`;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (request.method === "GET" && url.pathname === "/") {
+      const signals = await fetchAgendaSignals();
+      const payload = await buildDashboardPayload(signals);
+      return new Response(renderDashboard(payload), {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+        },
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/status") {
+      return Response.json(buildStatusPayload(env));
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/sites") {
+      return Response.json({
+        sites: SITES,
+        count: SITES.length,
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/signals") {
+      const signals = await fetchAgendaSignals();
+      return Response.json({
+        signals,
+        source: AGENDA_CENTER_URL,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/briefs") {
+      const signals = await fetchAgendaSignals();
+      const briefs = await buildCaseBriefs(signals);
+      return Response.json({
+        briefs,
+        source: AGENDA_CENTER_URL,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/summary") {
+      const signals = await fetchAgendaSignals();
+      const briefs = await buildCaseBriefs(signals);
+      return Response.json({
+        summary: buildSummaryMetrics(SITES, signals, briefs),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/ingest-info") {
+      return Response.json(
+        {
+          enabled: Boolean(env.OPPORTUNITYDB),
+          detail: env.OPPORTUNITYDB
+            ? "D1 binding is available for automated parcel ingest and parcel matching."
+            : "D1 binding is not configured yet.",
+          nextStep: env.OPPORTUNITYDB
+            ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, and match them to parcels."
+            : "Attach D1 and persist case briefs, then map briefs to parcels and corridors.",
+        },
+        { status: 200 },
+      );
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/parcels/upsert") {
+      if (!env.OPPORTUNITYDB) {
+        return missingDatabaseResponse();
+      }
+
+      const body = await readJson<{ parcels?: ParcelUpsertInput[] }>(request);
+      if (!Array.isArray(body.parcels)) {
+        return Response.json(
+          { ok: false, error: "Request body must include a parcels array." },
+          { status: 400 },
+        );
+      }
+
+      await upsertParcels(env.OPPORTUNITYDB, body.parcels);
+
+      return Response.json({
+        ok: true,
+        ingested: body.parcels.length,
+      });
+    }
+
+    if (request.method === "POST" && url.pathname === "/api/opportunities/match") {
+      if (!env.OPPORTUNITYDB) {
+        return missingDatabaseResponse();
+      }
+
+      const body = await readJson<{ opportunities?: OpportunityParcelInput[] }>(request);
+      if (!Array.isArray(body.opportunities)) {
+        return Response.json(
+          { ok: false, error: "Request body must include an opportunities array." },
+          { status: 400 },
+        );
+      }
+
+      const results = await matchAndPersistOpportunities(env.OPPORTUNITYDB, body.opportunities);
+
+      return Response.json({
+        ok: true,
+        matched: results.filter((result) => result.matchType !== "no_match").length,
+        reviewNeeded: results.filter((result) => result.needsReview).length,
+        results,
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opportunities/review") {
+      if (!env.OPPORTUNITYDB) {
+        return missingDatabaseResponse();
+      }
+
+      const limitParam = Number(url.searchParams.get("limit") ?? "25");
+      const needsReviewOnly = url.searchParams.get("needsReviewOnly") !== "false";
+      const queue = await listParcelReviewQueue(env.OPPORTUNITYDB, {
+        limit: Number.isFinite(limitParam) ? limitParam : 25,
+        needsReviewOnly,
+      });
+
+      return Response.json({
+        ok: true,
+        count: queue.length,
+        needsReviewOnly,
+        results: queue,
+      });
+    }
+
+    if (request.method === "POST" && url.pathname === "/ingest") {
+      if (!env.OPPORTUNITYDB) {
+        return Response.json(
+          {
+            accepted: false,
+            message: buildIngestMessage("manual"),
+            detail: "Queue and database bindings are not configured yet.",
+          },
+          { status: 501 },
+        );
+      }
+
+      const runId = await startIngestionRun(env.OPPORTUNITYDB, "manual");
+
+      try {
+        const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
+
+        return Response.json({
+          accepted: true,
+          message: buildIngestMessage("manual"),
+          detail:
+            "Manual ingest completed: Danvers parcels refreshed, case briefs rebuilt, and opportunities matched.",
+          summary,
+        });
+      } catch (error) {
+        await finishIngestionRun(env.OPPORTUNITYDB, runId, "failed");
+
+        return Response.json(
+          {
+            accepted: false,
+            message: buildIngestMessage("manual"),
+            error: error instanceof Error ? error.message : "Ingest failed.",
+          },
+          { status: 500 },
+        );
+      }
+    }
+
+    return new Response("Not Found", { status: 404 });
+  },
+
+  async scheduled(controller: { cron: string }, env: Env): Promise<void> {
+    const timestamp = new Date().toISOString();
+
+    if (env.OPPORTUNITYDB) {
+      const runId = await startIngestionRun(env.OPPORTUNITYDB, "scheduled");
+
+      try {
+        const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
+
+        console.log(
+          JSON.stringify({
+            event: "scheduled-run",
+            cron: controller.cron,
+            at: timestamp,
+            databaseConfigured: true,
+            summary,
+          }),
+        );
+        return;
+      } catch (error) {
+        await finishIngestionRun(env.OPPORTUNITYDB, runId, "failed");
+
+        console.error(
+          JSON.stringify({
+            event: "scheduled-run-failed",
+            cron: controller.cron,
+            at: timestamp,
+            databaseConfigured: true,
+            error: error instanceof Error ? error.message : "Unknown ingest failure",
+          }),
+        );
+        throw error;
+      }
+    }
+
+    console.log(
+      JSON.stringify({
+        event: "scheduled-run",
+        cron: controller.cron,
+        at: timestamp,
+        databaseConfigured: Boolean(env.OPPORTUNITYDB),
+      }),
+    );
+  },
 }
