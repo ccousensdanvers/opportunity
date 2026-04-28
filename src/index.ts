@@ -219,6 +219,37 @@ interface DanversFloodAttributes {
   DEPTH?: number | null;
 }
 
+function coerceOptionalString(value: unknown): string | null {
+  if (typeof value === "string") {
+    const normalized = value.trim();
+    return normalized || null;
+  }
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+
+  return null;
+}
+
+function coerceOptionalNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.replace(/,/g, "").trim();
+    if (!normalized) {
+      return null;
+    }
+
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
 interface ParcelContext {
   address: string;
   ownerName: string | null;
@@ -2003,14 +2034,14 @@ async function fetchParcelContextForAddresses(addresses: string[]): Promise<Parc
         : { intersectsGroundwaterProtection: false };
       contexts.push({
         address: normalizedAddress,
-        ownerName: feature.attributes.OWNER1?.trim() || feature.attributes.OWN_CO?.trim() || null,
-        zoning: feature.attributes.ZONING?.trim() || null,
-        totalValue: typeof feature.attributes.TOTAL_VAL === "number" ? feature.attributes.TOTAL_VAL : null,
-        landValue: typeof feature.attributes.LAND_VAL === "number" ? feature.attributes.LAND_VAL : null,
-        buildingValue: typeof feature.attributes.BLDG_VAL === "number" ? feature.attributes.BLDG_VAL : null,
-        lotSize: typeof feature.attributes.LOT_SIZE === "number" ? feature.attributes.LOT_SIZE : null,
-        yearBuilt: typeof feature.attributes.YEAR_BUILT === "number" ? feature.attributes.YEAR_BUILT : null,
-        useCode: typeof feature.attributes.USE_CODE === "number" ? feature.attributes.USE_CODE : null,
+        ownerName: coerceOptionalString(feature.attributes.OWNER1) || coerceOptionalString(feature.attributes.OWN_CO),
+        zoning: coerceOptionalString(feature.attributes.ZONING),
+        totalValue: coerceOptionalNumber(feature.attributes.TOTAL_VAL),
+        landValue: coerceOptionalNumber(feature.attributes.LAND_VAL),
+        buildingValue: coerceOptionalNumber(feature.attributes.BLDG_VAL),
+        lotSize: coerceOptionalNumber(feature.attributes.LOT_SIZE),
+        yearBuilt: coerceOptionalNumber(feature.attributes.YEAR_BUILT),
+        useCode: coerceOptionalNumber(feature.attributes.USE_CODE),
         floodZones: flood.floodZones,
         specialFloodHazard: flood.specialFloodHazard,
         hasMappedWaterAccess: utility.hasMappedWaterAccess,
