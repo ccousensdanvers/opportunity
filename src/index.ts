@@ -1280,18 +1280,22 @@ async function fetchLatestStrategicBrief(db?: D1Database): Promise<StrategicBrie
     return null;
   }
 
-  const row = await db
-    .prepare(
-      `
-      SELECT generated_at, trigger, title, summary, insights_json, recommendations_json, metrics_json, source_count
-      FROM strategic_briefs
-      ORDER BY generated_at DESC
-      LIMIT 1
-      `,
-    )
-    .first<StrategicBriefRow>();
+  try {
+    const row = await db
+      .prepare(
+        `
+        SELECT generated_at, trigger, title, summary, insights_json, recommendations_json, metrics_json, source_count
+        FROM strategic_briefs
+        ORDER BY generated_at DESC
+        LIMIT 1
+        `,
+      )
+      .first<StrategicBriefRow>();
 
-  return mapStrategicBriefRow(row ?? null);
+    return mapStrategicBriefRow(row ?? null);
+  } catch {
+    return null;
+  }
 }
 
 async function listStrategicBriefs(db?: D1Database, limit = 10): Promise<StrategicBrief[]> {
@@ -1300,51 +1304,59 @@ async function listStrategicBriefs(db?: D1Database, limit = 10): Promise<Strateg
   }
 
   const safeLimit = Math.max(1, Math.min(limit, 25));
-  const result = await db
-    .prepare(
-      `
-      SELECT generated_at, trigger, title, summary, insights_json, recommendations_json, metrics_json, source_count
-      FROM strategic_briefs
-      ORDER BY generated_at DESC
-      LIMIT ?
-      `,
-    )
-    .bind(safeLimit)
-    .all<StrategicBriefRow>();
+  try {
+    const result = await db
+      .prepare(
+        `
+        SELECT generated_at, trigger, title, summary, insights_json, recommendations_json, metrics_json, source_count
+        FROM strategic_briefs
+        ORDER BY generated_at DESC
+        LIMIT ?
+        `,
+      )
+      .bind(safeLimit)
+      .all<StrategicBriefRow>();
 
-  return (result.results ?? [])
-    .map((row) => mapStrategicBriefRow(row))
-    .filter((row): row is StrategicBrief => Boolean(row));
+    return (result.results ?? [])
+      .map((row) => mapStrategicBriefRow(row))
+      .filter((row): row is StrategicBrief => Boolean(row));
+  } catch {
+    return [];
+  }
 }
 
 async function persistStrategicBrief(db: D1Database, brief: StrategicBrief): Promise<void> {
-  await db
-    .prepare(
-      `
-      INSERT INTO strategic_briefs (
-        generated_at,
-        trigger,
-        title,
-        summary,
-        insights_json,
-        recommendations_json,
-        metrics_json,
-        source_count
+  try {
+    await db
+      .prepare(
+        `
+        INSERT INTO strategic_briefs (
+          generated_at,
+          trigger,
+          title,
+          summary,
+          insights_json,
+          recommendations_json,
+          metrics_json,
+          source_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `,
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `,
-    )
-    .bind(
-      brief.generatedAt,
-      brief.trigger,
-      brief.title,
-      brief.summary,
-      JSON.stringify(brief.insights),
-      JSON.stringify(brief.recommendations),
-      JSON.stringify(brief.metrics),
-      brief.sourceCount,
-    )
-    .run();
+      .bind(
+        brief.generatedAt,
+        brief.trigger,
+        brief.title,
+        brief.summary,
+        JSON.stringify(brief.insights),
+        JSON.stringify(brief.recommendations),
+        JSON.stringify(brief.metrics),
+        brief.sourceCount,
+      )
+      .run();
+  } catch {
+    return;
+  }
 }
 
 async function createAndPersistStrategicBrief(
