@@ -575,6 +575,20 @@ function looksLikeProjectTitle(value: string): boolean {
     lowered === "projects" ||
     lowered === "meeting schedule and filing fees" ||
     lowered.includes("application") ||
+    lowered.includes("floor plan") ||
+    lowered.includes("floor plans") ||
+    lowered.includes("elevation") ||
+    lowered.includes("elevations") ||
+    lowered.includes("detail") ||
+    lowered.includes("details") ||
+    lowered.includes("memo") ||
+    lowered.includes("report") ||
+    lowered.includes("appendix") ||
+    lowered.includes("rendering") ||
+    lowered.includes("renderings") ||
+    lowered.includes("exhibit") ||
+    lowered.includes("cut sheet") ||
+    lowered.includes("cut sheets") ||
     lowered.includes("site plan") ||
     lowered.includes("narrative") ||
     lowered.includes("traffic") ||
@@ -1205,15 +1219,15 @@ function renderDashboard(payload: DashboardPayload): string {
     <title>Opportunity</title>
     <style>
       :root {
-        --bg: #f5f1e8;
-        --panel: #fffaf2;
-        --ink: #1f2a27;
-        --muted: #5e6a67;
-        --line: rgba(31, 42, 39, 0.12);
-        --accent: #16423c;
-        --accent-soft: rgba(22, 66, 60, 0.1);
-        --warm: #af5e2f;
-        --warm-soft: rgba(175, 94, 47, 0.12);
+        --bg: #edf4fb;
+        --panel: #f8fbff;
+        --ink: #12324f;
+        --muted: #5d7791;
+        --line: rgba(18, 50, 79, 0.12);
+        --accent: #005a9c;
+        --accent-soft: rgba(0, 90, 156, 0.1);
+        --warm: #2a7abf;
+        --warm-soft: rgba(42, 122, 191, 0.14);
       }
 
       * {
@@ -1223,7 +1237,7 @@ function renderDashboard(payload: DashboardPayload): string {
       body {
         margin: 0;
         font-family: Georgia, "Times New Roman", serif;
-        background: linear-gradient(180deg, #f7f2e9 0%, #efe7da 100%);
+        background: linear-gradient(180deg, #f1f7fd 0%, #dce9f6 100%);
         color: var(--ink);
       }
 
@@ -1239,7 +1253,7 @@ function renderDashboard(payload: DashboardPayload): string {
 
       .rail {
         padding: 28px 22px;
-        background: rgba(255, 250, 242, 0.9);
+        background: rgba(246, 251, 255, 0.94);
         border-right: 1px solid var(--line);
         display: grid;
         align-content: space-between;
@@ -1323,7 +1337,7 @@ function renderDashboard(payload: DashboardPayload): string {
       .topbar-meta,
       .panel,
       .metric {
-        background: rgba(255, 250, 242, 0.82);
+        background: rgba(248, 251, 255, 0.88);
         border: 1px solid var(--line);
         border-radius: 14px;
       }
@@ -1345,11 +1359,11 @@ function renderDashboard(payload: DashboardPayload): string {
       }
 
       .metric.warm {
-        background: linear-gradient(180deg, #fffaf2, #f8ecdf);
+        background: linear-gradient(180deg, #f8fbff, #e3effb);
       }
 
       .metric.cool {
-        background: linear-gradient(180deg, #fffaf2, #eef5f3);
+        background: linear-gradient(180deg, #f8fbff, #d8eafc);
       }
 
       .metric-label,
