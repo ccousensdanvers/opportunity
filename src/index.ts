@@ -77,6 +77,8 @@ interface DashboardPayload {
 }
 
 const AGENDA_CENTER_URL = "https://www.danversma.gov/AgendaCenter";
+const PLANNING_BOARD_AGENDA_URL = "https://www.danversma.gov/AgendaCenter/Planning-Board-11";
+const ZBA_AGENDA_URL = "https://www.danversma.gov/AgendaCenter/Zoning-Board-of-Appeals-18";
 const DANVERS_PARCELS_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
 const DANVERS_PARCELS_PAGE_SIZE = 1000;
@@ -498,11 +500,14 @@ class AgendaLinkCollector {
   }
 }
 
-async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
+async function fetchAgendaSignalsForBoard(
+  board: AgendaSignal["board"],
+  url: string,
+): Promise<AgendaSignal[]> {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 4000);
-    const response = await fetch(AGENDA_CENTER_URL, {
+    const response = await fetch(url, {
       signal: controller.signal,
       headers: {
         "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
@@ -515,20 +520,15 @@ async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
     }
 
     const html = await response.text();
-    let currentBoard: string | null = null;
     let currentDate: string | null = null;
     const signals: AgendaSignal[] = [];
     const seen = new Set<string>();
 
-    const boardCollector = new HeadingCollector((value) => {
-      currentBoard = value || null;
-      currentDate = null;
-    });
     const dateCollector = new HeadingCollector((value) => {
       currentDate = value || null;
     });
     const linkCollector = new AgendaLinkCollector(
-      () => currentBoard,
+      () => board,
       () => currentDate,
       (signal) => {
         const key = `${signal.board}|${signal.meetingDate}|${signal.agendaUrl}`;
@@ -540,23 +540,30 @@ async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
     );
 
     await new HTMLRewriter()
-      .on("h2", boardCollector)
       .on("h3", dateCollector)
       .on("a", linkCollector)
       .transform(new Response(html))
       .text();
 
-    const filtered = signals
-      .filter(
-        (signal) =>
-          signal.board === "Planning Board" || signal.board === "Zoning Board of Appeals",
-      )
+    return signals
+      .filter((signal) => !signal.title.toLowerCase().includes("cancel"))
       .slice(0, 8);
-
-    return filtered.length ? filtered : FALLBACK_SIGNALS;
   } catch {
-    return FALLBACK_SIGNALS;
+    return [];
   }
+}
+
+async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
+  const [planningSignals, zbaSignals] = await Promise.all([
+    fetchAgendaSignalsForBoard("Planning Board", PLANNING_BOARD_AGENDA_URL),
+    fetchAgendaSignalsForBoard("Zoning Board of Appeals", ZBA_AGENDA_URL),
+  ]);
+
+  const signals = [...planningSignals, ...zbaSignals]
+    .sort((left, right) => right.meetingDate.localeCompare(left.meetingDate))
+    .slice(0, 8);
+
+  return signals.length ? signals : FALLBACK_SIGNALS;
 }
 
 function isPdfDocument(bytes: Uint8Array, contentType: string | null): boolean {
