@@ -110,6 +110,9 @@ interface StrategicBrief {
     businessZonedParcels?: number;
     floodConstrainedParcels?: number;
     olderBuildingStockParcels?: number;
+    waterServedParcels?: number;
+    sewerServedParcels?: number;
+    externalServiceAreaParcels?: number;
   };
   sourceCount: number;
 }
@@ -128,6 +131,16 @@ const DANVERS_ASSESSOR_TABLE_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/45/query";
 const DANVERS_FIRM_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/44/query";
+const DANVERS_WATER_PIPE_LAYER_URL =
+  "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/30/query";
+const DANVERS_PEABODY_SEWER_CUSTOMERS_LAYER_URL =
+  "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/31/query";
+const DANVERS_PEABODY_WATER_CUSTOMERS_LAYER_URL =
+  "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/32/query";
+const DANVERS_GRAVITY_MAIN_LAYER_URL =
+  "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/37/query";
+const DANVERS_FORCE_MAIN_LAYER_URL =
+  "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_OpsLayers/MapServer/38/query";
 const DANVERS_PARCELS_PAGE_SIZE = 1000;
 const INGEST_PARCEL_SAMPLE_LIMIT = 250;
 
@@ -157,6 +170,10 @@ interface ArcGisFeature<TAttributes = Record<string, unknown>, TGeometry = Recor
 interface ArcGisQueryResponse<TAttributes = Record<string, unknown>, TGeometry = Record<string, unknown>> {
   features?: Array<ArcGisFeature<TAttributes, TGeometry>>;
   exceededTransferLimit?: boolean;
+}
+
+interface ArcGisCountResponse {
+  count?: number;
 }
 
 interface DanversAssessorAttributes {
@@ -203,6 +220,10 @@ interface ParcelContext {
   useCode: number | null;
   floodZones: string[];
   specialFloodHazard: boolean;
+  hasMappedWaterAccess: boolean;
+  hasMappedSewerAccess: boolean;
+  externalWaterServiceArea: boolean;
+  externalSewerServiceArea: boolean;
 }
 
 interface StrategicBriefRow {
@@ -1234,6 +1255,11 @@ function buildStrategicBrief(
   const underbuiltBusinessParcels = parcelContexts.filter(
     (context) => isBusinessZoning(context.zoning) && isLikelyUnderbuiltParcel(context),
   ).length;
+  const waterServedParcels = parcelContexts.filter((context) => context.hasMappedWaterAccess).length;
+  const sewerServedParcels = parcelContexts.filter((context) => context.hasMappedSewerAccess).length;
+  const externalServiceAreaParcels = parcelContexts.filter(
+    (context) => context.externalWaterServiceArea || context.externalSewerServiceArea,
+  ).length;
 
   let boardTitle = "Board activity is split across both review lanes";
   let boardDetail =
@@ -1280,6 +1306,17 @@ function buildStrategicBrief(
         ? "The first parcel-context pass did not flag special flood hazard areas for the assessed lead set, which improves the odds that the current queue contains workable follow-up candidates."
         : "Flood and assessor screening have not yet returned parcel context for the current queue, so constraints still need to be checked case by case.";
 
+  const utilityInsightTitle =
+    waterServedParcels > 0 || sewerServedParcels > 0
+      ? "Mapped utility context is starting to separate easier sites from harder ones"
+      : "Utility readiness is still mostly unconfirmed for the current queue";
+  const utilityInsightDetail =
+    waterServedParcels > 0 || sewerServedParcels > 0
+      ? `${waterServedParcels} brief-linked parcels intersect mapped water infrastructure or service areas, ${sewerServedParcels} intersect mapped sewer infrastructure or service areas, and ${externalServiceAreaParcels} fall in mapped Peabody customer areas. That gives Danvers an early site-readiness read before engineering review.`
+      : parcelContexts.length
+        ? "The first utility pass did not find mapped water or sewer context for the current assessed leads, which means service readiness still needs manual follow-up."
+        : "Utility screening has not yet returned parcel context for the current queue.";
+
   const recommendations: StrategicRecommendation[] = [
     {
       action:
@@ -1321,6 +1358,16 @@ function buildStrategicBrief(
           ? "That prevents the Town from spending the same level of attention on straightforward sites and more complex resilience- or permitting-heavy sites."
           : "The next jump in recommendation quality will come from consistently screening physical and regulatory constraints before staff time is spent.",
     },
+    {
+      action:
+        waterServedParcels > 0 || sewerServedParcels > 0
+          ? "Prioritize parcels with mapped utility context for the first site-readiness shortlist."
+          : "Add more utility validation before treating current leads as truly site-ready.",
+      whyItMatters:
+        waterServedParcels > 0 || sewerServedParcels > 0
+          ? "Those parcels are more likely to move faster from policy interest to realistic development conversations because service context is already partly visible."
+          : "Economic-development recommendations are much stronger when they distinguish promising sites from sites that still need basic infrastructure confirmation.",
+    },
   ];
 
   return {
@@ -1349,6 +1396,11 @@ function buildStrategicBrief(
         title: constraintInsightTitle,
         detail: constraintInsightDetail,
       },
+      {
+        eyebrow: "Utility Readiness",
+        title: utilityInsightTitle,
+        detail: utilityInsightDetail,
+      },
     ],
     recommendations,
     metrics: {
@@ -1360,6 +1412,9 @@ function buildStrategicBrief(
       businessZonedParcels,
       floodConstrainedParcels,
       olderBuildingStockParcels,
+      waterServedParcels,
+      sewerServedParcels,
+      externalServiceAreaParcels,
     },
     sourceCount: signals.length + briefs.length + parcelContexts.length,
   };
@@ -1599,6 +1654,19 @@ function buildDanversFloodQueryUrl(geometry: DanversParcelGeometry): string {
   return `${DANVERS_FIRM_LAYER_URL}?${params.toString()}`;
 }
 
+function buildArcGisGeometryCountQueryUrl(layerUrl: string, geometry: DanversParcelGeometry): string {
+  const params = new URLSearchParams({
+    geometry: JSON.stringify(geometry),
+    geometryType: "esriGeometryPolygon",
+    inSR: String(geometry.spatialReference?.latestWkid ?? geometry.spatialReference?.wkid ?? 2249),
+    spatialRel: "esriSpatialRelIntersects",
+    returnCountOnly: "true",
+    f: "json",
+  });
+
+  return `${layerUrl}?${params.toString()}`;
+}
+
 function buildParcelAliases(attributes: DanversParcelAttributes): ParcelUpsertInput["aliases"] {
   const aliases: NonNullable<ParcelUpsertInput["aliases"]> = [];
 
@@ -1728,23 +1796,13 @@ function isLikelyUnderbuiltParcel(context: ParcelContext): boolean {
   return context.landValue >= context.buildingValue;
 }
 
-async function fetchParcelFloodContext(address: string): Promise<{
+async function fetchParcelFloodContext(geometry: DanversParcelGeometry): Promise<{
   floodZones: string[];
   specialFloodHazard: boolean;
 }> {
   try {
-    const parcelPayload = await fetchJson<ArcGisQueryResponse<Record<string, unknown>, DanversParcelGeometry>>(
-      buildDanversParcelGeometryQueryUrl(address),
-      15000,
-    );
-    const parcelGeometry = parcelPayload.features?.find((feature) => feature.geometry?.rings)?.geometry;
-
-    if (!parcelGeometry) {
-      return { floodZones: [], specialFloodHazard: false };
-    }
-
     const floodPayload = await fetchJson<ArcGisQueryResponse<DanversFloodAttributes>>(
-      buildDanversFloodQueryUrl(parcelGeometry),
+      buildDanversFloodQueryUrl(geometry),
       15000,
     );
     const zones = Array.from(
@@ -1761,6 +1819,61 @@ async function fetchParcelFloodContext(address: string): Promise<{
     return { floodZones: zones, specialFloodHazard };
   } catch {
     return { floodZones: [], specialFloodHazard: false };
+  }
+}
+
+async function fetchParcelUtilityContext(geometry: DanversParcelGeometry): Promise<{
+  hasMappedWaterAccess: boolean;
+  hasMappedSewerAccess: boolean;
+  externalWaterServiceArea: boolean;
+  externalSewerServiceArea: boolean;
+}> {
+  try {
+    const [
+      waterPipeCount,
+      gravityMainCount,
+      forceMainCount,
+      peabodyWaterAreaCount,
+      peabodySewerAreaCount,
+    ] = await Promise.all([
+      fetchJson<ArcGisCountResponse>(
+        buildArcGisGeometryCountQueryUrl(DANVERS_WATER_PIPE_LAYER_URL, geometry),
+        15000,
+      ),
+      fetchJson<ArcGisCountResponse>(
+        buildArcGisGeometryCountQueryUrl(DANVERS_GRAVITY_MAIN_LAYER_URL, geometry),
+        15000,
+      ),
+      fetchJson<ArcGisCountResponse>(
+        buildArcGisGeometryCountQueryUrl(DANVERS_FORCE_MAIN_LAYER_URL, geometry),
+        15000,
+      ),
+      fetchJson<ArcGisCountResponse>(
+        buildArcGisGeometryCountQueryUrl(DANVERS_PEABODY_WATER_CUSTOMERS_LAYER_URL, geometry),
+        15000,
+      ),
+      fetchJson<ArcGisCountResponse>(
+        buildArcGisGeometryCountQueryUrl(DANVERS_PEABODY_SEWER_CUSTOMERS_LAYER_URL, geometry),
+        15000,
+      ),
+    ]);
+
+    return {
+      hasMappedWaterAccess: Number(waterPipeCount.count ?? 0) > 0 || Number(peabodyWaterAreaCount.count ?? 0) > 0,
+      hasMappedSewerAccess:
+        Number(gravityMainCount.count ?? 0) > 0
+        || Number(forceMainCount.count ?? 0) > 0
+        || Number(peabodySewerAreaCount.count ?? 0) > 0,
+      externalWaterServiceArea: Number(peabodyWaterAreaCount.count ?? 0) > 0,
+      externalSewerServiceArea: Number(peabodySewerAreaCount.count ?? 0) > 0,
+    };
+  } catch {
+    return {
+      hasMappedWaterAccess: false,
+      hasMappedSewerAccess: false,
+      externalWaterServiceArea: false,
+      externalSewerServiceArea: false,
+    };
   }
 }
 
@@ -1794,7 +1907,22 @@ async function fetchParcelContextForAddresses(addresses: string[]): Promise<Parc
         continue;
       }
 
-      const flood = await fetchParcelFloodContext(normalizedAddress);
+      const parcelPayload = await fetchJson<ArcGisQueryResponse<Record<string, unknown>, DanversParcelGeometry>>(
+        buildDanversParcelGeometryQueryUrl(normalizedAddress),
+        15000,
+      );
+      const parcelGeometry = parcelPayload.features?.find((candidate) => candidate.geometry?.rings)?.geometry;
+      const flood = parcelGeometry
+        ? await fetchParcelFloodContext(parcelGeometry)
+        : { floodZones: [], specialFloodHazard: false };
+      const utility = parcelGeometry
+        ? await fetchParcelUtilityContext(parcelGeometry)
+        : {
+            hasMappedWaterAccess: false,
+            hasMappedSewerAccess: false,
+            externalWaterServiceArea: false,
+            externalSewerServiceArea: false,
+          };
       contexts.push({
         address: normalizedAddress,
         ownerName: feature.attributes.OWNER1?.trim() || feature.attributes.OWN_CO?.trim() || null,
@@ -1807,6 +1935,10 @@ async function fetchParcelContextForAddresses(addresses: string[]): Promise<Parc
         useCode: typeof feature.attributes.USE_CODE === "number" ? feature.attributes.USE_CODE : null,
         floodZones: flood.floodZones,
         specialFloodHazard: flood.specialFloodHazard,
+        hasMappedWaterAccess: utility.hasMappedWaterAccess,
+        hasMappedSewerAccess: utility.hasMappedSewerAccess,
+        externalWaterServiceArea: utility.externalWaterServiceArea,
+        externalSewerServiceArea: utility.externalSewerServiceArea,
       });
     } catch {
       continue;
@@ -2746,10 +2878,10 @@ export default {
           {
             enabled: Boolean(env.OPPORTUNITYDB),
             detail: env.OPPORTUNITYDB
-              ? "D1 binding is available for automated parcel ingest, parcel matching, stored strategic briefs, and parcel-context screening."
+              ? "D1 binding is available for automated parcel ingest, parcel matching, stored strategic briefs, and parcel-context screening including flood and utility context."
               : "D1 binding is not configured yet.",
             nextStep: env.OPPORTUNITYDB
-              ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, match them to parcels, screen brief-linked parcels against assessor and flood context, and save a strategic brief for the dashboard."
+              ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, match them to parcels, screen brief-linked parcels against assessor, flood, and utility context, and save a strategic brief for the dashboard."
               : "Attach D1 and persist case briefs, then map briefs to parcels, corridors, and recurring strategic briefs.",
           },
           { status: 200 },
