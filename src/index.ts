@@ -109,6 +109,16 @@ interface IngestRunSummary {
   reviewNeeded: number;
 }
 
+interface AgendaSignalDebugResult {
+  board: AgendaSignal["board"];
+  url: string;
+  ok: boolean;
+  status?: number;
+  error?: string;
+  parsedCount: number;
+  signals: AgendaSignal[];
+}
+
 const SITES: OpportunitySite[] = [
   {
     id: "maple-industrial-edge",
@@ -504,6 +514,14 @@ async function fetchAgendaSignalsForBoard(
   board: AgendaSignal["board"],
   url: string,
 ): Promise<AgendaSignal[]> {
+  const result = await fetchAgendaSignalsForBoardWithDebug(board, url);
+  return result.signals;
+}
+
+async function fetchAgendaSignalsForBoardWithDebug(
+  board: AgendaSignal["board"],
+  url: string,
+): Promise<AgendaSignalDebugResult> {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
@@ -516,7 +534,15 @@ async function fetchAgendaSignalsForBoard(
     clearTimeout(timeout);
 
     if (!response.ok) {
-      throw new Error(`Agenda Center request failed with ${response.status}`);
+      return {
+        board,
+        url,
+        ok: false,
+        status: response.status,
+        error: `Agenda Center request failed with ${response.status}`,
+        parsedCount: 0,
+        signals: [],
+      };
     }
 
     const html = await response.text();
@@ -568,9 +594,23 @@ async function fetchAgendaSignalsForBoard(
       });
     }
 
-    return signals.slice(0, 8);
-  } catch {
-    return [];
+    return {
+      board,
+      url,
+      ok: true,
+      status: response.status,
+      parsedCount: signals.length,
+      signals: signals.slice(0, 8),
+    };
+  } catch (error) {
+    return {
+      board,
+      url,
+      ok: false,
+      error: error instanceof Error ? error.message : "Unknown fetch failure",
+      parsedCount: 0,
+      signals: [],
+    };
   }
 }
 
@@ -585,6 +625,24 @@ async function fetchAgendaSignals(): Promise<AgendaSignal[]> {
     .slice(0, 8);
 
   return signals.length ? signals : FALLBACK_SIGNALS;
+}
+
+async function fetchAgendaSignalsDebug() {
+  const [planningBoard, zoningBoard] = await Promise.all([
+    fetchAgendaSignalsForBoardWithDebug("Planning Board", PLANNING_BOARD_AGENDA_URL),
+    fetchAgendaSignalsForBoardWithDebug("Zoning Board of Appeals", ZBA_AGENDA_URL),
+  ]);
+
+  const combined = [...planningBoard.signals, ...zoningBoard.signals]
+    .sort((left, right) => right.meetingDate.localeCompare(left.meetingDate))
+    .slice(0, 8);
+
+  return {
+    fallbackUsed: combined.length === 0,
+    planningBoard,
+    zoningBoard,
+    combinedSignals: combined.length ? combined : FALLBACK_SIGNALS,
+  };
 }
 
 function isPdfDocument(bytes: Uint8Array, contentType: string | null): boolean {
@@ -1631,6 +1689,14 @@ export default {
       return Response.json({
         signals,
         source: AGENDA_CENTER_URL,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/debug/signals") {
+      const debug = await fetchAgendaSignalsDebug();
+      return Response.json({
+        ...debug,
         updatedAt: new Date().toISOString(),
       });
     }
