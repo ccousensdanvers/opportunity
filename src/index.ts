@@ -864,11 +864,24 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
   return parcels;
 }
 
-function buildOpportunityInputs(briefs: CaseBrief[]): OpportunityParcelInput[] {
-  return briefs.map((brief) => ({
+function buildOpportunityInputs(
+  briefs: CaseBrief[],
+  parcels: ParcelUpsertInput[],
+): OpportunityParcelInput[] {
+  const derivedFromBriefs = briefs.map((brief) => ({
     id: brief.id,
     address: brief.addresses[0] ?? null,
   }));
+
+  const seededParcelTests = parcels
+    .filter((parcel) => parcel.address)
+    .slice(0, 3)
+    .map((parcel, index) => ({
+      id: `seeded-parcel-test-${index + 1}`,
+      address: parcel.address,
+    }));
+
+  return [...derivedFromBriefs, ...seededParcelTests];
 }
 
 async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
@@ -877,7 +890,7 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
 
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
-  const opportunities = buildOpportunityInputs(briefs);
+  const opportunities = buildOpportunityInputs(briefs, parcels);
   const results = await matchAndPersistOpportunities(db, opportunities);
 
   return {
