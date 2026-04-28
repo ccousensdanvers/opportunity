@@ -1098,10 +1098,19 @@ function buildOpportunityInputs(
   briefs: CaseBrief[],
   parcels: ParcelUpsertInput[],
 ): OpportunityParcelInput[] {
-  const derivedFromBriefs = briefs.map((brief) => ({
-    id: brief.id,
-    address: brief.addresses[0] ?? null,
-  }));
+  const derivedFromBriefs = briefs.flatMap((brief) => {
+    if (!brief.addresses.length) {
+      return [{
+        id: brief.id,
+        address: null,
+      }];
+    }
+
+    return brief.addresses.map((address, index) => ({
+      id: brief.addresses.length === 1 ? brief.id : `${brief.id}-address-${index + 1}`,
+      address,
+    }));
+  });
 
   const seededParcelTests = parcels
     .filter((parcel) => parcel.address)
