@@ -75,6 +75,11 @@ interface DashboardPayload {
   activity: ActivityItem[];
   signals: AgendaSignal[];
   briefs: CaseBrief[];
+  reviewSummary: {
+    total: number;
+    matched: number;
+    needsReview: number;
+  };
 }
 
 const AGENDA_CENTER_URL = "https://www.danversma.gov/AgendaCenter";
@@ -422,6 +427,29 @@ function extractAddresses(text: string): string[] {
     ),
   );
   return deduped.slice(0, 4);
+}
+
+function extractProjectTitleAddresses(title: string): string[] {
+  const normalized = normalizeWhitespace(title);
+  const rangeMatch = normalized.match(
+    /^(\d{1,5})-(\d{1,5})\s+([A-Za-z0-9.'-]+(?:\s+[A-Za-z0-9.'-]+){0,4}\s+(?:Street|St|Road|Rd|Avenue|Ave|Lane|Ln|Drive|Dr|Boulevard|Blvd|Way|Court|Ct|Terrace|Ter|Place|Pl|Highway|Hwy|Circle|Cir))$/i,
+  );
+
+  if (rangeMatch) {
+    return [`${rangeMatch[1]} ${rangeMatch[3]}`, `${rangeMatch[2]} ${rangeMatch[3]}`];
+  }
+
+  return extractAddresses(title);
+}
+
+function formatSourceLabel(source: string): string {
+  if (source === "danvers projects page") {
+    return "Projects Page";
+  }
+  if (source === "danvers agenda rss") {
+    return "Agenda RSS";
+  }
+  return source;
 }
 
 function buildSummaryMetrics(
@@ -986,11 +1014,17 @@ async function fetchPacketText(url: string): Promise<string> {
 async function buildCaseBriefs(signals: AgendaSignal[]): Promise<CaseBrief[]> {
   const briefs = await Promise.all(
     signals.slice(0, 6).map(async (signal) => {
-      const titleAddresses = extractAddresses(signal.title);
+      const titleAddresses =
+        signal.source === "danvers projects page"
+          ? extractProjectTitleAddresses(signal.title)
+          : extractAddresses(signal.title);
       const packetText = signal.source === "danvers projects page" ? "" : await fetchPacketText(signal.agendaUrl);
       const packetAddresses = packetText ? extractAddresses(packetText) : [];
       const addresses = titleAddresses.length ? titleAddresses : packetAddresses;
-      const likelySite = addresses[0] ?? `${signal.board} agenda item`;
+      const likelySite =
+        signal.source === "danvers projects page" && titleAddresses.length > 1
+          ? signal.title
+          : addresses[0] ?? `${signal.board} agenda item`;
       const titleAndPacket = normalizeWhitespace(`${signal.title} ${packetText}`);
 
       return {
@@ -1010,6 +1044,28 @@ async function buildCaseBriefs(signals: AgendaSignal[]): Promise<CaseBrief[]> {
   );
 
   return briefs;
+}
+
+async function fetchDashboardReviewSummary(db?: D1Database): Promise<DashboardPayload["reviewSummary"]> {
+  if (!db) {
+    return { total: 0, matched: 0, needsReview: 0 };
+  }
+
+  const totalRow = await db
+    .prepare(`SELECT COUNT(*) AS count FROM opportunity_parcel_matches`)
+    .first<{ count: number }>();
+  const matchedRow = await db
+    .prepare(`SELECT COUNT(*) AS count FROM opportunity_parcel_matches WHERE match_type != 'no_match'`)
+    .first<{ count: number }>();
+  const reviewRow = await db
+    .prepare(`SELECT COUNT(*) AS count FROM opportunity_parcel_matches WHERE needs_review = 1`)
+    .first<{ count: number }>();
+
+  return {
+    total: Number(totalRow?.count ?? 0),
+    matched: Number(matchedRow?.count ?? 0),
+    needsReview: Number(reviewRow?.count ?? 0),
+  };
 }
 
 function buildDanversParcelQueryUrl(resultOffset: number): string {
@@ -1196,8 +1252,9 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
   };
 }
 
-async function buildDashboardPayload(signals: AgendaSignal[]): Promise<DashboardPayload> {
+async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): Promise<DashboardPayload> {
   const briefs = await buildCaseBriefs(signals);
+  const reviewSummary = await fetchDashboardReviewSummary(db);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -1206,6 +1263,7 @@ async function buildDashboardPayload(signals: AgendaSignal[]): Promise<Dashboard
     activity: ACTIVITIES,
     signals,
     briefs,
+    reviewSummary,
   };
 }
 
@@ -1246,7 +1304,7 @@ function renderBriefMarkup(briefs: CaseBrief[]): string {
           <p class="brief-site">${escapeHtml(brief.likelySite)}</p>
           <p class="brief-type">${escapeHtml(brief.signalType)}</p>
           <p class="brief-rationale">${escapeHtml(brief.rationale)}</p>
-          <div class="brief-meta"><span>${escapeHtml(brief.meetingDate)}</span><a href="${escapeHtml(brief.agendaUrl)}" target="_blank" rel="noreferrer">Open agenda</a></div>
+          <div class="brief-meta"><span>${escapeHtml(brief.meetingDate)} · ${escapeHtml(formatSourceLabel(brief.source))}</span><a href="${escapeHtml(brief.agendaUrl)}" target="_blank" rel="noreferrer">Open source</a></div>
         </li>`,
     )
     .join("");
@@ -1259,7 +1317,7 @@ function renderSignalMarkup(signals: AgendaSignal[]): string {
         <li class="signal-item">
           <div class="signal-meta"><span>${escapeHtml(signal.board)}</span><span>${escapeHtml(signal.meetingDate)}</span></div>
           <a class="signal-link" href="${escapeHtml(signal.agendaUrl)}" target="_blank" rel="noreferrer">${escapeHtml(signal.title)}</a>
-          <p class="signal-source">${escapeHtml(signal.source)}</p>
+          <p class="signal-source">${escapeHtml(formatSourceLabel(signal.source))}</p>
         </li>`,
     )
     .join("");
@@ -1286,6 +1344,19 @@ function renderDashboard(payload: DashboardPayload): string {
     timeStyle: "short",
   });
   const initialTableRows = renderTableRows(payload.sites);
+  const reviewSummaryMarkup = `
+    <div class="review-summary">
+      <div class="review-card review-card-match">
+        <p class="eyebrow">Matched</p>
+        <strong>${escapeHtml(String(payload.reviewSummary.matched))}</strong>
+        <span>parcel-linked opportunities</span>
+      </div>
+      <div class="review-card review-card-review">
+        <p class="eyebrow">Needs Review</p>
+        <strong>${escapeHtml(String(payload.reviewSummary.needsReview))}</strong>
+        <span>items still needing staff review</span>
+      </div>
+    </div>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -1450,6 +1521,38 @@ function renderDashboard(payload: DashboardPayload): string {
       .metric-value {
         margin: 10px 0 8px;
         font-size: 2rem;
+      }
+
+      .review-summary {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+        margin-top: 14px;
+      }
+
+      .review-card {
+        padding: 12px 14px;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+      }
+
+      .review-card strong {
+        display: block;
+        font-size: 1.8rem;
+        margin: 2px 0 4px;
+      }
+
+      .review-card span {
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      .review-card-match {
+        background: linear-gradient(180deg, #eef7ff, #dcecff);
+      }
+
+      .review-card-review {
+        background: linear-gradient(180deg, #f8fbff, #e9f3fd);
       }
 
       .workspace {
@@ -1668,6 +1771,7 @@ function renderDashboard(payload: DashboardPayload): string {
             <div>Worker name: <strong>opportunity</strong></div>
             <div>Mode: dashboard plus case briefs</div>
             <div>Data store: seeded watchlist, live public feed</div>
+            ${reviewSummaryMarkup}
           </div>
         </header>
 
@@ -1874,7 +1978,7 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/") {
       const signals = await fetchAgendaSignals();
-      const payload = await buildDashboardPayload(signals);
+      const payload = await buildDashboardPayload(signals, env.OPPORTUNITYDB);
       return new Response(renderDashboard(payload), {
         headers: {
           "content-type": "text/html; charset=utf-8",
