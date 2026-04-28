@@ -494,7 +494,21 @@ export async function listParcelReviewQueue(
           zoningDistrict: row.zoningDistrict,
         }
       : null,
-  }));
+  })).filter((item) => {
+    if (item.opportunityId.startsWith("seeded-parcel-test-")) {
+      return false;
+    }
+
+    if (item.opportunityId === "planning-board-may-27-2025-planning-board-members") {
+      return false;
+    }
+
+    if (item.opportunityId === "zoning-board-of-appeals-jun-9-2025-zoning-board-of-appeals-members") {
+      return false;
+    }
+
+    return true;
+  });
 }
 
 export async function debugLookupParcelAddress(

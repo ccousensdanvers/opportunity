@@ -1173,15 +1173,7 @@ function buildOpportunityInputs(
     }));
   });
 
-  const seededParcelTests = parcels
-    .filter((parcel) => parcel.address)
-    .slice(0, 3)
-    .map((parcel, index) => ({
-      id: `seeded-parcel-test-${index + 1}`,
-      address: parcel.address,
-    }));
-
-  return [...derivedFromBriefs, ...seededParcelTests];
+  return derivedFromBriefs;
 }
 
 async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
