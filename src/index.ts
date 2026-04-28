@@ -75,6 +75,7 @@ interface DashboardPayload {
   activity: ActivityItem[];
   signals: AgendaSignal[];
   briefs: CaseBrief[];
+  strategicBrief: StrategicBrief;
   reviewSummary: {
     total: number;
     matched: number;
@@ -86,6 +87,27 @@ interface StrategicInsight {
   eyebrow: string;
   title: string;
   detail: string;
+}
+
+interface StrategicRecommendation {
+  action: string;
+  whyItMatters: string;
+}
+
+interface StrategicBrief {
+  generatedAt: string;
+  trigger: "live" | IngestTrigger;
+  title: string;
+  summary: string;
+  insights: StrategicInsight[];
+  recommendations: StrategicRecommendation[];
+  metrics: {
+    briefingSignals: number;
+    caseBriefs: number;
+    matched: number;
+    needsReview: number;
+  };
+  sourceCount: number;
 }
 
 const AGENDA_CENTER_URL = "https://www.danversma.gov/AgendaCenter";
@@ -117,6 +139,17 @@ interface DanversParcelFeature {
 interface DanversParcelQueryResponse {
   features?: DanversParcelFeature[];
   exceededTransferLimit?: boolean;
+}
+
+interface StrategicBriefRow {
+  generated_at: string;
+  trigger: string;
+  title: string;
+  summary: string;
+  insights_json: string;
+  recommendations_json: string;
+  metrics_json: string;
+  source_count: number;
 }
 
 interface IngestRunSummary {
@@ -314,7 +347,8 @@ function buildStatusPayload(env?: Env) {
         caseExtraction: true,
         scheduledChecks: true,
         database: Boolean(env?.OPPORTUNITYDB),
-        queue: false,
+        queue: Boolean(env?.OPPORTUNITYDB),
+        strategicBriefs: Boolean(env?.OPPORTUNITYDB),
       },
     },
   };
@@ -1112,6 +1146,226 @@ async function fetchDashboardReviewSummary(db?: D1Database): Promise<DashboardPa
   };
 }
 
+function buildStrategicBrief(
+  generatedAt: string,
+  trigger: StrategicBrief["trigger"],
+  sites: OpportunitySite[],
+  signals: AgendaSignal[],
+  briefs: CaseBrief[],
+  reviewSummary: DashboardPayload["reviewSummary"],
+): StrategicBrief {
+  const planningBoardBriefs = briefs.filter((brief) => brief.board === "Planning Board").length;
+  const zbaBriefs = briefs.filter((brief) => brief.board === "Zoning Board of Appeals").length;
+  const confidentBriefs = briefs.filter((brief) => brief.confidence !== "low").length;
+  const advancingSites = sites.filter((site) => site.readiness === "Advancing").length;
+  const averageScore = Math.round(sites.reduce((sum, site) => sum + site.score, 0) / sites.length);
+  const reviewShare = reviewSummary.total
+    ? Math.round((reviewSummary.needsReview / reviewSummary.total) * 100)
+    : 0;
+
+  let boardTitle = "Board activity is split across both review lanes";
+  let boardDetail =
+    "Planning Board and ZBA postings are landing at a similar pace, so Danvers should keep watching both formal development review and use-relief activity.";
+
+  if (planningBoardBriefs > zbaBriefs) {
+    boardTitle = "Planning Board is setting the near-term development pipeline";
+    boardDetail = `${planningBoardBriefs} of ${briefs.length} current briefs come from Planning Board materials, which suggests the strongest near-term signals are tied to formal site planning, subdivision, or project review.`;
+  } else if (zbaBriefs > planningBoardBriefs) {
+    boardTitle = "ZBA filings are surfacing the most immediate site friction";
+    boardDetail = `${zbaBriefs} of ${briefs.length} current briefs come from ZBA materials, pointing to a heavier mix of variance, use, and site-constraint questions that may need staff attention before broader redevelopment can move.`;
+  }
+
+  const queueTitle =
+    reviewSummary.needsReview > 0
+      ? "Staff review capacity is still shaping how fast leads become usable"
+      : "The parcel review queue is currently under control";
+  const queueDetail =
+    reviewSummary.total > 0
+      ? `${reviewSummary.needsReview} of ${reviewSummary.total} parcel-linked records still need staff review. Clearing ambiguous matches should improve how quickly Danvers can turn agenda signals into actionable property-level follow-up.`
+      : "Parcel-linked review records are not yet built up in the database, so the next value comes from continuing ingest and building a more complete site-level queue.";
+
+  const postureTitle =
+    advancingSites >= 2
+      ? "Several tracked Danvers sites are moving beyond early watchlist status"
+      : "Most tracked opportunities are still in an early-read posture";
+  const postureDetail =
+    confidentBriefs > 0
+      ? `${advancingSites} sites are marked advancing, the average watchlist score is ${averageScore}, and ${confidentBriefs} briefs now include medium or high confidence clues. Danvers can start prioritizing corridor-specific response, not just broad monitoring.`
+      : `${advancingSites} sites are marked advancing, but the current extraction layer still produces limited high-confidence clues. Better source coverage and parcel validation should come before heavier policy moves.`;
+
+  const recommendations: StrategicRecommendation[] = [
+    {
+      action:
+        reviewSummary.needsReview > 0
+          ? "Clear the highest-confidence review queue first."
+          : "Keep building parcel-linked coverage from live board activity.",
+      whyItMatters:
+        reviewSummary.needsReview > 0
+          ? "That is the fastest way to convert live postings into specific sites, owners, and follow-up candidates for staff."
+          : "A larger parcel-linked record set will make future recommendations more specific and more defensible.",
+    },
+    {
+      action:
+        planningBoardBriefs >= zbaBriefs
+          ? "Track Planning Board items as the main near-term development pipeline."
+          : "Track ZBA items as the clearest sign of near-term site friction and adaptation.",
+      whyItMatters:
+        planningBoardBriefs >= zbaBriefs
+          ? "Those filings are most likely to signal commercial expansion, redevelopment timing, and infrastructure questions early enough for Town response."
+          : "Those filings can reveal where zoning, site constraints, or reuse issues are slowing investment before projects mature.",
+    },
+    {
+      action: "Use the advancing watchlist to focus business-retention and redevelopment follow-up.",
+      whyItMatters:
+        "The combination of site readiness, case-brief confidence, and corridor context gives Danvers a practical shortlist for staff outreach and internal coordination.",
+    },
+  ];
+
+  return {
+    generatedAt,
+    trigger,
+    title: "Danvers Strategic Brief",
+    summary: `This briefing reflects ${signals.length} live agenda signals, ${briefs.length} case briefs, and ${reviewSummary.matched} parcel-linked opportunities. It is intended as decision support for Danvers economic development follow-up.`,
+    insights: [
+      {
+        eyebrow: "Strategic Insight",
+        title: boardTitle,
+        detail: boardDetail,
+      },
+      {
+        eyebrow: reviewShare > 50 ? "Operational Pressure" : "Review Queue",
+        title: queueTitle,
+        detail: queueDetail,
+      },
+      {
+        eyebrow: "Danvers Posture",
+        title: postureTitle,
+        detail: postureDetail,
+      },
+    ],
+    recommendations,
+    metrics: {
+      briefingSignals: signals.length,
+      caseBriefs: briefs.length,
+      matched: reviewSummary.matched,
+      needsReview: reviewSummary.needsReview,
+    },
+    sourceCount: signals.length + briefs.length,
+  };
+}
+
+function mapStrategicBriefRow(row: StrategicBriefRow | null): StrategicBrief | null {
+  if (!row) {
+    return null;
+  }
+
+  try {
+    return {
+      generatedAt: row.generated_at,
+      trigger: row.trigger === "manual" || row.trigger === "scheduled" ? row.trigger : "live",
+      title: row.title,
+      summary: row.summary,
+      insights: JSON.parse(row.insights_json) as StrategicInsight[],
+      recommendations: JSON.parse(row.recommendations_json) as StrategicRecommendation[],
+      metrics: JSON.parse(row.metrics_json) as StrategicBrief["metrics"],
+      sourceCount: Number(row.source_count ?? 0),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchLatestStrategicBrief(db?: D1Database): Promise<StrategicBrief | null> {
+  if (!db) {
+    return null;
+  }
+
+  const row = await db
+    .prepare(
+      `
+      SELECT generated_at, trigger, title, summary, insights_json, recommendations_json, metrics_json, source_count
+      FROM strategic_briefs
+      ORDER BY generated_at DESC
+      LIMIT 1
+      `,
+    )
+    .first<StrategicBriefRow>();
+
+  return mapStrategicBriefRow(row ?? null);
+}
+
+async function listStrategicBriefs(db?: D1Database, limit = 10): Promise<StrategicBrief[]> {
+  if (!db) {
+    return [];
+  }
+
+  const safeLimit = Math.max(1, Math.min(limit, 25));
+  const result = await db
+    .prepare(
+      `
+      SELECT generated_at, trigger, title, summary, insights_json, recommendations_json, metrics_json, source_count
+      FROM strategic_briefs
+      ORDER BY generated_at DESC
+      LIMIT ?
+      `,
+    )
+    .bind(safeLimit)
+    .all<StrategicBriefRow>();
+
+  return (result.results ?? [])
+    .map((row) => mapStrategicBriefRow(row))
+    .filter((row): row is StrategicBrief => Boolean(row));
+}
+
+async function persistStrategicBrief(db: D1Database, brief: StrategicBrief): Promise<void> {
+  await db
+    .prepare(
+      `
+      INSERT INTO strategic_briefs (
+        generated_at,
+        trigger,
+        title,
+        summary,
+        insights_json,
+        recommendations_json,
+        metrics_json,
+        source_count
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+    )
+    .bind(
+      brief.generatedAt,
+      brief.trigger,
+      brief.title,
+      brief.summary,
+      JSON.stringify(brief.insights),
+      JSON.stringify(brief.recommendations),
+      JSON.stringify(brief.metrics),
+      brief.sourceCount,
+    )
+    .run();
+}
+
+async function createAndPersistStrategicBrief(
+  db: D1Database,
+  trigger: IngestTrigger,
+): Promise<StrategicBrief> {
+  const signals = await fetchAgendaSignals();
+  const briefs = await buildCaseBriefs(signals);
+  const reviewSummary = await fetchDashboardReviewSummary(db);
+  const brief = buildStrategicBrief(
+    new Date().toISOString(),
+    trigger,
+    SITES,
+    signals,
+    briefs,
+    reviewSummary,
+  );
+  await persistStrategicBrief(db, brief);
+  return brief;
+}
+
 function buildDanversParcelQueryUrl(resultOffset: number): string {
   const params = new URLSearchParams({
     where: "1=1",
@@ -1299,6 +1553,10 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
 async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): Promise<DashboardPayload> {
   const briefs = await buildCaseBriefs(signals);
   const reviewSummary = await fetchDashboardReviewSummary(db);
+  const latestStoredBrief = await fetchLatestStrategicBrief(db);
+  const strategicBrief =
+    latestStoredBrief ??
+    buildStrategicBrief(new Date().toISOString(), "live", SITES, signals, briefs, reviewSummary);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -1307,6 +1565,7 @@ async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): 
     activity: ACTIVITIES,
     signals,
     briefs,
+    strategicBrief,
     reviewSummary,
   };
 }
@@ -1382,68 +1641,8 @@ function renderActivityMarkup(activity: ActivityItem[]): string {
     .join("");
 }
 
-function buildStrategicInsights(payload: DashboardPayload): StrategicInsight[] {
-  const planningBoardBriefs = payload.briefs.filter((brief) => brief.board === "Planning Board").length;
-  const zbaBriefs = payload.briefs.filter((brief) => brief.board === "Zoning Board of Appeals").length;
-  const confidentBriefs = payload.briefs.filter((brief) => brief.confidence !== "low").length;
-  const advancingSites = payload.sites.filter((site) => site.readiness === "Advancing").length;
-  const reviewShare = payload.reviewSummary.total
-    ? Math.round((payload.reviewSummary.needsReview / payload.reviewSummary.total) * 100)
-    : 0;
-  const averageScore = Math.round(
-    payload.sites.reduce((sum, site) => sum + site.score, 0) / payload.sites.length,
-  );
-
-  let boardTitle = "Board activity is split across both review lanes";
-  let boardDetail = "Planning Board and ZBA postings are landing at a similar pace, so staff should watch both boards for redevelopment and policy signals.";
-
-  if (planningBoardBriefs > zbaBriefs) {
-    boardTitle = "Planning Board is setting the near-term project pipeline";
-    boardDetail = `${planningBoardBriefs} of ${payload.briefs.length} current briefs come from Planning Board materials, suggesting most current movement is tied to site planning, subdivision, or formal development review.`;
-  } else if (zbaBriefs > planningBoardBriefs) {
-    boardTitle = "ZBA activity is surfacing the most immediate edge cases";
-    boardDetail = `${zbaBriefs} of ${payload.briefs.length} current briefs come from ZBA materials, which points to a heavier mix of variance, use, and site-constraint questions in the current queue.`;
-  }
-
-  const reviewTitle =
-    payload.reviewSummary.needsReview > 0
-      ? "Staff triage capacity is still a real constraint"
-      : "The parcel review queue is staying under control";
-  const reviewDetail =
-    payload.reviewSummary.total > 0
-      ? `${payload.reviewSummary.needsReview} of ${payload.reviewSummary.total} parcel-match records still need staff review, so the best next gains will come from clearing ambiguous matches and improving confidence on live signals.`
-      : "Parcel-linked review records have not been persisted yet, so the next operational step is turning the live signal feed into a maintained review queue.";
-
-  const postureTitle =
-    advancingSites >= 2
-      ? "Several Danvers sites are moving beyond early watchlist status"
-      : "Most tracked opportunities are still in early positioning mode";
-  const postureDetail =
-    confidentBriefs > 0
-      ? `${advancingSites} sites are marked advancing, the average watchlist score is ${averageScore}, and ${confidentBriefs} current briefs include medium or high confidence clues. That is enough signal to prioritize corridor-specific follow-up rather than broad scanning alone.`
-      : `${advancingSites} sites are marked advancing, but the case-extraction layer is still producing limited high-confidence clues. Near-term value will come from better source coverage and more parcel-linked validation.`;
-
-  return [
-    {
-      eyebrow: "Strategic Insight",
-      title: boardTitle,
-      detail: boardDetail,
-    },
-    {
-      eyebrow: reviewShare > 50 ? "Operational Pressure" : "Review Queue",
-      title: reviewTitle,
-      detail: reviewDetail,
-    },
-    {
-      eyebrow: "Danvers Posture",
-      title: postureTitle,
-      detail: postureDetail,
-    },
-  ];
-}
-
 function renderStrategicInsightsMarkup(payload: DashboardPayload): string {
-  return buildStrategicInsights(payload)
+  return payload.strategicBrief.insights
     .map(
       (insight) => `
         <div class="insight">
@@ -1455,13 +1654,30 @@ function renderStrategicInsightsMarkup(payload: DashboardPayload): string {
     .join("");
 }
 
+function renderStrategicRecommendationsMarkup(payload: DashboardPayload): string {
+  return payload.strategicBrief.recommendations
+    .map(
+      (recommendation) => `
+        <li class="recommendation-item">
+          <strong>${escapeHtml(recommendation.action)}</strong>
+          <p>${escapeHtml(recommendation.whyItMatters)}</p>
+        </li>`,
+    )
+    .join("");
+}
+
 function renderDashboard(payload: DashboardPayload, nonce: string): string {
   const generatedAt = new Date(payload.generatedAt).toLocaleString("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
   });
+  const briefGeneratedAt = new Date(payload.strategicBrief.generatedAt).toLocaleString("en-US", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
   const initialTableRows = renderTableRows(payload.sites);
   const strategicInsightsMarkup = renderStrategicInsightsMarkup(payload);
+  const strategicRecommendationsMarkup = renderStrategicRecommendationsMarkup(payload);
   const reviewSummaryMarkup = `
     <div class="review-summary">
       <div class="review-card review-card-match">
@@ -1763,7 +1979,8 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
 
       .brief-list,
       .signal-list,
-      .activity-list {
+      .activity-list,
+      .recommendation-list {
         display: grid;
         gap: 14px;
         padding: 0;
@@ -1845,6 +2062,32 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         border: 1px solid rgba(34, 42, 38, 0.08);
       }
 
+      .strategic-summary {
+        margin: 12px 0 14px;
+        color: var(--muted);
+        line-height: 1.55;
+      }
+
+      .strategic-meta {
+        color: var(--muted);
+        font-size: 0.9rem;
+        margin-bottom: 14px;
+      }
+
+      .recommendation-list {
+        margin-top: 14px;
+      }
+
+      .recommendation-item {
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+
+      .recommendation-item p {
+        margin: 8px 0 0;
+        color: var(--muted);
+      }
+
       @media (max-width: 1100px) {
         .shell,
         .topbar,
@@ -1880,6 +2123,7 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
             <a class="nav-item" href="/api/sites">Sites API</a>
             <a class="nav-item" href="/api/signals">Signals API</a>
             <a class="nav-item" href="/api/briefs">Case Briefs API</a>
+            <a class="nav-item" href="/api/strategic-briefs">Strategic Briefs API</a>
             <a class="nav-item" href="/api/status">System Status</a>
           </nav>
         </div>
@@ -1948,13 +2192,15 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
 
           <section class="panel strategic-panel">
             <p class="eyebrow">Strategic Insights</p>
-            <h3>What the current signal mix suggests for Danvers</h3>
-            <p>
-              These takeaways translate the live agenda feed, watchlist posture, and parcel-review queue into plain-language implications for staff prioritization.
-            </p>
+            <h3>${escapeHtml(payload.strategicBrief.title)}</h3>
+            <p class="strategic-summary">${escapeHtml(payload.strategicBrief.summary)}</p>
+            <div class="strategic-meta">
+              Latest brief ${escapeHtml(briefGeneratedAt)} · Trigger ${escapeHtml(payload.strategicBrief.trigger)} · Sources reviewed ${escapeHtml(String(payload.strategicBrief.sourceCount))}
+            </div>
             <div class="insight-grid">
               ${strategicInsightsMarkup}
             </div>
+            <ul class="recommendation-list">${strategicRecommendationsMarkup}</ul>
           </section>
 
           <div class="side-stack">
@@ -2170,17 +2416,31 @@ export default {
       );
     }
 
+    if (request.method === "GET" && url.pathname === "/api/strategic-briefs") {
+      const limitParam = Number(url.searchParams.get("limit") ?? "10");
+      const briefs = env.OPPORTUNITYDB
+        ? await listStrategicBriefs(env.OPPORTUNITYDB, limitParam)
+        : [];
+      return withSecurityHeaders(
+        Response.json({
+          briefs,
+          count: briefs.length,
+          updatedAt: new Date().toISOString(),
+        }),
+      );
+    }
+
     if (request.method === "GET" && url.pathname === "/ingest-info") {
       return withSecurityHeaders(
         Response.json(
           {
             enabled: Boolean(env.OPPORTUNITYDB),
             detail: env.OPPORTUNITYDB
-              ? "D1 binding is available for automated parcel ingest and parcel matching."
+              ? "D1 binding is available for automated parcel ingest, parcel matching, and stored strategic briefs."
               : "D1 binding is not configured yet.",
             nextStep: env.OPPORTUNITYDB
-              ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, and match them to parcels."
-              : "Attach D1 and persist case briefs, then map briefs to parcels and corridors.",
+              ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, match them to parcels, and save a strategic brief for the dashboard."
+              : "Attach D1 and persist case briefs, then map briefs to parcels, corridors, and recurring strategic briefs.",
           },
           { status: 200 },
         ),
@@ -2303,6 +2563,7 @@ export default {
 
       try {
         const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "manual");
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
         return withSecurityHeaders(
@@ -2310,8 +2571,9 @@ export default {
             accepted: true,
             message: buildIngestMessage("manual"),
             detail:
-              "Manual ingest completed: Danvers parcels refreshed, case briefs rebuilt, and opportunities matched.",
+              "Manual ingest completed: Danvers parcels refreshed, case briefs rebuilt, opportunities matched, and a strategic brief was saved for the dashboard.",
             summary,
+            strategicBrief,
           }),
         );
       } catch (error) {
@@ -2341,6 +2603,7 @@ export default {
 
       try {
         const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "scheduled");
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
         console.log(
@@ -2350,6 +2613,7 @@ export default {
             at: timestamp,
             databaseConfigured: true,
             summary,
+            strategicBriefGeneratedAt: strategicBrief.generatedAt,
           }),
         );
         return;
