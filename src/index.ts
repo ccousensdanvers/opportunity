@@ -332,12 +332,33 @@ function missingDatabaseResponse() {
   );
 }
 
-function withSecurityHeaders(response: Response): Response {
+function generateCspNonce(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let value = "";
+  for (const byte of bytes) {
+    value += String.fromCharCode(byte);
+  }
+  return btoa(value);
+}
+
+function buildContentSecurityPolicy(nonce?: string): string {
+  const styleSource = nonce ? `'self' 'nonce-${nonce}'` : "'self'";
+  const scriptSource = nonce ? `'self' 'nonce-${nonce}'` : "'self'";
+  return [
+    "default-src 'self'",
+    `style-src ${styleSource}`,
+    `script-src ${scriptSource}`,
+    "img-src 'self' data: https:",
+    "connect-src 'self' https:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    "frame-ancestors 'self'",
+  ].join("; ");
+}
+
+function withSecurityHeaders(response: Response, nonce?: string): Response {
   const headers = new Headers(response.headers);
-  headers.set(
-    "content-security-policy",
-    "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
-  );
+  headers.set("content-security-policy", buildContentSecurityPolicy(nonce));
   headers.set("x-frame-options", "SAMEORIGIN");
   headers.set("x-content-type-options", "nosniff");
   headers.set("referrer-policy", "strict-origin-when-cross-origin");
@@ -1434,7 +1455,7 @@ function renderStrategicInsightsMarkup(payload: DashboardPayload): string {
     .join("");
 }
 
-function renderDashboard(payload: DashboardPayload): string {
+function renderDashboard(payload: DashboardPayload, nonce: string): string {
   const generatedAt = new Date(payload.generatedAt).toLocaleString("en-US", {
     dateStyle: "medium",
     timeStyle: "short",
@@ -1461,7 +1482,7 @@ function renderDashboard(payload: DashboardPayload): string {
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Opportunity</title>
-    <style>
+    <style nonce="${escapeHtml(nonce)}">
       :root {
         --bg: #edf4fb;
         --panel: #f8fbff;
@@ -1971,7 +1992,7 @@ function renderDashboard(payload: DashboardPayload): string {
         </section>
       </main>
     </div>
-    <script>
+    <script nonce="${escapeHtml(nonce)}">
       const initialData = ${JSON.stringify(payload)};
 
       const watchlistBody = document.getElementById("watchlist-body");
@@ -2081,12 +2102,14 @@ export default {
     if (request.method === "GET" && url.pathname === "/") {
       const signals = await fetchAgendaSignals();
       const payload = await buildDashboardPayload(signals, env.OPPORTUNITYDB);
+      const nonce = generateCspNonce();
       return withSecurityHeaders(
-        new Response(renderDashboard(payload), {
+        new Response(renderDashboard(payload, nonce), {
           headers: {
             "content-type": "text/html; charset=utf-8",
           },
         }),
+        nonce,
       );
     }
 
