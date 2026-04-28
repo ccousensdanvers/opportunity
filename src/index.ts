@@ -1026,6 +1026,44 @@ function buildDanversParcelQueryUrl(resultOffset: number): string {
   return `${DANVERS_PARCELS_LAYER_URL}?${params.toString()}`;
 }
 
+function escapeArcGisWhereLiteral(value: string): string {
+  return value.replaceAll("'", "''");
+}
+
+function toTitleCase(value: string): string {
+  return value
+    .toLowerCase()
+    .split(" ")
+    .map((token) => (token ? `${token[0].toUpperCase()}${token.slice(1)}` : token))
+    .join(" ");
+}
+
+function buildDanversParcelAddressQueryUrl(address: string): string {
+  const variants = Array.from(
+    new Set([
+      normalizeWhitespace(address),
+      normalizeWhitespace(address).toUpperCase(),
+      toTitleCase(normalizeWhitespace(address)),
+    ].filter(Boolean)),
+  );
+
+  const where = variants
+    .map((value) => {
+      const escaped = escapeArcGisWhereLiteral(value);
+      return `(Location = '${escaped}' OR StreetName = '${escaped}')`;
+    })
+    .join(" OR ");
+
+  const params = new URLSearchParams({
+    where,
+    returnGeometry: "false",
+    outFields: "MAP_PAR_ID,GIS_ID,Location,StreetName,LUCDescription,YearBuilt",
+    f: "json",
+  });
+
+  return `${DANVERS_PARCELS_LAYER_URL}?${params.toString()}`;
+}
+
 function buildParcelAliases(attributes: DanversParcelAttributes): ParcelUpsertInput["aliases"] {
   const aliases: NonNullable<ParcelUpsertInput["aliases"]> = [];
 
@@ -1055,9 +1093,31 @@ function mapDanversParcelFeatureToInput(feature: DanversParcelFeature): ParcelUp
   };
 }
 
-async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
+async function fetchDanversParcels(priorityAddresses: string[] = []): Promise<ParcelUpsertInput[]> {
   const parcels: ParcelUpsertInput[] = [];
   const seenMapLots = new Set<string>();
+
+  for (const address of priorityAddresses) {
+    const payload = await fetchJson<DanversParcelQueryResponse>(
+      buildDanversParcelAddressQueryUrl(address),
+      15000,
+    );
+
+    for (const feature of payload.features ?? []) {
+      const parcel = mapDanversParcelFeatureToInput(feature);
+      if (!parcel || seenMapLots.has(parcel.mapLot)) {
+        continue;
+      }
+
+      seenMapLots.add(parcel.mapLot);
+      parcels.push(parcel);
+
+      if (parcels.length >= INGEST_PARCEL_SAMPLE_LIMIT) {
+        return parcels;
+      }
+    }
+  }
+
   let resultOffset = 0;
 
   while (true) {
@@ -1125,11 +1185,14 @@ function buildOpportunityInputs(
 }
 
 async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
-  const parcels = await fetchDanversParcels();
-  await upsertParcels(db, parcels);
-
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
+  const priorityAddresses = Array.from(
+    new Set(briefs.flatMap((brief) => brief.addresses)),
+  );
+  const parcels = await fetchDanversParcels(priorityAddresses);
+  await upsertParcels(db, parcels);
+
   const opportunities = buildOpportunityInputs(briefs, parcels);
   const results = await matchAndPersistOpportunities(db, opportunities);
 
