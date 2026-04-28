@@ -184,18 +184,18 @@ const SITES: OpportunitySite[] = [
 const ACTIVITIES: ActivityItem[] = [
   {
     time: "08:30",
-    title: "Automated ingest added",
-    detail: "Manual and scheduled ingest now refresh Danvers parcel records, rebuild agenda briefs, and run parcel matching in one flow.",
+    title: "Agenda feed and parcel ingest are wired",
+    detail: "Manual and scheduled runs now pull Danvers parcel records, rebuild agenda-derived briefs, and push likely opportunities into parcel matching.",
   },
   {
     time: "09:15",
-    title: "Review queue expanded",
-    detail: "The review endpoint now keeps low-confidence and no-match items so staff can see what still needs manual cleanup.",
+    title: "Staff review queue is taking shape",
+    detail: "Low-confidence and no-match results now stay visible in the review endpoint so staff can see which filings still need manual cleanup.",
   },
   {
     time: "Next",
-    title: "Parcel sync source wired",
-    detail: "The Worker now pulls parcel identifiers and address aliases from the Town of Danvers public GIS parcel layer during ingest.",
+    title: "Current build focus: parcel-linked triage",
+    detail: "We are turning meeting signals into parcel-level follow-up by tightening brief extraction, matching quality, and the staff-facing review workflow.",
   },
 ];
 
@@ -833,16 +833,380 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
       buildDanversParcelQueryUrl(resultOffset),
       15000,
     );
-    const…2947 tokens truncated…n        padding: 0 12px;
+
+    const features = payload.features ?? [];
+    if (!features.length) {
+      break;
+    }
+
+    for (const feature of features) {
+      const parcel = mapDanversParcelFeatureToInput(feature);
+      if (!parcel || seenMapLots.has(parcel.mapLot)) {
+        continue;
+      }
+
+      seenMapLots.add(parcel.mapLot);
+      parcels.push(parcel);
+    }
+
+    if (!payload.exceededTransferLimit && features.length < DANVERS_PARCELS_PAGE_SIZE) {
+      break;
+    }
+
+    resultOffset += DANVERS_PARCELS_PAGE_SIZE;
+  }
+
+  return parcels;
+}
+
+function buildOpportunityInputs(briefs: CaseBrief[]): OpportunityParcelInput[] {
+  return briefs.map((brief) => ({
+    id: brief.id,
+    address: brief.addresses[0] ?? null,
+  }));
+}
+
+async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
+  const parcels = await fetchDanversParcels();
+  await upsertParcels(db, parcels);
+
+  const signals = await fetchAgendaSignals();
+  const briefs = await buildCaseBriefs(signals);
+  const opportunities = buildOpportunityInputs(briefs);
+  const results = await matchAndPersistOpportunities(db, opportunities);
+
+  return {
+    parcelsIngested: parcels.length,
+    opportunitiesPrepared: opportunities.length,
+    matched: results.filter((result) => result.matchType !== "no_match").length,
+    reviewNeeded: results.filter((result) => result.needsReview).length,
+  };
+}
+
+async function buildDashboardPayload(signals: AgendaSignal[]): Promise<DashboardPayload> {
+  const briefs = await buildCaseBriefs(signals);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    summary: buildSummaryMetrics(SITES, signals, briefs),
+    sites: SITES,
+    activity: ACTIVITIES,
+    signals,
+    briefs,
+  };
+}
+
+function renderMetricMarkup(summary: SummaryMetric[]): string {
+  return summary
+    .map(
+      (item) => `
+        <article class="metric ${item.tone ?? "neutral"}">
+          <p class="metric-label">${escapeHtml(item.label)}</p>
+          <p class="metric-value">${escapeHtml(item.value)}</p>
+          <p class="metric-detail">${escapeHtml(item.detail)}</p>
+        </article>`,
+    )
+    .join("");
+}
+
+function renderTableRows(sites: OpportunitySite[]): string {
+  return sites
+    .map(
+      (site) => `
+        <tr>
+          <td><strong>${escapeHtml(site.site)}</strong><div class="cell-subtle">${escapeHtml(site.corridor)}</div></td>
+          <td>${escapeHtml(site.signal)}</td>
+          <td>${escapeHtml(site.focus)}</td>
+          <td>${escapeHtml(String(site.score))}</td>
+          <td><span class="status-pill">${escapeHtml(site.status)}</span></td>
+        </tr>`,
+    )
+    .join("");
+}
+
+function renderBriefMarkup(briefs: CaseBrief[]): string {
+  return briefs
+    .map(
+      (brief) => `
+        <li class="brief-item">
+          <div class="brief-topline"><span>${escapeHtml(brief.board)}</span><span>${escapeHtml(brief.confidence)}</span></div>
+          <p class="brief-site">${escapeHtml(brief.likelySite)}</p>
+          <p class="brief-type">${escapeHtml(brief.signalType)}</p>
+          <p class="brief-rationale">${escapeHtml(brief.rationale)}</p>
+          <div class="brief-meta"><span>${escapeHtml(brief.meetingDate)}</span><a href="${escapeHtml(brief.agendaUrl)}" target="_blank" rel="noreferrer">Open agenda</a></div>
+        </li>`,
+    )
+    .join("");
+}
+
+function renderSignalMarkup(signals: AgendaSignal[]): string {
+  return signals
+    .map(
+      (signal) => `
+        <li class="signal-item">
+          <div class="signal-meta"><span>${escapeHtml(signal.board)}</span><span>${escapeHtml(signal.meetingDate)}</span></div>
+          <a class="signal-link" href="${escapeHtml(signal.agendaUrl)}" target="_blank" rel="noreferrer">${escapeHtml(signal.title)}</a>
+          <p class="signal-source">${escapeHtml(signal.source)}</p>
+        </li>`,
+    )
+    .join("");
+}
+
+function renderActivityMarkup(activity: ActivityItem[]): string {
+  return activity
+    .map(
+      (item) => `
+        <li class="activity-item">
+          <p class="activity-time">${escapeHtml(item.time)}</p>
+          <div>
+            <p class="activity-title">${escapeHtml(item.title)}</p>
+            <p class="activity-detail">${escapeHtml(item.detail)}</p>
+          </div>
+        </li>`,
+    )
+    .join("");
+}
+
+function renderDashboard(payload: DashboardPayload): string {
+  const generatedAt = new Date(payload.generatedAt).toLocaleString("en-US", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  const initialTableRows = renderTableRows(payload.sites);
+
+  return `<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Opportunity</title>
+    <style>
+      :root {
+        --bg: #f5f1e8;
+        --panel: #fffaf2;
+        --ink: #1f2a27;
+        --muted: #5e6a67;
+        --line: rgba(31, 42, 39, 0.12);
+        --accent: #16423c;
+        --accent-soft: rgba(22, 66, 60, 0.1);
+        --warm: #af5e2f;
+        --warm-soft: rgba(175, 94, 47, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: Georgia, "Times New Roman", serif;
+        background: linear-gradient(180deg, #f7f2e9 0%, #efe7da 100%);
+        color: var(--ink);
+      }
+
+      a {
+        color: inherit;
+      }
+
+      .shell {
+        min-height: 100vh;
+        display: grid;
+        grid-template-columns: 280px minmax(0, 1fr);
+      }
+
+      .rail {
+        padding: 28px 22px;
+        background: rgba(255, 250, 242, 0.9);
+        border-right: 1px solid var(--line);
+        display: grid;
+        align-content: space-between;
+        gap: 28px;
+      }
+
+      .brand {
+        display: grid;
+        grid-template-columns: 42px minmax(0, 1fr);
+        gap: 14px;
+        align-items: start;
+      }
+
+      .brand-mark {
+        width: 42px;
+        height: 42px;
+        border-radius: 10px;
+        display: grid;
+        place-items: center;
+        background: var(--accent);
+        color: #fff;
+        font-weight: 700;
+      }
+
+      .eyebrow {
+        margin: 0 0 6px;
+        color: var(--muted);
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      .nav-group {
+        display: grid;
+        gap: 8px;
+        margin-top: 22px;
+      }
+
+      .nav-item {
+        padding: 10px 12px;
+        border-radius: 8px;
+        text-decoration: none;
+        color: var(--muted);
+      }
+
+      .nav-item.active,
+      .nav-item:hover {
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+
+      .rail-footer {
+        display: grid;
+        gap: 10px;
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+
+      .main {
+        padding: 28px 26px 40px;
+      }
+
+      .topbar,
+      .workspace {
+        display: grid;
+        gap: 18px;
+      }
+
+      .topbar {
+        grid-template-columns: minmax(0, 1fr) 280px;
+        margin-bottom: 18px;
+      }
+
+      .topbar-meta,
+      .panel,
+      .metric {
+        background: rgba(255, 250, 242, 0.82);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+      }
+
+      .topbar-meta,
+      .panel {
+        padding: 18px;
+      }
+
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 14px;
+        margin-bottom: 18px;
+      }
+
+      .metric {
+        padding: 16px;
+      }
+
+      .metric.warm {
+        background: linear-gradient(180deg, #fffaf2, #f8ecdf);
+      }
+
+      .metric.cool {
+        background: linear-gradient(180deg, #fffaf2, #eef5f3);
+      }
+
+      .metric-label,
+      .metric-detail {
+        color: var(--muted);
+      }
+
+      .metric-value {
+        margin: 10px 0 8px;
+        font-size: 2rem;
+      }
+
+      .workspace {
+        grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.9fr);
+        align-items: start;
+      }
+
+      .watchlist-head,
+      .panel-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        align-items: start;
+        margin-bottom: 14px;
+      }
+
+      .controls {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 180px 180px;
+        gap: 10px;
+        margin-bottom: 14px;
+      }
+
+      .search,
+      .select {
+        width: 100%;
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: #fffdf9;
+        color: var(--ink);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        padding: 12px 10px;
+        text-align: left;
+        border-top: 1px solid var(--line);
+        vertical-align: top;
+      }
+
+      th {
+        color: var(--muted);
+        font-size: 0.82rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+
+      .cell-subtle,
+      .empty,
+      .signal-source,
+      .brief-rationale,
+      .activity-detail {
+        color: var(--muted);
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 32px;
+        padding: 0 12px;
         border-radius: 999px;
         background: var(--accent-soft);
         color: var(--accent);
         white-space: nowrap;
-      }
-
-      .empty {
-        padding: 22px 0 8px;
-        color: var(--muted);
       }
 
       .side-stack {
@@ -888,13 +1252,6 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
         color: var(--accent);
       }
 
-      .brief-rationale,
-      .signal-source {
-        margin: 8px 0 0;
-        color: var(--muted);
-        line-height: 1.5;
-      }
-
       .brief-meta {
         display: flex;
         justify-content: space-between;
@@ -906,13 +1263,7 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
       .signal-link {
         display: block;
         margin-top: 8px;
-        color: var(--ink);
         line-height: 1.45;
-      }
-
-      .signal-link:hover,
-      .brief-meta a:hover {
-        color: var(--accent);
       }
 
       .activity-item {
@@ -921,126 +1272,45 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
         gap: 14px;
       }
 
-      .activity-time {
+      .activity-time,
+      .activity-title {
         margin: 0;
+      }
+
+      .activity-time {
         color: var(--muted);
         font-size: 0.86rem;
         letter-spacing: 0.04em;
         text-transform: uppercase;
       }
 
-      .activity-title {
-        margin: 0;
-        font-size: 1rem;
-      }
-
-      .activity-detail {
-        margin: 8px 0 0;
-        color: var(--muted);
-        line-height: 1.55;
-      }
-
-      .insight-band {
-        overflow: hidden;
-        position: relative;
-      }
-
-      .insight-band::after {
-        content: "";
-        position: absolute;
-        inset: auto -20% -20% 35%;
-        height: 160px;
-        background: linear-gradient(90deg, rgba(22, 66, 60, 0.05), rgba(175, 94, 47, 0.16));
-        transform: rotate(-6deg);
-      }
-
       .insight-grid {
         display: grid;
         grid-template-columns: repeat(3, minmax(0, 1fr));
         gap: 12px;
-        margin-top: 16px;
-        position: relative;
-        z-index: 1;
       }
 
       .insight {
         min-height: 108px;
         padding: 14px;
-        border-radius: 14px;
+        border-radius: 10px;
         background: rgba(255, 252, 247, 0.74);
         border: 1px solid rgba(34, 42, 38, 0.08);
       }
 
-      .insight strong {
-        display: block;
-        margin-bottom: 10px;
-        font-size: 0.84rem;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-      }
-
-      .insight p {
-        margin: 0;
-        color: var(--muted);
-        line-height: 1.5;
-      }
-
-      @keyframes rise {
-        to {
-          opacity: 1;
-          transform: translateY(0);
-        }
-      }
-
       @media (max-width: 1100px) {
-        .shell {
-          grid-template-columns: 1fr;
-        }
-
-        .rail {
-          gap: 22px;
-          border-right: 0;
-          border-bottom: 1px solid var(--line);
-        }
-
+        .shell,
+        .topbar,
+        .workspace,
+        .controls,
         .metrics,
         .insight-grid {
-          grid-template-columns: 1fr 1fr;
-        }
-
-        .workspace,
-        .controls {
           grid-template-columns: 1fr;
         }
 
-        .topbar {
-          flex-direction: column;
-        }
-
-        .topbar-meta {
-          text-align: left;
-        }
-      }
-
-      @media (max-width: 760px) {
-        .main,
         .rail {
-          padding: 22px 18px;
-        }
-
-        .metrics,
-        .insight-grid,
-        .nav-group {
-          grid-template-columns: 1fr;
-        }
-
-        .activity-item {
-          grid-template-columns: 1fr;
-        }
-
-        th:nth-child(3),
-        td:nth-child(3) {
-          display: none;
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
         }
       }
     </style>
@@ -1077,8 +1347,8 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
             <p class="eyebrow">Staff Dashboard</p>
             <h2>See where change may be becoming opportunity.</h2>
             <p>
-              This version now includes one live public source feed from Danvers itself plus a lightweight case-extraction layer.
-              The tool is beginning to move from meeting notices toward site-specific review leads.
+              This version includes one live public source feed from Danvers plus a lightweight case-extraction layer.
+              The tool is moving from meeting notices toward site-specific review leads.
             </p>
           </div>
           <div class="topbar-meta">
@@ -1088,7 +1358,7 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
           </div>
         </header>
 
-        <section class="metrics" aria-label="Top metrics" id="summary-metrics">
+        <section class="metrics" aria-label="Top metrics">
           ${renderMetricMarkup(payload.summary)}
         </section>
 
@@ -1123,59 +1393,48 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
                   <th>Status</th>
                 </tr>
               </thead>
-              <tbody id="watchlist-body">
-                ${initialTableRows}
-              </tbody>
+              <tbody id="watchlist-body">${initialTableRows}</tbody>
             </table>
             <div id="empty-state" class="empty" hidden>No sites match the current filter.</div>
           </div>
 
           <div class="side-stack">
-            <section class="panel briefs">
+            <section class="panel">
               <div class="panel-head">
                 <div>
                   <p class="eyebrow">Case Briefs</p>
                   <h3>Likely site signals</h3>
-                  <p>These briefs combine live agenda postings with simple packet parsing to pull out likely locations and project types.</p>
                 </div>
               </div>
-              <ul id="brief-list" class="brief-list">
-                ${renderBriefMarkup(payload.briefs)}
-              </ul>
+              <ul id="brief-list" class="brief-list">${renderBriefMarkup(payload.briefs)}</ul>
             </section>
 
-            <section class="panel signals">
+            <section class="panel">
               <div class="panel-head">
                 <div>
                   <p class="eyebrow">Live Source Feed</p>
                   <h3>Recent agenda postings</h3>
-                  <p>Direct from Danvers Agenda Center. These are the earliest reliable public signals now wired into the tool.</p>
                 </div>
               </div>
-              <ul id="signal-list" class="signal-list">
-                ${renderSignalMarkup(payload.signals)}
-              </ul>
+              <ul id="signal-list" class="signal-list">${renderSignalMarkup(payload.signals)}</ul>
             </section>
 
-            <section class="panel activity">
+            <section class="panel">
               <div class="panel-head">
                 <div>
                   <p class="eyebrow">Activity</p>
                   <h3>Build notes</h3>
-                  <p>What the system is doing now and what comes next.</p>
+                  <p>What is live now, and what the current build cycle is focused on next.</p>
                 </div>
               </div>
-              <ul class="activity-list">
-                ${renderActivityMarkup(payload.activity)}
-              </ul>
+              <ul class="activity-list">${renderActivityMarkup(payload.activity)}</ul>
             </section>
           </div>
         </section>
 
-        <section class="panel insight-band" style="margin-top:16px;">
+        <section class="panel" style="margin-top: 16px;">
           <p class="eyebrow">Decision Support</p>
           <h3>What this next layer unlocks</h3>
-          <p>Danvers now has not only a live feed of development-relevant public meetings, but also first-pass briefs that can be triaged into parcels, corridors, and follow-up actions.</p>
           <div class="insight-grid">
             <div class="insight">
               <strong>Early Read</strong>
@@ -1187,7 +1446,7 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
             </div>
             <div class="insight">
               <strong>Town Action</strong>
-              <p>Staff can begin sorting which postings are merely administrative and which may deserve zoning, infrastructure, or redevelopment attention.</p>
+              <p>Staff can sort which postings are administrative and which may deserve zoning, infrastructure, or redevelopment attention.</p>
             </div>
           </div>
         </section>
@@ -1291,30 +1550,6 @@ async function fetchDanversParcels(): Promise<ParcelUpsertInput[]> {
       searchInput.addEventListener("input", applyFilters);
       corridorFilter.addEventListener("change", applyFilters);
       statusFilter.addEventListener("change", applyFilters);
-
-      fetch("/api/signals")
-        .then((response) => response.json())
-        .then((data) => {
-          if (Array.isArray(data.signals)) {
-            initialData.signals = data.signals;
-            renderSignals(initialData.signals);
-          }
-        })
-        .catch(() => {
-          // Keep the server-rendered signal list in place if refresh fails.
-        });
-
-      fetch("/api/briefs")
-        .then((response) => response.json())
-        .then((data) => {
-          if (Array.isArray(data.briefs)) {
-            initialData.briefs = data.briefs;
-            renderBriefs(initialData.briefs);
-          }
-        })
-        .catch(() => {
-          // Keep the server-rendered case briefs in place if refresh fails.
-        });
     </script>
   </body>
 </html>`;
