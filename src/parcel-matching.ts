@@ -496,3 +496,87 @@ export async function listParcelReviewQueue(
       : null,
   }));
 }
+
+export async function debugLookupParcelAddress(
+  db: D1Database,
+  rawAddress: string,
+): Promise<{
+  rawAddress: string;
+  normalizedAddress: string | null;
+  exactAliasMatches: Array<{
+    parcelId: number;
+    mapLot: string | null;
+    address: string | null;
+    aliasValueRaw: string;
+    aliasValueNorm: string;
+  }>;
+  prefixAliasMatches: Array<{
+    parcelId: number;
+    mapLot: string | null;
+    address: string | null;
+    aliasValueRaw: string;
+    aliasValueNorm: string;
+  }>;
+}> {
+  const normalizedAddress = normalizeAddress(rawAddress);
+  if (!normalizedAddress) {
+    return {
+      rawAddress,
+      normalizedAddress: null,
+      exactAliasMatches: [],
+      prefixAliasMatches: [],
+    };
+  }
+
+  const exact = await db.prepare(
+    `
+    SELECT
+      p.id AS parcelId,
+      p.map_lot AS mapLot,
+      p.address AS address,
+      a.alias_value_raw AS aliasValueRaw,
+      a.alias_value_norm AS aliasValueNorm
+    FROM parcel_aliases a
+    JOIN parcels p ON p.id = a.parcel_id
+    WHERE a.alias_type = 'address' AND a.alias_value_norm = ?
+    ORDER BY p.id
+    LIMIT 10
+    `,
+  ).bind(normalizedAddress).all<{
+    parcelId: number;
+    mapLot: string | null;
+    address: string | null;
+    aliasValueRaw: string;
+    aliasValueNorm: string;
+  }>();
+
+  const prefix = await db.prepare(
+    `
+    SELECT
+      p.id AS parcelId,
+      p.map_lot AS mapLot,
+      p.address AS address,
+      a.alias_value_raw AS aliasValueRaw,
+      a.alias_value_norm AS aliasValueNorm
+    FROM parcel_aliases a
+    JOIN parcels p ON p.id = a.parcel_id
+    WHERE a.alias_type = 'address'
+      AND (a.alias_value_norm LIKE ? || '%' OR ? LIKE a.alias_value_norm || '%')
+    ORDER BY LENGTH(a.alias_value_norm) DESC, p.id
+    LIMIT 10
+    `,
+  ).bind(normalizedAddress, normalizedAddress).all<{
+    parcelId: number;
+    mapLot: string | null;
+    address: string | null;
+    aliasValueRaw: string;
+    aliasValueNorm: string;
+  }>();
+
+  return {
+    rawAddress,
+    normalizedAddress,
+    exactAliasMatches: exact.results ?? [],
+    prefixAliasMatches: prefix.results ?? [],
+  };
+}

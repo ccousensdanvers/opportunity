@@ -1,4 +1,5 @@
 import {
+  debugLookupParcelAddress,
   listParcelReviewQueue,
   matchAndPersistOpportunities,
   upsertParcels,
@@ -1949,6 +1950,26 @@ export default {
         count: queue.length,
         needsReviewOnly,
         results: queue,
+      });
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/debug/parcel-lookup") {
+      if (!env.OPPORTUNITYDB) {
+        return missingDatabaseResponse();
+      }
+
+      const address = url.searchParams.get("address")?.trim() ?? "";
+      if (!address) {
+        return Response.json(
+          { ok: false, error: "Query string must include an address parameter." },
+          { status: 400 },
+        );
+      }
+
+      const result = await debugLookupParcelAddress(env.OPPORTUNITYDB, address);
+      return Response.json({
+        ok: true,
+        ...result,
       });
     }
 
