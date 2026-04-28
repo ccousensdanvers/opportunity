@@ -236,6 +236,11 @@ const FALLBACK_SIGNALS: AgendaSignal[] = [
   },
 ];
 
+const IGNORED_PACKET_ADDRESSES = new Set([
+  "1 Sylvan Street",
+  "1 Sylvan St",
+]);
+
 function buildIngestMessage(trigger: IngestTrigger): IngestMessage {
   return {
     trigger,
@@ -396,7 +401,13 @@ function inferConfidence(addresses: string[], packetText: string): CaseBrief["co
 
 function extractAddresses(text: string): string[] {
   const matches = text.match(/\b\d{1,5}\s+[A-Z][A-Za-z0-9.'-]*(?:\s+[A-Z][A-Za-z0-9.'-]*){0,4}\s+(?:Street|St|Road|Rd|Avenue|Ave|Lane|Ln|Drive|Dr|Boulevard|Blvd|Way|Court|Ct|Terrace|Ter|Place|Pl|Highway|Hwy|Circle|Cir)\b/g) ?? [];
-  const deduped = Array.from(new Set(matches.map((value) => normalizeWhitespace(value))));
+  const deduped = Array.from(
+    new Set(
+      matches
+        .map((value) => normalizeWhitespace(value))
+        .filter((value) => !IGNORED_PACKET_ADDRESSES.has(value)),
+    ),
+  );
   return deduped.slice(0, 4);
 }
 
