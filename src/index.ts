@@ -134,6 +134,7 @@ interface StrategicBrief {
     externalServiceAreaParcels?: number;
     wetlandConstrainedParcels?: number;
     groundwaterConstrainedParcels?: number;
+    parcelsWithCommercialPermits?: number;
   };
   sourceCount: number;
 }
@@ -1454,6 +1455,7 @@ function buildStrategicBrief(
     (context) => context.intersectsGroundwaterProtection,
   ).length;
   const commercialPermitSignals = permits.filter(isCommercialPermit).length;
+  const parcelsWithCommercialPermits = countParcelContextsWithCommercialPermits(parcelContexts, permits);
 
   let boardTitle = "Board activity is split across both review lanes";
   let boardDetail =
@@ -1517,7 +1519,7 @@ function buildStrategicBrief(
       : "Permit history is not yet adding much commercial signal to the current queue";
   const permitInsightDetail =
     commercialPermitSignals > 0
-      ? `${commercialPermitSignals} recent archive permit records in the sampled Danvers permit history read as commercial-facing activity. That gives the Town another way to spot reinvestment and reuse patterns beyond agendas and project pages alone.`
+      ? `${commercialPermitSignals} recent archive permit records in the sampled Danvers permit history read as commercial-facing activity, and ${parcelsWithCommercialPermits} brief-linked parcels already line up with that permit history. That gives the Town another way to spot reinvestment and reuse patterns beyond agendas and project pages alone.`
       : permits.length
         ? "The archive permit sample is mostly residential or low-strategy activity right now, so it is not yet shifting the commercial picture much."
         : "Permit archive records have not yet been pulled into this run, so permit history is not yet contributing to the strategic read.";
@@ -1627,6 +1629,7 @@ function buildStrategicBrief(
       briefingSignals: signals.length,
       permitSignals: permits.length,
       commercialPermitSignals,
+      parcelsWithCommercialPermits,
       caseBriefs: briefs.length,
       matched: reviewSummary.matched,
       needsReview: reviewSummary.needsReview,
@@ -2303,7 +2306,7 @@ async function buildParcelDetailPayload(address: string, db?: D1Database): Promi
   const parcelAddress = parcel?.address ?? context?.address ?? address;
   const relatedBriefs = buildRelatedParcelBriefs(briefs, parcelAddress);
   const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
-  const relatedPermits = buildRelatedPermitRecords(permits, parcelAddress);
+  const relatedPermits = prioritizePermitRecords(buildRelatedPermitRecords(permits, parcelAddress), 8);
 
   return {
     requestedAddress: address,
@@ -2328,7 +2331,10 @@ async function buildWatchlistDetailPayload(siteId: string): Promise<WatchlistDet
   const relatedBriefs = buildRelatedWatchlistBriefs(site, briefs);
   const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
   const relatedPermitAddresses = Array.from(new Set(relatedBriefs.flatMap((brief) => brief.addresses)));
-  const relatedPermits = relatedPermitAddresses.flatMap((address) => buildRelatedPermitRecords(permits, address)).slice(0, 10);
+  const relatedPermits = prioritizePermitRecords(
+    relatedPermitAddresses.flatMap((address) => buildRelatedPermitRecords(permits, address)),
+    10,
+  );
 
   return {
     site,
@@ -2500,6 +2506,28 @@ function buildRelatedPermitRecords(permits: PermitRecord[], address: string): Pe
   return permits.filter((permit) => normalizeAddress(permit.siteAddress) === normalizedTarget);
 }
 
+function prioritizePermitRecords(permits: PermitRecord[], limit = 8): PermitRecord[] {
+  const sorted = [...permits].sort((left, right) => {
+    const leftCommercial = isCommercialPermit(left) ? 1 : 0;
+    const rightCommercial = isCommercialPermit(right) ? 1 : 0;
+    if (leftCommercial !== rightCommercial) {
+      return rightCommercial - leftCommercial;
+    }
+
+    return right.issuedDate.localeCompare(left.issuedDate);
+  });
+
+  return sorted.slice(0, limit);
+}
+
+function countParcelContextsWithCommercialPermits(parcelContexts: ParcelContext[], permits: PermitRecord[]): number {
+  return parcelContexts.filter((context) =>
+    permits.some(
+      (permit) => isCommercialPermit(permit) && normalizeAddress(permit.siteAddress) === normalizeAddress(context.address),
+    ),
+  ).length;
+}
+
 function tokenizeWatchlistText(site: OpportunitySite): string[] {
   const stopWords = new Set([
     "street",
@@ -2596,6 +2624,12 @@ function renderStrategicScorecardMarkup(payload: DashboardPayload): string {
       value: String(metrics.businessZonedParcels ?? 0),
       detail: "commercial or industrial districts",
       tone: "neutral",
+    },
+    {
+      label: "Permit Overlap",
+      value: String(metrics.parcelsWithCommercialPermits ?? 0),
+      detail: "brief-linked parcels with commercial permit history",
+      tone: "positive",
     },
   ];
 
@@ -3375,7 +3409,7 @@ function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): st
     : `<li class="detail-list-item"><strong>No related live signals found.</strong><p>The current signal set does not include a direct posting tied to this address.</p></li>`;
   const relatedPermitsMarkup = payload.relatedPermits.length
     ? payload.relatedPermits.map((permit) => `
-        <li class="detail-list-item">
+        <li class="detail-list-item permit-item ${isCommercialPermit(permit) ? "permit-commercial" : ""}">
           <strong>${escapeHtml(permit.permitType)}</strong>
           <p>${escapeHtml(permit.issuedDate)} · ${escapeHtml(permit.status)}${permit.permitNumber ? ` · ${escapeHtml(permit.permitNumber)}` : ""}</p>
           <span>${escapeHtml(permit.applicantName || "Applicant not listed")}${permit.detailUrl ? ` · <a href="${escapeHtml(permit.detailUrl)}" target="_blank" rel="noreferrer">Open permit</a>` : ""}</span>
@@ -3471,6 +3505,23 @@ function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): st
       .detail-list-item {
         padding-top: 14px;
         border-top: 1px solid var(--line);
+      }
+      .permit-item {
+        position: relative;
+        padding-left: 18px;
+      }
+      .permit-item::before {
+        content: "";
+        position: absolute;
+        left: 0;
+        top: 18px;
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: rgba(18, 50, 79, 0.25);
+      }
+      .permit-commercial::before {
+        background: var(--accent);
       }
       .status-row {
         display: grid;
@@ -3589,7 +3640,7 @@ function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): st
         </section>
       </div>
       <section class="panel" style="margin-top: 18px;">
-        <p class="eyebrow">Related Permit History</p>
+        <p class="eyebrow">Related Permit Timeline</p>
         <ul class="detail-list">${relatedPermitsMarkup}</ul>
       </section>
     </div>
@@ -3622,7 +3673,7 @@ function renderWatchlistDetailPage(payload: WatchlistDetailPayload, nonce: strin
     : `<li class="detail-list-item"><strong>No related signals found.</strong><p>This watchlist item is still mostly being tracked through the seeded staff list.</p></li>`;
   const relatedPermitsMarkup = payload.relatedPermits.length
     ? payload.relatedPermits.map((permit) => `
-        <li class="detail-list-item">
+        <li class="detail-list-item permit-item ${isCommercialPermit(permit) ? "permit-commercial" : ""}">
           <strong>${escapeHtml(permit.siteAddress)}</strong>
           <p>${escapeHtml(permit.permitType)} · ${escapeHtml(permit.issuedDate)} · ${escapeHtml(permit.status)}</p>
           <span>${permit.detailUrl ? `<a href="${escapeHtml(permit.detailUrl)}" target="_blank" rel="noreferrer">Open permit</a>` : escapeHtml(permit.applicantName || "Applicant not listed")}</span>
@@ -3779,7 +3830,7 @@ function renderWatchlistDetailPage(payload: WatchlistDetailPayload, nonce: strin
         </section>
       </div>
       <section class="panel" style="margin-top: 18px;">
-        <p class="eyebrow">Related Permit History</p>
+        <p class="eyebrow">Related Permit Timeline</p>
         <ul class="detail-list">${relatedPermitsMarkup}</ul>
       </section>
     </div>
