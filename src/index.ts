@@ -59,6 +59,17 @@ interface AgendaSignal {
   source: string;
 }
 
+interface PermitRecord {
+  applicantName: string;
+  siteAddress: string;
+  permitType: string;
+  status: string;
+  issuedDate: string;
+  permitNumber: string | null;
+  detailUrl: string | null;
+  source: string;
+}
+
 interface CaseBrief {
   id: string;
   board: AgendaSignal["board"];
@@ -79,6 +90,7 @@ interface DashboardPayload {
   sites: OpportunitySite[];
   activity: ActivityItem[];
   signals: AgendaSignal[];
+  permits: PermitRecord[];
   briefs: CaseBrief[];
   strategicBrief: StrategicBrief;
   reviewSummary: {
@@ -108,6 +120,8 @@ interface StrategicBrief {
   recommendations: StrategicRecommendation[];
   metrics: {
     briefingSignals: number;
+    permitSignals?: number;
+    commercialPermitSignals?: number;
     caseBriefs: number;
     matched: number;
     needsReview: number;
@@ -132,6 +146,7 @@ const PLANNING_BOARD_RSS_URL =
 const ZBA_RSS_URL =
   "https://www.danversma.gov/RSSFeed.aspx?CID=Zoning-Board-of-Appeals-18&ModID=65";
 const PROJECTS_PAGE_URL = "https://www.danversma.gov/235/Projects";
+const DANVERS_PERMIT_ARCHIVE_URL = "https://fctpermit.com/sites/Danvers/homepage.asp";
 const DANVERS_PARCELS_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
 const DANVERS_ASSESSOR_TABLE_URL =
@@ -277,12 +292,14 @@ interface ParcelDetailPayload {
   relatedMatches: ParcelReviewItem[];
   relatedBriefs: CaseBrief[];
   relatedSignals: AgendaSignal[];
+  relatedPermits: PermitRecord[];
 }
 
 interface WatchlistDetailPayload {
   site: OpportunitySite;
   relatedBriefs: CaseBrief[];
   relatedSignals: AgendaSignal[];
+  relatedPermits: PermitRecord[];
 }
 
 interface StrategicBriefRow {
@@ -395,7 +412,7 @@ const ACTIVITIES: ActivityItem[] = [
   {
     time: "08:30",
     title: "Parcel context now reaches beyond agenda text",
-    detail: "Manual and scheduled runs now screen brief-linked parcels against Danvers assessor, utility, flood, wetlands, and groundwater layers before writing the strategic brief.",
+    detail: "Manual and scheduled runs now screen brief-linked parcels against Danvers assessor, utility, flood, wetlands, groundwater, and sampled permit history before writing the strategic brief.",
   },
   {
     time: "09:15",
@@ -821,6 +838,118 @@ function formatRssPubDate(value: string): string {
     year: "numeric",
     timeZone: "America/New_York",
   });
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function stripHtmlTags(value: string): string {
+  return normalizeWhitespace(decodeHtmlEntities(value.replace(/<[^>]+>/g, " ")));
+}
+
+function resolvePermitDetailUrl(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+    return trimmed;
+  }
+
+  return new URL(trimmed, DANVERS_PERMIT_ARCHIVE_URL).toString();
+}
+
+function parsePermitArchiveRows(html: string): PermitRecord[] {
+  const rows = Array.from(
+    html.matchAll(
+      /<tr[^>]*>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<\/tr>/gi,
+    ),
+  );
+
+  return rows
+    .map((match) => {
+      const applicantName = stripHtmlTags(match[1]);
+      const siteAddress = stripHtmlTags(match[2]);
+      const permitType = stripHtmlTags(match[3]);
+      const status = stripHtmlTags(match[4]);
+      const issuedDate = stripHtmlTags(match[5]);
+      const permitNumber = stripHtmlTags(match[6]) || null;
+      const detailHref = match[7].match(/href\s*=\s*"([^"]+)"/i)?.[1]
+        ?? match[7].match(/href\s*=\s*'([^']+)'/i)?.[1]
+        ?? "";
+
+      return {
+        applicantName,
+        siteAddress,
+        permitType,
+        status,
+        issuedDate,
+        permitNumber,
+        detailUrl: resolvePermitDetailUrl(detailHref),
+        source: "danvers permit archive",
+      };
+    })
+    .filter((record) =>
+      Boolean(record.siteAddress)
+      && /\d{4}-\d{2}-\d{2}/.test(record.issuedDate)
+      && !record.siteAddress.toLowerCase().includes("site address"),
+    );
+}
+
+function isCommercialPermit(record: PermitRecord): boolean {
+  const value = `${record.permitType} ${record.siteAddress}`.toLowerCase();
+  return value.includes("commercial")
+    || value.includes("co permit")
+    || value.includes("sign application")
+    || value.includes("tenant");
+}
+
+async function fetchPermitArchiveRecords(maxPages = 3): Promise<PermitRecord[]> {
+  const records: PermitRecord[] = [];
+  const seen = new Set<string>();
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    try {
+      const url = page === 1 ? DANVERS_PERMIT_ARCHIVE_URL : `${DANVERS_PERMIT_ARCHIVE_URL}?PageNo=${page}`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      const response = await fetch(url, {
+        signal: controller.signal,
+        headers: {
+          "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
+        },
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        continue;
+      }
+
+      const html = await response.text();
+      const pageRecords = parsePermitArchiveRows(html);
+      for (const record of pageRecords) {
+        const key = `${record.siteAddress}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ""}`;
+        if (seen.has(key)) {
+          continue;
+        }
+
+        seen.add(key);
+        records.push(record);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return records.slice(0, 60);
 }
 
 function looksLikeProjectTitle(value: string): boolean {
@@ -1296,6 +1425,7 @@ function buildStrategicBrief(
   trigger: StrategicBrief["trigger"],
   sites: OpportunitySite[],
   signals: AgendaSignal[],
+  permits: PermitRecord[],
   briefs: CaseBrief[],
   reviewSummary: DashboardPayload["reviewSummary"],
   parcelContexts: ParcelContext[] = [],
@@ -1323,6 +1453,7 @@ function buildStrategicBrief(
   const groundwaterConstrainedParcels = parcelContexts.filter(
     (context) => context.intersectsGroundwaterProtection,
   ).length;
+  const commercialPermitSignals = permits.filter(isCommercialPermit).length;
 
   let boardTitle = "Board activity is split across both review lanes";
   let boardDetail =
@@ -1380,6 +1511,17 @@ function buildStrategicBrief(
         ? "The first utility pass did not find mapped water or sewer context for the current assessed leads, which means service readiness still needs manual follow-up."
         : "Utility screening has not yet returned parcel context for the current queue.";
 
+  const permitInsightTitle =
+    commercialPermitSignals > 0
+      ? "Permit history is adding a second investment signal beyond board activity"
+      : "Permit history is not yet adding much commercial signal to the current queue";
+  const permitInsightDetail =
+    commercialPermitSignals > 0
+      ? `${commercialPermitSignals} recent archive permit records in the sampled Danvers permit history read as commercial-facing activity. That gives the Town another way to spot reinvestment and reuse patterns beyond agendas and project pages alone.`
+      : permits.length
+        ? "The archive permit sample is mostly residential or low-strategy activity right now, so it is not yet shifting the commercial picture much."
+        : "Permit archive records have not yet been pulled into this run, so permit history is not yet contributing to the strategic read.";
+
   const recommendations: StrategicRecommendation[] = [
     {
       action:
@@ -1431,13 +1573,23 @@ function buildStrategicBrief(
           ? "Those parcels are more likely to move faster from policy interest to realistic development conversations because service context is already partly visible."
           : "Economic-development recommendations are much stronger when they distinguish promising sites from sites that still need basic infrastructure confirmation.",
     },
+    {
+      action:
+        commercialPermitSignals > 0
+          ? "Use permit activity to cross-check which corridors are showing actual reinvestment, not just discussion."
+          : "Keep expanding permit coverage so parcel recommendations can be validated against investment history.",
+      whyItMatters:
+        commercialPermitSignals > 0
+          ? "That helps Danvers distinguish parcels with real capital movement from parcels that are only showing up in meeting materials."
+          : "A second source of address-level activity makes strategic recommendations much more durable and less dependent on a single municipal feed.",
+    },
   ];
 
   return {
     generatedAt,
     trigger,
     title: "Danvers Strategic Brief",
-    summary: `This briefing reflects ${signals.length} live agenda signals, ${briefs.length} case briefs, ${reviewSummary.matched} parcel-linked opportunities, and ${parcelContexts.length} parcel-context checks from Danvers assessor and flood data. It is intended as decision support for Danvers economic development follow-up.`,
+    summary: `This briefing reflects ${signals.length} live agenda signals, ${permits.length} sampled permit records, ${briefs.length} case briefs, ${reviewSummary.matched} parcel-linked opportunities, and ${parcelContexts.length} parcel-context checks from Danvers assessor and environmental layers. It is intended as decision support for Danvers economic development follow-up.`,
     insights: [
       {
         eyebrow: "Strategic Insight",
@@ -1464,10 +1616,17 @@ function buildStrategicBrief(
         title: utilityInsightTitle,
         detail: utilityInsightDetail,
       },
+      {
+        eyebrow: "Permit History",
+        title: permitInsightTitle,
+        detail: permitInsightDetail,
+      },
     ],
     recommendations,
     metrics: {
       briefingSignals: signals.length,
+      permitSignals: permits.length,
+      commercialPermitSignals,
       caseBriefs: briefs.length,
       matched: reviewSummary.matched,
       needsReview: reviewSummary.needsReview,
@@ -1481,7 +1640,7 @@ function buildStrategicBrief(
       wetlandConstrainedParcels,
       groundwaterConstrainedParcels,
     },
-    sourceCount: signals.length + briefs.length + parcelContexts.length,
+    sourceCount: signals.length + permits.length + briefs.length + parcelContexts.length,
   };
 }
 
@@ -1595,6 +1754,7 @@ async function createAndPersistStrategicBrief(
   trigger: IngestTrigger,
 ): Promise<StrategicBrief> {
   const signals = await fetchAgendaSignals();
+  const permits = await fetchPermitArchiveRecords();
   const briefs = await buildCaseBriefs(signals);
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const parcelContexts = await fetchParcelContextForAddresses(
@@ -1605,6 +1765,7 @@ async function createAndPersistStrategicBrief(
     trigger,
     SITES,
     signals,
+    permits,
     briefs,
     reviewSummary,
     parcelContexts,
@@ -2101,6 +2262,7 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
 }
 
 async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): Promise<DashboardPayload> {
+  const permits = await fetchPermitArchiveRecords();
   const briefs = await buildCaseBriefs(signals);
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const latestStoredBrief = await fetchLatestStrategicBrief(db);
@@ -2109,7 +2271,7 @@ async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): 
     : await fetchParcelContextForAddresses(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))));
   const strategicBrief =
     latestStoredBrief ??
-    buildStrategicBrief(new Date().toISOString(), "live", SITES, signals, briefs, reviewSummary, parcelContexts);
+    buildStrategicBrief(new Date().toISOString(), "live", SITES, signals, permits, briefs, reviewSummary, parcelContexts);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -2117,6 +2279,7 @@ async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): 
     sites: SITES,
     activity: ACTIVITIES,
     signals,
+    permits,
     briefs,
     strategicBrief,
     reviewSummary,
@@ -2135,10 +2298,12 @@ async function buildParcelDetailPayload(address: string, db?: D1Database): Promi
   const context = contexts[0] ?? null;
   const relatedMatches = db && parcel ? await listParcelMatchesForParcelId(db, parcel.id, 10) : [];
   const signals = await fetchAgendaSignals();
+  const permits = await fetchPermitArchiveRecords();
   const briefs = await buildCaseBriefs(signals);
   const parcelAddress = parcel?.address ?? context?.address ?? address;
   const relatedBriefs = buildRelatedParcelBriefs(briefs, parcelAddress);
   const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
+  const relatedPermits = buildRelatedPermitRecords(permits, parcelAddress);
 
   return {
     requestedAddress: address,
@@ -2147,6 +2312,7 @@ async function buildParcelDetailPayload(address: string, db?: D1Database): Promi
     relatedMatches,
     relatedBriefs,
     relatedSignals,
+    relatedPermits,
   };
 }
 
@@ -2157,14 +2323,18 @@ async function buildWatchlistDetailPayload(siteId: string): Promise<WatchlistDet
   }
 
   const signals = await fetchAgendaSignals();
+  const permits = await fetchPermitArchiveRecords();
   const briefs = await buildCaseBriefs(signals);
   const relatedBriefs = buildRelatedWatchlistBriefs(site, briefs);
   const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
+  const relatedPermitAddresses = Array.from(new Set(relatedBriefs.flatMap((brief) => brief.addresses)));
+  const relatedPermits = relatedPermitAddresses.flatMap((address) => buildRelatedPermitRecords(permits, address)).slice(0, 10);
 
   return {
     site,
     relatedBriefs,
     relatedSignals,
+    relatedPermits,
   };
 }
 
@@ -2319,6 +2489,15 @@ function buildRelatedParcelBriefs(briefs: CaseBrief[], address: string): CaseBri
 function buildRelatedParcelSignals(signals: AgendaSignal[], briefs: CaseBrief[]): AgendaSignal[] {
   const agendaUrls = new Set(briefs.map((brief) => brief.agendaUrl));
   return signals.filter((signal) => agendaUrls.has(signal.agendaUrl));
+}
+
+function buildRelatedPermitRecords(permits: PermitRecord[], address: string): PermitRecord[] {
+  const normalizedTarget = normalizeAddress(address);
+  if (!normalizedTarget) {
+    return [];
+  }
+
+  return permits.filter((permit) => normalizeAddress(permit.siteAddress) === normalizedTarget);
 }
 
 function tokenizeWatchlistText(site: OpportunitySite): string[] {
@@ -2940,6 +3119,7 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
             <a class="nav-item" href="/api/summary">Summary API</a>
             <a class="nav-item" href="/api/sites">Sites API</a>
             <a class="nav-item" href="/api/signals">Signals API</a>
+            <a class="nav-item" href="/api/permits">Permits API</a>
             <a class="nav-item" href="/api/briefs">Case Briefs API</a>
             <a class="nav-item" href="/api/strategic-briefs">Strategic Briefs API</a>
             <a class="nav-item" href="/api/status">System Status</a>
@@ -3193,6 +3373,14 @@ function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): st
           <span><a href="${escapeHtml(signal.agendaUrl)}" target="_blank" rel="noreferrer">Open source</a></span>
         </li>`).join("")
     : `<li class="detail-list-item"><strong>No related live signals found.</strong><p>The current signal set does not include a direct posting tied to this address.</p></li>`;
+  const relatedPermitsMarkup = payload.relatedPermits.length
+    ? payload.relatedPermits.map((permit) => `
+        <li class="detail-list-item">
+          <strong>${escapeHtml(permit.permitType)}</strong>
+          <p>${escapeHtml(permit.issuedDate)} · ${escapeHtml(permit.status)}${permit.permitNumber ? ` · ${escapeHtml(permit.permitNumber)}` : ""}</p>
+          <span>${escapeHtml(permit.applicantName || "Applicant not listed")}${permit.detailUrl ? ` · <a href="${escapeHtml(permit.detailUrl)}" target="_blank" rel="noreferrer">Open permit</a>` : ""}</span>
+        </li>`).join("")
+    : `<li class="detail-list-item"><strong>No related permit history found.</strong><p>The sampled permit archive did not return a matching permit row for this address.</p></li>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -3400,6 +3588,10 @@ function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): st
           <ul class="detail-list">${relatedSignalsMarkup}</ul>
         </section>
       </div>
+      <section class="panel" style="margin-top: 18px;">
+        <p class="eyebrow">Related Permit History</p>
+        <ul class="detail-list">${relatedPermitsMarkup}</ul>
+      </section>
     </div>
   </body>
 </html>`;
@@ -3428,6 +3620,14 @@ function renderWatchlistDetailPage(payload: WatchlistDetailPayload, nonce: strin
           <span><a href="${escapeHtml(signal.agendaUrl)}" target="_blank" rel="noreferrer">Open source</a></span>
         </li>`).join("")
     : `<li class="detail-list-item"><strong>No related signals found.</strong><p>This watchlist item is still mostly being tracked through the seeded staff list.</p></li>`;
+  const relatedPermitsMarkup = payload.relatedPermits.length
+    ? payload.relatedPermits.map((permit) => `
+        <li class="detail-list-item">
+          <strong>${escapeHtml(permit.siteAddress)}</strong>
+          <p>${escapeHtml(permit.permitType)} · ${escapeHtml(permit.issuedDate)} · ${escapeHtml(permit.status)}</p>
+          <span>${permit.detailUrl ? `<a href="${escapeHtml(permit.detailUrl)}" target="_blank" rel="noreferrer">Open permit</a>` : escapeHtml(permit.applicantName || "Applicant not listed")}</span>
+        </li>`).join("")
+    : `<li class="detail-list-item"><strong>No related permit rows found.</strong><p>The sampled permit archive has not yet produced a linked permit history for the current related addresses.</p></li>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -3578,6 +3778,10 @@ function renderWatchlistDetailPage(payload: WatchlistDetailPayload, nonce: strin
           <ul class="detail-list">${relatedSignalsMarkup}</ul>
         </section>
       </div>
+      <section class="panel" style="margin-top: 18px;">
+        <p class="eyebrow">Related Permit History</p>
+        <ul class="detail-list">${relatedPermitsMarkup}</ul>
+      </section>
     </div>
   </body>
 </html>`;
@@ -3681,6 +3885,18 @@ export default {
         Response.json({
           signals,
           source: AGENDA_CENTER_URL,
+          updatedAt: new Date().toISOString(),
+        }),
+      );
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/permits") {
+      const permits = await fetchPermitArchiveRecords();
+      return withSecurityHeaders(
+        Response.json({
+          permits,
+          count: permits.length,
+          source: DANVERS_PERMIT_ARCHIVE_URL,
           updatedAt: new Date().toISOString(),
         }),
       );
