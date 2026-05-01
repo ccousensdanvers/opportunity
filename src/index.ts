@@ -71,6 +71,18 @@ interface PermitRecord {
   source: string;
 }
 
+interface OpenGovPermitAttemptDebug {
+  address: string;
+  variant: string;
+  requestUrl: string;
+  ok: boolean;
+  status: number | null;
+  statusText: string | null;
+  parsedCount: number;
+  bodyPreview: string;
+  error?: string;
+}
+
 interface CaseBrief {
   id: string;
   board: AgendaSignal["board"];
@@ -1090,25 +1102,29 @@ function buildOpenGovAddressVariants(address: string): string[] {
   return Array.from(variants).map((value) => normalizeWhitespace(value)).filter(Boolean);
 }
 
-async function fetchOpenGovPermitRecordsForAddress(address: string, env?: Env): Promise<PermitRecord[]> {
+async function queryOpenGovPermitRecordsForAddress(
+  address: string,
+  env?: Env,
+): Promise<{ records: PermitRecord[]; attempts: OpenGovPermitAttemptDebug[] }> {
   const normalizedAddress = normalizeWhitespace(address);
   if (!normalizedAddress) {
-    return [];
+    return { records: [], attempts: [] };
   }
 
   const seen = new Set<string>();
   const records: PermitRecord[] = [];
+  const attempts: OpenGovPermitAttemptDebug[] = [];
 
   for (const variant of buildOpenGovAddressVariants(normalizedAddress)) {
+    const requestUrl = new URL(DANVERS_OPENGOV_SEARCH_URL);
+    requestUrl.searchParams.set("criteria", "location");
+    requestUrl.searchParams.set("key", variant);
+    requestUrl.searchParams.set("timeStamp", String(Date.now()));
+    requestUrl.searchParams.set("ignoreCommunity", "true");
+
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 12000);
-      const url = new URL(DANVERS_OPENGOV_SEARCH_URL);
-      url.searchParams.set("criteria", "location");
-      url.searchParams.set("key", variant);
-      url.searchParams.set("timeStamp", String(Date.now()));
-      url.searchParams.set("ignoreCommunity", "true");
-
       const headers: Record<string, string> = {
         accept: "*/*",
         "accept-language": "en-US,en;q=0.9",
@@ -1125,19 +1141,39 @@ async function fetchOpenGovPermitRecordsForAddress(address: string, env?: Env): 
         headers["cf-turnstile-token"] = env.OPENGOV_TURNSTILE_TOKEN;
       }
 
-      const response = await fetch(url.toString(), {
+      const response = await fetch(requestUrl.toString(), {
         signal: controller.signal,
         headers,
       });
+      const body = await response.text();
       clearTimeout(timeout);
 
       if (!response.ok) {
+        attempts.push({
+          address: normalizedAddress,
+          variant,
+          requestUrl: requestUrl.toString(),
+          ok: false,
+          status: response.status,
+          statusText: response.statusText,
+          parsedCount: 0,
+          bodyPreview: body.slice(0, 400),
+        });
         continue;
       }
 
-      const body = await response.text();
       const payload = JSON.parse(body) as unknown;
       const parsed = parseOpenGovPermitResults(payload, normalizedAddress);
+      attempts.push({
+        address: normalizedAddress,
+        variant,
+        requestUrl: requestUrl.toString(),
+        ok: true,
+        status: response.status,
+        statusText: response.statusText,
+        parsedCount: parsed.length,
+        bodyPreview: body.slice(0, 400),
+      });
       for (const record of parsed) {
         const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ""}`;
         if (seen.has(key)) {
@@ -1147,12 +1183,28 @@ async function fetchOpenGovPermitRecordsForAddress(address: string, env?: Env): 
         seen.add(key);
         records.push(record);
       }
-    } catch {
+    } catch (error) {
+      attempts.push({
+        address: normalizedAddress,
+        variant,
+        requestUrl: requestUrl.toString(),
+        ok: false,
+        status: null,
+        statusText: null,
+        parsedCount: 0,
+        bodyPreview: "",
+        error: error instanceof Error ? error.message : "Unknown fetch error",
+      });
       continue;
     }
   }
 
-  return records;
+  return { records, attempts };
+}
+
+async function fetchOpenGovPermitRecordsForAddress(address: string, env?: Env): Promise<PermitRecord[]> {
+  const result = await queryOpenGovPermitRecordsForAddress(address, env);
+  return result.records;
 }
 
 async function fetchPermitRecords(addresses: string[], env?: Env): Promise<PermitRecord[]> {
@@ -1173,6 +1225,31 @@ async function fetchPermitRecords(addresses: string[], env?: Env): Promise<Permi
   }
 
   return records.slice(0, 60);
+}
+
+async function buildPermitDebugPayload(env?: Env, limit = 8) {
+  const signals = await fetchAgendaSignals();
+  const briefs = await buildCaseBriefs(signals);
+  const addresses = Array.from(new Set(briefs.flatMap((brief) => brief.addresses).map((value) => normalizeWhitespace(value)).filter(Boolean))).slice(0, limit);
+  const searches = [];
+
+  for (const address of addresses) {
+    const result = await queryOpenGovPermitRecordsForAddress(address, env);
+    searches.push({
+      address,
+      recordCount: result.records.length,
+      records: result.records,
+      attempts: result.attempts,
+    });
+  }
+
+  return {
+    searchedAddresses: addresses,
+    addressCount: addresses.length,
+    hasTurnstileToken: Boolean(env?.OPENGOV_TURNSTILE_TOKEN),
+    source: DANVERS_OPENGOV_SEARCH_URL,
+    searches,
+  };
 }
 
 function looksLikeProjectTitle(value: string): boolean {
@@ -4180,6 +4257,20 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/api/debug/signals") {
       const debug = await fetchAgendaSignalsDebug();
+      return withSecurityHeaders(
+        Response.json({
+          ...debug,
+          updatedAt: new Date().toISOString(),
+        }),
+      );
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/debug/permits") {
+      const limitParam = Number(url.searchParams.get("limit") ?? "8");
+      const debug = await buildPermitDebugPayload(
+        env,
+        Number.isFinite(limitParam) && limitParam > 0 ? limitParam : 8,
+      );
       return withSecurityHeaders(
         Response.json({
           ...debug,
