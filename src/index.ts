@@ -147,7 +147,8 @@ const PLANNING_BOARD_RSS_URL =
 const ZBA_RSS_URL =
   "https://www.danversma.gov/RSSFeed.aspx?CID=Zoning-Board-of-Appeals-18&ModID=65";
 const PROJECTS_PAGE_URL = "https://www.danversma.gov/235/Projects";
-const DANVERS_PERMIT_ARCHIVE_URL = "https://fctpermit.com/sites/Danvers/homepage.asp";
+const DANVERS_OPENGOV_SEARCH_URL = "https://api-east.viewpointcloud.com/v2/danversma/search_results";
+const DANVERS_OPENGOV_PORTAL_URL = "https://danversma.portal.opengov.com/search";
 const DANVERS_PARCELS_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
 const DANVERS_ASSESSOR_TABLE_URL =
@@ -865,44 +866,183 @@ function resolvePermitDetailUrl(value: string): string | null {
     return trimmed;
   }
 
-  return new URL(trimmed, DANVERS_PERMIT_ARCHIVE_URL).toString();
+  return new URL(trimmed, DANVERS_OPENGOV_PORTAL_URL).toString();
 }
 
-function parsePermitArchiveRows(html: string): PermitRecord[] {
-  const rows = Array.from(
-    html.matchAll(
-      /<tr[^>]*>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>\s*<\/tr>/gi,
-    ),
+function collectNestedObjects(value: unknown, objects: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  if (!value || typeof value !== "object") {
+    return objects;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectNestedObjects(item, objects);
+    }
+    return objects;
+  }
+
+  const record = value as Record<string, unknown>;
+  objects.push(record);
+  for (const nested of Object.values(record)) {
+    collectNestedObjects(nested, objects);
+  }
+  return objects;
+}
+
+function lookupFirstString(
+  source: Record<string, unknown>,
+  keys: string[],
+): string | null {
+  for (const key of keys) {
+    const direct = coerceOptionalString(source[key]);
+    if (direct) {
+      return direct;
+    }
+
+    const normalizedTarget = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+    for (const [candidateKey, candidateValue] of Object.entries(source)) {
+      const normalizedCandidate = candidateKey.replace(/[^a-z0-9]/gi, "").toLowerCase();
+      if (normalizedCandidate === normalizedTarget) {
+        const candidate = coerceOptionalString(candidateValue);
+        if (candidate) {
+          return candidate;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+function formatPermitDate(value: string | null): string {
+  if (!value) {
+    return "Date not listed";
+  }
+
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && value.trim().length >= 10) {
+    const parsed = new Date(numeric);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString().slice(0, 10);
+    }
+  }
+
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString().slice(0, 10);
+  }
+
+  const normalized = normalizeWhitespace(value);
+  return normalized || "Date not listed";
+}
+
+function normalizePermitRecord(
+  candidate: Record<string, unknown>,
+  searchedAddress: string,
+): PermitRecord | null {
+  const siteAddress =
+    lookupFirstString(candidate, [
+      "siteAddress",
+      "address",
+      "fullAddress",
+      "location",
+      "projectAddress",
+      "propertyAddress",
+      "jobAddress",
+      "site_address",
+    ]) ?? searchedAddress;
+  const permitType = lookupFirstString(candidate, [
+    "permitType",
+    "type",
+    "recordType",
+    "recordName",
+    "applicationType",
+    "workType",
+    "description",
+    "projectType",
+  ]);
+  const status = lookupFirstString(candidate, [
+    "status",
+    "permitStatus",
+    "currentStatus",
+    "workflowStatus",
+    "stage",
+  ]);
+  const permitNumber = lookupFirstString(candidate, [
+    "permitNumber",
+    "applicationNumber",
+    "recordNumber",
+    "number",
+    "recordId",
+    "caseNumber",
+  ]);
+  const applicantName = lookupFirstString(candidate, [
+    "applicantName",
+    "applicant",
+    "contactName",
+    "ownerName",
+    "name",
+  ]) ?? "";
+  const detailUrl = resolvePermitDetailUrl(
+    lookupFirstString(candidate, [
+      "detailUrl",
+      "url",
+      "recordUrl",
+      "publicUrl",
+      "link",
+      "href",
+    ]) ?? "",
+  );
+  const issuedDate = formatPermitDate(
+    lookupFirstString(candidate, [
+      "issuedDate",
+      "issueDate",
+      "submittedDate",
+      "appliedDate",
+      "filedDate",
+      "createdAt",
+      "createdDate",
+      "updatedAt",
+      "date",
+    ]),
   );
 
-  return rows
-    .map((match) => {
-      const applicantName = stripHtmlTags(match[1]);
-      const siteAddress = stripHtmlTags(match[2]);
-      const permitType = stripHtmlTags(match[3]);
-      const status = stripHtmlTags(match[4]);
-      const issuedDate = stripHtmlTags(match[5]);
-      const permitNumber = stripHtmlTags(match[6]) || null;
-      const detailHref = match[7].match(/href\s*=\s*"([^"]+)"/i)?.[1]
-        ?? match[7].match(/href\s*=\s*'([^']+)'/i)?.[1]
-        ?? "";
+  if (!permitType && !permitNumber) {
+    return null;
+  }
 
-      return {
-        applicantName,
-        siteAddress,
-        permitType,
-        status,
-        issuedDate,
-        permitNumber,
-        detailUrl: resolvePermitDetailUrl(detailHref),
-        source: "danvers permit archive",
-      };
-    })
-    .filter((record) =>
-      Boolean(record.siteAddress)
-      && /\d{4}-\d{2}-\d{2}/.test(record.issuedDate)
-      && !record.siteAddress.toLowerCase().includes("site address"),
-    );
+  if (!siteAddress) {
+    return null;
+  }
+
+  return {
+    applicantName,
+    siteAddress: normalizeWhitespace(siteAddress),
+    permitType: normalizeWhitespace(permitType ?? "Permit record"),
+    status: normalizeWhitespace(status ?? "Status not listed"),
+    issuedDate,
+    permitNumber,
+    detailUrl,
+    source: "OpenGov permitting search",
+  };
+}
+
+function parseOpenGovPermitResults(payload: unknown, searchedAddress: string): PermitRecord[] {
+  const normalizedSearch = normalizeAddress(searchedAddress);
+  const records = collectNestedObjects(payload)
+    .map((candidate) => normalizePermitRecord(candidate, searchedAddress))
+    .filter((record): record is PermitRecord => Boolean(record));
+
+  return records.filter((record) => {
+    const normalizedRecordAddress = normalizeAddress(record.siteAddress);
+    if (!normalizedSearch || !normalizedRecordAddress) {
+      return true;
+    }
+
+    return normalizedRecordAddress === normalizedSearch
+      || normalizedRecordAddress.includes(normalizedSearch)
+      || normalizedSearch.includes(normalizedRecordAddress);
+  });
 }
 
 function isCommercialPermit(record: PermitRecord): boolean {
@@ -913,40 +1053,58 @@ function isCommercialPermit(record: PermitRecord): boolean {
     || value.includes("tenant");
 }
 
-async function fetchPermitArchiveRecords(maxPages = 3): Promise<PermitRecord[]> {
+async function fetchOpenGovPermitRecordsForAddress(address: string): Promise<PermitRecord[]> {
+  const normalizedAddress = normalizeWhitespace(address);
+  if (!normalizedAddress) {
+    return [];
+  }
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    const url = new URL(DANVERS_OPENGOV_SEARCH_URL);
+    url.searchParams.set("criteria", "location");
+    url.searchParams.set("key", normalizedAddress);
+    url.searchParams.set("timeStamp", String(Date.now()));
+    url.searchParams.set("ignoreCommunity", "true");
+
+    const response = await fetch(url.toString(), {
+      signal: controller.signal,
+      headers: {
+        accept: "*/*",
+        referer: DANVERS_OPENGOV_PORTAL_URL,
+        sourceapp: "storefront",
+        "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
+      },
+    });
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const body = await response.text();
+    const payload = JSON.parse(body) as unknown;
+    return parseOpenGovPermitResults(payload, normalizedAddress);
+  } catch {
+    return [];
+  }
+}
+
+async function fetchPermitRecords(addresses: string[]): Promise<PermitRecord[]> {
   const records: PermitRecord[] = [];
   const seen = new Set<string>();
 
-  for (let page = 1; page <= maxPages; page += 1) {
-    try {
-      const url = page === 1 ? DANVERS_PERMIT_ARCHIVE_URL : `${DANVERS_PERMIT_ARCHIVE_URL}?PageNo=${page}`;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
-        },
-      });
-      clearTimeout(timeout);
-
-      if (!response.ok) {
+  for (const address of Array.from(new Set(addresses.map((value) => normalizeWhitespace(value)).filter(Boolean))).slice(0, 24)) {
+    const addressRecords = await fetchOpenGovPermitRecordsForAddress(address);
+    for (const record of addressRecords) {
+      const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ""}`;
+      if (seen.has(key)) {
         continue;
       }
 
-      const html = await response.text();
-      const pageRecords = parsePermitArchiveRows(html);
-      for (const record of pageRecords) {
-        const key = `${record.siteAddress}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ""}`;
-        if (seen.has(key)) {
-          continue;
-        }
-
-        seen.add(key);
-        records.push(record);
-      }
-    } catch {
-      continue;
+      seen.add(key);
+      records.push(record);
     }
   }
 
@@ -1519,10 +1677,10 @@ function buildStrategicBrief(
       : "Permit history is not yet adding much commercial signal to the current queue";
   const permitInsightDetail =
     commercialPermitSignals > 0
-      ? `${commercialPermitSignals} recent archive permit records in the sampled Danvers permit history read as commercial-facing activity, and ${parcelsWithCommercialPermits} brief-linked parcels already line up with that permit history. That gives the Town another way to spot reinvestment and reuse patterns beyond agendas and project pages alone.`
+      ? `${commercialPermitSignals} recent OpenGov permit search records read as commercial-facing activity, and ${parcelsWithCommercialPermits} brief-linked parcels already line up with that permit history. That gives the Town another way to spot reinvestment and reuse patterns beyond agendas and project pages alone.`
       : permits.length
-        ? "The archive permit sample is mostly residential or low-strategy activity right now, so it is not yet shifting the commercial picture much."
-        : "Permit archive records have not yet been pulled into this run, so permit history is not yet contributing to the strategic read.";
+        ? "The current OpenGov permit pull is mostly residential or low-strategy activity right now, so it is not yet shifting the commercial picture much."
+        : "OpenGov permit records have not yet been pulled into this run, so permit history is not yet contributing to the strategic read.";
 
   const recommendations: StrategicRecommendation[] = [
     {
@@ -1591,7 +1749,7 @@ function buildStrategicBrief(
     generatedAt,
     trigger,
     title: "Danvers Strategic Brief",
-    summary: `This briefing reflects ${signals.length} live agenda signals, ${permits.length} sampled permit records, ${briefs.length} case briefs, ${reviewSummary.matched} parcel-linked opportunities, and ${parcelContexts.length} parcel-context checks from Danvers assessor and environmental layers. It is intended as decision support for Danvers economic development follow-up.`,
+    summary: `This briefing reflects ${signals.length} live agenda signals, ${permits.length} OpenGov permit records tied to brief-linked addresses, ${briefs.length} case briefs, ${reviewSummary.matched} parcel-linked opportunities, and ${parcelContexts.length} parcel-context checks from Danvers assessor and environmental layers. It is intended as decision support for Danvers economic development follow-up.`,
     insights: [
       {
         eyebrow: "Strategic Insight",
@@ -1757,8 +1915,8 @@ async function createAndPersistStrategicBrief(
   trigger: IngestTrigger,
 ): Promise<StrategicBrief> {
   const signals = await fetchAgendaSignals();
-  const permits = await fetchPermitArchiveRecords();
   const briefs = await buildCaseBriefs(signals);
+  const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))));
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const parcelContexts = await fetchParcelContextForAddresses(
     Array.from(new Set(briefs.flatMap((brief) => brief.addresses))),
@@ -2265,8 +2423,8 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
 }
 
 async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): Promise<DashboardPayload> {
-  const permits = await fetchPermitArchiveRecords();
   const briefs = await buildCaseBriefs(signals);
+  const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))));
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const latestStoredBrief = await fetchLatestStrategicBrief(db);
   const parcelContexts = latestStoredBrief
@@ -2301,9 +2459,9 @@ async function buildParcelDetailPayload(address: string, db?: D1Database): Promi
   const context = contexts[0] ?? null;
   const relatedMatches = db && parcel ? await listParcelMatchesForParcelId(db, parcel.id, 10) : [];
   const signals = await fetchAgendaSignals();
-  const permits = await fetchPermitArchiveRecords();
   const briefs = await buildCaseBriefs(signals);
   const parcelAddress = parcel?.address ?? context?.address ?? address;
+  const permits = await fetchPermitRecords([parcelAddress]);
   const relatedBriefs = buildRelatedParcelBriefs(briefs, parcelAddress);
   const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
   const relatedPermits = prioritizePermitRecords(buildRelatedPermitRecords(permits, parcelAddress), 8);
@@ -2326,11 +2484,11 @@ async function buildWatchlistDetailPayload(siteId: string): Promise<WatchlistDet
   }
 
   const signals = await fetchAgendaSignals();
-  const permits = await fetchPermitArchiveRecords();
   const briefs = await buildCaseBriefs(signals);
   const relatedBriefs = buildRelatedWatchlistBriefs(site, briefs);
   const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
   const relatedPermitAddresses = Array.from(new Set(relatedBriefs.flatMap((brief) => brief.addresses)));
+  const permits = await fetchPermitRecords(relatedPermitAddresses);
   const relatedPermits = prioritizePermitRecords(
     relatedPermitAddresses.flatMap((address) => buildRelatedPermitRecords(permits, address)),
     10,
@@ -3414,7 +3572,7 @@ function renderParcelDetailPage(payload: ParcelDetailPayload, nonce: string): st
           <p>${escapeHtml(permit.issuedDate)} · ${escapeHtml(permit.status)}${permit.permitNumber ? ` · ${escapeHtml(permit.permitNumber)}` : ""}</p>
           <span>${escapeHtml(permit.applicantName || "Applicant not listed")}${permit.detailUrl ? ` · <a href="${escapeHtml(permit.detailUrl)}" target="_blank" rel="noreferrer">Open permit</a>` : ""}</span>
         </li>`).join("")
-    : `<li class="detail-list-item"><strong>No related permit history found.</strong><p>The sampled permit archive did not return a matching permit row for this address.</p></li>`;
+    : `<li class="detail-list-item"><strong>No related permit history found.</strong><p>The current OpenGov permit search did not return a matching record for this address.</p></li>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -3678,7 +3836,7 @@ function renderWatchlistDetailPage(payload: WatchlistDetailPayload, nonce: strin
           <p>${escapeHtml(permit.permitType)} · ${escapeHtml(permit.issuedDate)} · ${escapeHtml(permit.status)}</p>
           <span>${permit.detailUrl ? `<a href="${escapeHtml(permit.detailUrl)}" target="_blank" rel="noreferrer">Open permit</a>` : escapeHtml(permit.applicantName || "Applicant not listed")}</span>
         </li>`).join("")
-    : `<li class="detail-list-item"><strong>No related permit rows found.</strong><p>The sampled permit archive has not yet produced a linked permit history for the current related addresses.</p></li>`;
+    : `<li class="detail-list-item"><strong>No related permit rows found.</strong><p>The current OpenGov permit search has not yet produced a linked permit history for the current related addresses.</p></li>`;
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -3942,12 +4100,14 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/api/permits") {
-      const permits = await fetchPermitArchiveRecords();
+      const signals = await fetchAgendaSignals();
+      const briefs = await buildCaseBriefs(signals);
+      const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))));
       return withSecurityHeaders(
         Response.json({
           permits,
           count: permits.length,
-          source: DANVERS_PERMIT_ARCHIVE_URL,
+          source: DANVERS_OPENGOV_SEARCH_URL,
           updatedAt: new Date().toISOString(),
         }),
       );
