@@ -426,8 +426,8 @@ const SITES: OpportunitySite[] = [
 const ACTIVITIES: ActivityItem[] = [
   {
     time: "08:30",
-    title: "Parcel context now reaches beyond agenda text",
-    detail: "Manual and scheduled runs now screen brief-linked parcels against Danvers assessor, utility, flood, wetlands, groundwater, and sampled permit history before writing the strategic brief.",
+    title: "Parcel context is live; permit integration is still gated",
+    detail: "Manual and scheduled runs now screen brief-linked parcels against Danvers assessor, utility, flood, wetlands, and groundwater context. OpenGov permit lookups were tested but are still blocked by platform access controls.",
   },
   {
     time: "09:15",
@@ -436,8 +436,8 @@ const ACTIVITIES: ActivityItem[] = [
   },
   {
     time: "Next",
-    title: "Current build focus: connected site workflows",
-    detail: "Next up is tightening watchlist drilldowns and making it easier to move between strategic briefs, parcel pages, and source records without losing context.",
+    title: "Current build focus: supported permit data access",
+    detail: "Next up is confirming whether Danvers can expose permit data through an OpenGov-supported export, reporting feed, or admin-enabled API instead of blocked public search requests.",
   },
 ];
 
