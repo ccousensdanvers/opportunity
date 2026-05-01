@@ -18,6 +18,7 @@ type Readiness = "Early" | "Emerging" | "Advancing";
 
 interface Env {
   OPPORTUNITYDB?: D1Database;
+  OPENGOV_TURNSTILE_TOKEN?: string;
 }
 
 interface IngestMessage {
@@ -950,6 +951,9 @@ function normalizePermitRecord(
       "propertyAddress",
       "jobAddress",
       "site_address",
+      "address1",
+      "matchedAddress",
+      "full_address",
     ]) ?? searchedAddress;
   const permitType = lookupFirstString(candidate, [
     "permitType",
@@ -960,6 +964,11 @@ function normalizePermitRecord(
     "workType",
     "description",
     "projectType",
+    "recordTypeName",
+    "category",
+    "subType",
+    "subtype",
+    "displayName",
   ]);
   const status = lookupFirstString(candidate, [
     "status",
@@ -967,6 +976,7 @@ function normalizePermitRecord(
     "currentStatus",
     "workflowStatus",
     "stage",
+    "statusLabel",
   ]);
   const permitNumber = lookupFirstString(candidate, [
     "permitNumber",
@@ -975,6 +985,8 @@ function normalizePermitRecord(
     "number",
     "recordId",
     "caseNumber",
+    "record_number",
+    "displayId",
   ]);
   const applicantName = lookupFirstString(candidate, [
     "applicantName",
@@ -982,6 +994,7 @@ function normalizePermitRecord(
     "contactName",
     "ownerName",
     "name",
+    "applicant_name",
   ]) ?? "";
   const detailUrl = resolvePermitDetailUrl(
     lookupFirstString(candidate, [
@@ -1004,6 +1017,8 @@ function normalizePermitRecord(
       "createdDate",
       "updatedAt",
       "date",
+      "openedDate",
+      "applied_on",
     ]),
   );
 
@@ -1053,50 +1068,99 @@ function isCommercialPermit(record: PermitRecord): boolean {
     || value.includes("tenant");
 }
 
-async function fetchOpenGovPermitRecordsForAddress(address: string): Promise<PermitRecord[]> {
+function buildOpenGovAddressVariants(address: string): string[] {
+  const normalized = normalizeWhitespace(address);
+  if (!normalized) {
+    return [];
+  }
+
+  const variants = new Set<string>([normalized]);
+  const lowered = normalized.toLowerCase();
+  variants.add(lowered);
+  variants.add(lowered.replace(/\bstreet\b/g, "st"));
+  variants.add(lowered.replace(/\bavenue\b/g, "ave"));
+  variants.add(lowered.replace(/\broad\b/g, "rd"));
+  variants.add(lowered.replace(/\bdrive\b/g, "dr"));
+  variants.add(lowered.replace(/\blane\b/g, "ln"));
+  variants.add(lowered.replace(/\bcourt\b/g, "ct"));
+  variants.add(lowered.replace(/\bplace\b/g, "pl"));
+  variants.add(lowered.replace(/\bterrace\b/g, "ter"));
+  variants.add(lowered.replace(/\bboulevard\b/g, "blvd"));
+
+  return Array.from(variants).map((value) => normalizeWhitespace(value)).filter(Boolean);
+}
+
+async function fetchOpenGovPermitRecordsForAddress(address: string, env?: Env): Promise<PermitRecord[]> {
   const normalizedAddress = normalizeWhitespace(address);
   if (!normalizedAddress) {
     return [];
   }
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 12000);
-    const url = new URL(DANVERS_OPENGOV_SEARCH_URL);
-    url.searchParams.set("criteria", "location");
-    url.searchParams.set("key", normalizedAddress);
-    url.searchParams.set("timeStamp", String(Date.now()));
-    url.searchParams.set("ignoreCommunity", "true");
+  const seen = new Set<string>();
+  const records: PermitRecord[] = [];
 
-    const response = await fetch(url.toString(), {
-      signal: controller.signal,
-      headers: {
+  for (const variant of buildOpenGovAddressVariants(normalizedAddress)) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 12000);
+      const url = new URL(DANVERS_OPENGOV_SEARCH_URL);
+      url.searchParams.set("criteria", "location");
+      url.searchParams.set("key", variant);
+      url.searchParams.set("timeStamp", String(Date.now()));
+      url.searchParams.set("ignoreCommunity", "true");
+
+      const headers: Record<string, string> = {
         accept: "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        priority: "u=1, i",
         referer: DANVERS_OPENGOV_PORTAL_URL,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "cross-site",
         sourceapp: "storefront",
-        "user-agent": "Opportunity/0.1 (+https://www.danversma.gov/)",
-      },
-    });
-    clearTimeout(timeout);
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+      };
 
-    if (!response.ok) {
-      return [];
+      if (env?.OPENGOV_TURNSTILE_TOKEN) {
+        headers["cf-turnstile-token"] = env.OPENGOV_TURNSTILE_TOKEN;
+      }
+
+      const response = await fetch(url.toString(), {
+        signal: controller.signal,
+        headers,
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        continue;
+      }
+
+      const body = await response.text();
+      const payload = JSON.parse(body) as unknown;
+      const parsed = parseOpenGovPermitResults(payload, normalizedAddress);
+      for (const record of parsed) {
+        const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ""}`;
+        if (seen.has(key)) {
+          continue;
+        }
+
+        seen.add(key);
+        records.push(record);
+      }
+    } catch {
+      continue;
     }
-
-    const body = await response.text();
-    const payload = JSON.parse(body) as unknown;
-    return parseOpenGovPermitResults(payload, normalizedAddress);
-  } catch {
-    return [];
   }
+
+  return records;
 }
 
-async function fetchPermitRecords(addresses: string[]): Promise<PermitRecord[]> {
+async function fetchPermitRecords(addresses: string[], env?: Env): Promise<PermitRecord[]> {
   const records: PermitRecord[] = [];
   const seen = new Set<string>();
 
   for (const address of Array.from(new Set(addresses.map((value) => normalizeWhitespace(value)).filter(Boolean))).slice(0, 24)) {
-    const addressRecords = await fetchOpenGovPermitRecordsForAddress(address);
+    const addressRecords = await fetchOpenGovPermitRecordsForAddress(address, env);
     for (const record of addressRecords) {
       const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ""}`;
       if (seen.has(key)) {
@@ -1913,10 +1977,11 @@ async function persistStrategicBrief(db: D1Database, brief: StrategicBrief): Pro
 async function createAndPersistStrategicBrief(
   db: D1Database,
   trigger: IngestTrigger,
+  env?: Env,
 ): Promise<StrategicBrief> {
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
-  const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))));
+  const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))), env);
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const parcelContexts = await fetchParcelContextForAddresses(
     Array.from(new Set(briefs.flatMap((brief) => brief.addresses))),
@@ -2422,9 +2487,9 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
   };
 }
 
-async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): Promise<DashboardPayload> {
+async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database, env?: Env): Promise<DashboardPayload> {
   const briefs = await buildCaseBriefs(signals);
-  const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))));
+  const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))), env);
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const latestStoredBrief = await fetchLatestStrategicBrief(db);
   const parcelContexts = latestStoredBrief
@@ -2447,7 +2512,7 @@ async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database): 
   };
 }
 
-async function buildParcelDetailPayload(address: string, db?: D1Database): Promise<ParcelDetailPayload> {
+async function buildParcelDetailPayload(address: string, db?: D1Database, env?: Env): Promise<ParcelDetailPayload> {
   const parcel = db ? await findParcelByAddress(db, address) : null;
   const contextAddresses = Array.from(
     new Set([
@@ -2461,7 +2526,7 @@ async function buildParcelDetailPayload(address: string, db?: D1Database): Promi
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
   const parcelAddress = parcel?.address ?? context?.address ?? address;
-  const permits = await fetchPermitRecords([parcelAddress]);
+  const permits = await fetchPermitRecords([parcelAddress], env);
   const relatedBriefs = buildRelatedParcelBriefs(briefs, parcelAddress);
   const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
   const relatedPermits = prioritizePermitRecords(buildRelatedPermitRecords(permits, parcelAddress), 8);
@@ -2477,7 +2542,7 @@ async function buildParcelDetailPayload(address: string, db?: D1Database): Promi
   };
 }
 
-async function buildWatchlistDetailPayload(siteId: string): Promise<WatchlistDetailPayload | null> {
+async function buildWatchlistDetailPayload(siteId: string, env?: Env): Promise<WatchlistDetailPayload | null> {
   const site = SITES.find((candidate) => candidate.id === siteId);
   if (!site) {
     return null;
@@ -2488,7 +2553,7 @@ async function buildWatchlistDetailPayload(siteId: string): Promise<WatchlistDet
   const relatedBriefs = buildRelatedWatchlistBriefs(site, briefs);
   const relatedSignals = buildRelatedParcelSignals(signals, relatedBriefs);
   const relatedPermitAddresses = Array.from(new Set(relatedBriefs.flatMap((brief) => brief.addresses)));
-  const permits = await fetchPermitRecords(relatedPermitAddresses);
+  const permits = await fetchPermitRecords(relatedPermitAddresses, env);
   const relatedPermits = prioritizePermitRecords(
     relatedPermitAddresses.flatMap((address) => buildRelatedPermitRecords(permits, address)),
     10,
@@ -4002,7 +4067,7 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/") {
       const signals = await fetchAgendaSignals();
-      const payload = await buildDashboardPayload(signals, env.OPPORTUNITYDB);
+      const payload = await buildDashboardPayload(signals, env.OPPORTUNITYDB, env);
       const nonce = generateCspNonce();
       return withSecurityHeaders(
         new Response(renderDashboard(payload, nonce), {
@@ -4025,7 +4090,7 @@ export default {
         );
       }
 
-      const payload = await buildParcelDetailPayload(address, env.OPPORTUNITYDB);
+      const payload = await buildParcelDetailPayload(address, env.OPPORTUNITYDB, env);
       const nonce = generateCspNonce();
       return withSecurityHeaders(
         new Response(renderParcelDetailPage(payload, nonce), {
@@ -4039,7 +4104,7 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/watchlist") {
       const siteId = url.searchParams.get("id")?.trim() ?? "";
-      const payload = await buildWatchlistDetailPayload(siteId);
+      const payload = await buildWatchlistDetailPayload(siteId, env);
       if (!payload) {
         return withSecurityHeaders(new Response("Watchlist item not found", { status: 404 }));
       }
@@ -4070,7 +4135,7 @@ export default {
         );
       }
 
-      const payload = await buildParcelDetailPayload(address, env.OPPORTUNITYDB);
+      const payload = await buildParcelDetailPayload(address, env.OPPORTUNITYDB, env);
       return withSecurityHeaders(
         Response.json({
           ok: true,
@@ -4102,7 +4167,7 @@ export default {
     if (request.method === "GET" && url.pathname === "/api/permits") {
       const signals = await fetchAgendaSignals();
       const briefs = await buildCaseBriefs(signals);
-      const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))));
+      const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))), env);
       return withSecurityHeaders(
         Response.json({
           permits,
@@ -4293,7 +4358,7 @@ export default {
 
       try {
         const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
-        const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "manual");
+        const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "manual", env);
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
         return withSecurityHeaders(
@@ -4333,7 +4398,7 @@ export default {
 
       try {
         const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
-        const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "scheduled");
+        const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "scheduled", env);
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
         console.log(
