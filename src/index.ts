@@ -2058,7 +2058,7 @@ async function createAndPersistStrategicBrief(
 ): Promise<StrategicBrief> {
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
-  const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))), env);
+  const permits: PermitRecord[] = [];
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const parcelContexts = await fetchParcelContextForAddresses(
     Array.from(new Set(briefs.flatMap((brief) => brief.addresses))),
@@ -2566,7 +2566,7 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
 
 async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database, env?: Env): Promise<DashboardPayload> {
   const briefs = await buildCaseBriefs(signals);
-  const permits = await fetchPermitRecords(Array.from(new Set(briefs.flatMap((brief) => brief.addresses))), env);
+  const permits: PermitRecord[] = [];
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const latestStoredBrief = await fetchLatestStrategicBrief(db);
   const parcelContexts = latestStoredBrief
@@ -2736,10 +2736,10 @@ function renderStrategicInsightsMarkup(payload: DashboardPayload): string {
   return payload.strategicBrief.insights
     .map(
       (insight) => `
-        <div class="insight">
+        <div class="insight"${insight.eyebrow === "Permit History" ? ' data-insight="permit-history"' : ""}>
           <p class="eyebrow">${escapeHtml(insight.eyebrow)}</p>
-          <strong>${escapeHtml(insight.title)}</strong>
-          <p>${escapeHtml(insight.detail)}</p>
+          <strong${insight.eyebrow === "Permit History" ? ' data-permit-title="true"' : ""}>${escapeHtml(insight.title)}</strong>
+          <p${insight.eyebrow === "Permit History" ? ' data-permit-detail="true"' : ""}>${escapeHtml(insight.detail)}</p>
         </div>`,
     )
     .join("");
@@ -2930,15 +2930,16 @@ function renderStrategicScorecardMarkup(payload: DashboardPayload): string {
       value: String(metrics.parcelsWithCommercialPermits ?? 0),
       detail: "brief-linked parcels with commercial permit history",
       tone: "positive",
+      key: "permit-overlap",
     },
   ];
 
   return cards
     .map(
       (card) => `
-        <div class="scorecard-item scorecard-${escapeHtml(card.tone)}">
+        <div class="scorecard-item scorecard-${escapeHtml(card.tone)}"${card.key ? ` data-scorecard="${escapeHtml(card.key)}"` : ""}>
           <p class="eyebrow">${escapeHtml(card.label)}</p>
-          <strong>${escapeHtml(card.value)}</strong>
+          <strong${card.key === "permit-overlap" ? ' data-scorecard-value="permit-overlap"' : ""}>${escapeHtml(card.value)}</strong>
           <span>${escapeHtml(card.detail)}</span>
         </div>`,
     )
@@ -3581,6 +3582,10 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
       const statusFilter = document.getElementById("status-filter");
       const signalList = document.getElementById("signal-list");
       const briefList = document.getElementById("brief-list");
+      const permitInsight = document.querySelector('[data-insight="permit-history"]');
+      const permitTitle = document.querySelector("[data-permit-title='true']");
+      const permitDetail = document.querySelector("[data-permit-detail='true']");
+      const permitOverlapValue = document.querySelector("[data-scorecard-value='permit-overlap']");
 
       function escapeHtml(value) {
         return value
@@ -3647,6 +3652,331 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         }).join("");
       }
 
+      function normalizeAddress(value) {
+        return String(value || "")
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, " ")
+          .trim();
+      }
+
+      function isCommercialPermit(record) {
+        const value = (String(record.permitType || "") + " " + String(record.siteAddress || "")).toLowerCase();
+        return value.includes("commercial")
+          || value.includes("co permit")
+          || value.includes("sign application")
+          || value.includes("tenant");
+      }
+
+      function buildOpenGovAddressVariants(address) {
+        const normalized = String(address || "").trim();
+        if (!normalized) {
+          return [];
+        }
+
+        const lowered = normalized.toLowerCase();
+        const variants = new Set([
+          normalized,
+          lowered,
+          lowered.replace(/\bstreet\b/g, "st"),
+          lowered.replace(/\bavenue\b/g, "ave"),
+          lowered.replace(/\broad\b/g, "rd"),
+          lowered.replace(/\bdrive\b/g, "dr"),
+          lowered.replace(/\blane\b/g, "ln"),
+          lowered.replace(/\bcourt\b/g, "ct"),
+          lowered.replace(/\bplace\b/g, "pl"),
+          lowered.replace(/\bterrace\b/g, "ter"),
+          lowered.replace(/\bboulevard\b/g, "blvd"),
+        ]);
+
+        return [...variants].map((value) => String(value).trim()).filter(Boolean);
+      }
+
+      function collectNestedObjects(value, objects = []) {
+        if (!value || typeof value !== "object") {
+          return objects;
+        }
+
+        if (Array.isArray(value)) {
+          value.forEach((item) => collectNestedObjects(item, objects));
+          return objects;
+        }
+
+        objects.push(value);
+        Object.values(value).forEach((item) => collectNestedObjects(item, objects));
+        return objects;
+      }
+
+      function firstString(source, keys) {
+        for (const key of keys) {
+          const direct = source && source[key];
+          if (typeof direct === "string" && direct.trim()) {
+            return direct.trim();
+          }
+
+          if (typeof direct === "number" && Number.isFinite(direct)) {
+            return String(direct);
+          }
+
+          const normalizedTarget = key.replace(/[^a-z0-9]/gi, "").toLowerCase();
+          for (const candidateKey of Object.keys(source || {})) {
+            if (candidateKey.replace(/[^a-z0-9]/gi, "").toLowerCase() === normalizedTarget) {
+              const candidate = source[candidateKey];
+              if (typeof candidate === "string" && candidate.trim()) {
+                return candidate.trim();
+              }
+              if (typeof candidate === "number" && Number.isFinite(candidate)) {
+                return String(candidate);
+              }
+            }
+          }
+        }
+
+        return null;
+      }
+
+      function formatPermitDate(value) {
+        if (!value) {
+          return "Date not listed";
+        }
+
+        const numeric = Number(value);
+        if (Number.isFinite(numeric) && String(value).trim().length >= 10) {
+          const parsed = new Date(numeric);
+          if (!Number.isNaN(parsed.getTime())) {
+            return parsed.toISOString().slice(0, 10);
+          }
+        }
+
+        const parsed = new Date(value);
+        if (!Number.isNaN(parsed.getTime())) {
+          return parsed.toISOString().slice(0, 10);
+        }
+
+        return String(value).trim() || "Date not listed";
+      }
+
+      function normalizePermitRecord(candidate, searchedAddress) {
+        const siteAddress = firstString(candidate, [
+          "siteAddress",
+          "address",
+          "fullAddress",
+          "location",
+          "projectAddress",
+          "propertyAddress",
+          "jobAddress",
+          "site_address",
+          "address1",
+          "matchedAddress",
+          "full_address",
+        ]) || searchedAddress;
+        const permitType = firstString(candidate, [
+          "permitType",
+          "type",
+          "recordType",
+          "recordName",
+          "applicationType",
+          "workType",
+          "description",
+          "projectType",
+          "recordTypeName",
+          "category",
+          "subType",
+          "subtype",
+          "displayName",
+        ]);
+        const status = firstString(candidate, [
+          "status",
+          "permitStatus",
+          "currentStatus",
+          "workflowStatus",
+          "stage",
+          "statusLabel",
+        ]);
+        const permitNumber = firstString(candidate, [
+          "permitNumber",
+          "applicationNumber",
+          "recordNumber",
+          "number",
+          "recordId",
+          "caseNumber",
+          "record_number",
+          "displayId",
+        ]);
+        const applicantName = firstString(candidate, [
+          "applicantName",
+          "applicant",
+          "contactName",
+          "ownerName",
+          "name",
+          "applicant_name",
+        ]) || "";
+
+        if (!siteAddress || (!permitType && !permitNumber)) {
+          return null;
+        }
+
+        return {
+          applicantName,
+          siteAddress,
+          permitType: permitType || "Permit record",
+          status: status || "Status not listed",
+          issuedDate: formatPermitDate(firstString(candidate, [
+            "issuedDate",
+            "issueDate",
+            "submittedDate",
+            "appliedDate",
+            "filedDate",
+            "createdAt",
+            "createdDate",
+            "updatedAt",
+            "date",
+            "openedDate",
+            "applied_on",
+          ])),
+          permitNumber,
+        };
+      }
+
+      function parseOpenGovPermitResults(payload, searchedAddress) {
+        const normalizedSearch = normalizeAddress(searchedAddress);
+        return collectNestedObjects(payload)
+          .map((candidate) => normalizePermitRecord(candidate, searchedAddress))
+          .filter(Boolean)
+          .filter((record) => {
+            const normalizedRecordAddress = normalizeAddress(record.siteAddress);
+            return !normalizedSearch
+              || !normalizedRecordAddress
+              || normalizedRecordAddress === normalizedSearch
+              || normalizedRecordAddress.includes(normalizedSearch)
+              || normalizedSearch.includes(normalizedRecordAddress);
+          });
+      }
+
+      async function fetchBrowserPermitsForAddress(address) {
+        const seen = new Set();
+        const records = [];
+        let lastError = null;
+
+        for (const variant of buildOpenGovAddressVariants(address)) {
+          const requestUrl = new URL(${JSON.stringify(DANVERS_OPENGOV_SEARCH_URL)});
+          requestUrl.searchParams.set("criteria", "location");
+          requestUrl.searchParams.set("key", variant);
+          requestUrl.searchParams.set("timeStamp", String(Date.now()));
+          requestUrl.searchParams.set("ignoreCommunity", "true");
+
+          try {
+            const response = await fetch(requestUrl.toString(), {
+              method: "GET",
+              mode: "cors",
+              credentials: "omit",
+              headers: {
+                accept: "*/*",
+                sourceapp: "storefront",
+              },
+            });
+
+            const body = await response.text();
+            if (!response.ok) {
+              lastError = "OpenGov returned " + response.status + " for " + variant + ".";
+              continue;
+            }
+
+            const parsed = parseOpenGovPermitResults(JSON.parse(body), address);
+            parsed.forEach((record) => {
+              const key = [
+                normalizeAddress(record.siteAddress),
+                record.permitType,
+                record.issuedDate,
+                record.permitNumber || "",
+              ].join("|");
+
+              if (!seen.has(key)) {
+                seen.add(key);
+                records.push(record);
+              }
+            });
+          } catch (error) {
+            lastError = error instanceof Error ? error.message : "Browser request failed.";
+          }
+        }
+
+        return { records, lastError };
+      }
+
+      async function hydratePermitInsight() {
+        if (!permitInsight || !permitTitle || !permitDetail) {
+          return;
+        }
+
+        permitTitle.textContent = "Checking OpenGov permit history in the browser";
+        permitDetail.textContent = "The page is now trying the live OpenGov address lookups directly from your browser session.";
+
+        const addresses = [...new Set(
+          (initialData.briefs || [])
+            .flatMap((brief) => Array.isArray(brief.addresses) ? brief.addresses : [])
+            .map((value) => String(value || "").trim())
+            .filter(Boolean),
+        )].slice(0, 12);
+
+        if (!addresses.length) {
+          permitTitle.textContent = "No brief-linked addresses are available for permit lookups";
+          permitDetail.textContent = "The live case briefs did not produce any usable site addresses, so there is nothing to search against OpenGov yet.";
+          return;
+        }
+
+        const allRecords = [];
+        let lastError = null;
+        for (const address of addresses) {
+          const result = await fetchBrowserPermitsForAddress(address);
+          allRecords.push(...result.records);
+          if (result.lastError) {
+            lastError = result.lastError;
+          }
+        }
+
+        const uniqueRecords = [];
+        const seen = new Set();
+        allRecords.forEach((record) => {
+          const key = [
+            normalizeAddress(record.siteAddress),
+            record.permitType,
+            record.issuedDate,
+            record.permitNumber || "",
+          ].join("|");
+          if (!seen.has(key)) {
+            seen.add(key);
+            uniqueRecords.push(record);
+          }
+        });
+
+        const commercialRecords = uniqueRecords.filter(isCommercialPermit);
+        const briefAddressSet = new Set(addresses.map((value) => normalizeAddress(value)));
+        const overlapCount = new Set(
+          commercialRecords
+            .map((record) => normalizeAddress(record.siteAddress))
+            .filter((value) => value && briefAddressSet.has(value)),
+        ).size;
+
+        if (permitOverlapValue) {
+          permitOverlapValue.textContent = String(overlapCount);
+        }
+
+        if (uniqueRecords.length) {
+          permitTitle.textContent = commercialRecords.length
+            ? "Permit history is now adding live signal from OpenGov"
+            : "OpenGov returned permit history, but not much commercial signal yet";
+          permitDetail.textContent = commercialRecords.length
+            ? commercialRecords.length + " commercial-facing permit records matched the current browser lookup set across " + overlapCount + " brief-linked addresses."
+            : uniqueRecords.length + " permit records were found from OpenGov in the browser lookup, but they do not yet read as strong commercial reinvestment signals.";
+          return;
+        }
+
+        permitTitle.textContent = "OpenGov browser lookup did not return permit history";
+        permitDetail.textContent = lastError
+          ? "The page attempted direct browser lookups for " + addresses.length + " addresses, but OpenGov still rejected or blocked the requests. Latest result: " + lastError
+          : "The page attempted direct browser lookups for " + addresses.length + " addresses, but no permit history was returned.";
+      }
+
       function applyFilters() {
         const term = searchInput.value.trim().toLowerCase();
         const corridor = corridorFilter.value;
@@ -3669,6 +3999,7 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
       renderRows(initialData.sites);
       renderSignals(initialData.signals);
       renderBriefs(initialData.briefs);
+      hydratePermitInsight();
 
       searchInput.addEventListener("input", applyFilters);
       corridorFilter.addEventListener("change", applyFilters);
