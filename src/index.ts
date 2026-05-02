@@ -19,6 +19,7 @@ type Readiness = "Early" | "Emerging" | "Advancing";
 interface Env {
   OPPORTUNITYDB?: D1Database;
   OPENGOV_TURNSTILE_TOKEN?: string;
+  OPENGOV_API_KEY?: string;
   OPENGOV_CLIENT_ID?: string;
   OPENGOV_KEY?: string;
   OPENGOV_COMMUNITY?: string;
@@ -550,7 +551,7 @@ function buildStatusPayload(env?: Env) {
         queue: Boolean(env?.OPPORTUNITYDB),
         strategicBriefs: Boolean(env?.OPPORTUNITYDB),
         parcelContext: true,
-        openGovPlceCredentials: Boolean(env?.OPENGOV_CLIENT_ID && env?.OPENGOV_KEY),
+        openGovPlceCredentials: Boolean(env?.OPENGOV_API_KEY || (env?.OPENGOV_CLIENT_ID && env?.OPENGOV_KEY)),
       },
     },
   };
@@ -2582,12 +2583,34 @@ async function fetchOpenGovAccessToken(env: Env): Promise<string> {
   return payload.access_token;
 }
 
+function buildOpenGovAuthHeaders(env: Env, bearerToken?: string): HeadersInit {
+  if (env.OPENGOV_API_KEY) {
+    return {
+      Authorization: `Token ${env.OPENGOV_API_KEY}`,
+      Accept: "application/json",
+    };
+  }
+
+  if (bearerToken) {
+    return {
+      Authorization: `Bearer ${bearerToken}`,
+      Accept: "application/json",
+    };
+  }
+
+  throw new OpenGovApiError(
+    503,
+    "OpenGov credentials are not configured.",
+    "Configure OPENGOV_API_KEY or the OAuth pair OPENGOV_CLIENT_ID and OPENGOV_KEY.",
+  );
+}
+
 async function fetchOpenGovPlceJson(
   env: Env,
   path: string,
   searchParams?: Record<string, string>,
 ): Promise<unknown> {
-  const token = await fetchOpenGovAccessToken(env);
+  const bearerToken = env.OPENGOV_API_KEY ? undefined : await fetchOpenGovAccessToken(env);
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
   const url = new URL(`${OPENGOV_PLCE_BASE_URL}/v2/${community}/${path}`);
 
@@ -2598,10 +2621,7 @@ async function fetchOpenGovPlceJson(
   }
 
   const response = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: "application/json",
-    },
+    headers: buildOpenGovAuthHeaders(env, bearerToken),
   });
 
   const body = await response.text();
