@@ -92,6 +92,18 @@ interface OpenGovTokenResponse {
   expires_in?: number;
 }
 
+class OpenGovApiError extends Error {
+  status: number;
+  details: string;
+
+  constructor(status: number, message: string, details = "") {
+    super(message);
+    this.name = "OpenGovApiError";
+    this.status = status;
+    this.details = details;
+  }
+}
+
 interface CaseBrief {
   id: string;
   board: AgendaSignal["board"];
@@ -2538,7 +2550,7 @@ async function fetchParcelContextForAddresses(addresses: string[]): Promise<Parc
 
 async function fetchOpenGovAccessToken(env: Env): Promise<string> {
   if (!env.OPENGOV_CLIENT_ID || !env.OPENGOV_KEY) {
-    throw new Error("OpenGov credentials are not configured.");
+    throw new OpenGovApiError(503, "OpenGov credentials are not configured.");
   }
 
   const response = await fetch(OPENGOV_OAUTH_URL, {
@@ -2555,12 +2567,16 @@ async function fetchOpenGovAccessToken(env: Env): Promise<string> {
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`OpenGov token request failed with ${response.status}: ${body.slice(0, 300)}`);
+    throw new OpenGovApiError(
+      response.status,
+      `OpenGov token request failed with ${response.status}`,
+      body.slice(0, 300),
+    );
   }
 
   const payload = await response.json() as OpenGovTokenResponse;
   if (!payload.access_token) {
-    throw new Error("OpenGov token response did not include an access token.");
+    throw new OpenGovApiError(502, "OpenGov token response did not include an access token.");
   }
 
   return payload.access_token;
@@ -2591,7 +2607,11 @@ async function fetchOpenGovPlceJson(
   const body = await response.text();
 
   if (!response.ok) {
-    throw new Error(`OpenGov PLCE request failed with ${response.status}: ${body.slice(0, 500)}`);
+    throw new OpenGovApiError(
+      response.status,
+      `OpenGov PLCE request failed with ${response.status}`,
+      body.slice(0, 500),
+    );
   }
 
   try {
@@ -2599,6 +2619,36 @@ async function fetchOpenGovPlceJson(
   } catch {
     return { raw: body };
   }
+}
+
+function buildOpenGovErrorResponse(
+  error: unknown,
+  fallbackMessage: string,
+): Response {
+  const isKnownError = error instanceof OpenGovApiError;
+  const status = isKnownError ? error.status : 500;
+  const message = isKnownError ? error.message : fallbackMessage;
+  const details = isKnownError ? error.details : "";
+  const authLikely = status === 401 || status === 403;
+
+  return Response.json(
+    {
+      ok: false,
+      error: message,
+      details: details || undefined,
+      diagnosis: authLikely
+        ? "The Worker reached OpenGov, but the credentials were rejected or do not have access to this API."
+        : status === 503
+          ? "The Worker does not have the required OpenGov credentials configured."
+          : "The Worker reached OpenGov but the request failed before returning a usable payload.",
+      nextStep: authLikely
+        ? "Verify OPENGOV_CLIENT_ID and OPENGOV_KEY with OpenGov and confirm they are enabled for the PLCE API."
+        : status === 503
+          ? "Add OPENGOV_CLIENT_ID and OPENGOV_KEY to the Worker environment and retry."
+          : "Confirm the OpenGov tenant community value and API access scope, then retry.",
+    },
+    { status },
+  );
 }
 
 function buildOpportunityInputs(
@@ -4676,15 +4726,7 @@ export default {
           }),
         );
       } catch (error) {
-        return withSecurityHeaders(
-          Response.json(
-            {
-              ok: false,
-              error: error instanceof Error ? error.message : "OpenGov organization lookup failed.",
-            },
-            { status: 500 },
-          ),
-        );
+        return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov organization lookup failed."));
       }
     }
 
@@ -4700,15 +4742,7 @@ export default {
           }),
         );
       } catch (error) {
-        return withSecurityHeaders(
-          Response.json(
-            {
-              ok: false,
-              error: error instanceof Error ? error.message : "OpenGov record types lookup failed.",
-            },
-            { status: 500 },
-          ),
-        );
+        return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov record types lookup failed."));
       }
     }
 
