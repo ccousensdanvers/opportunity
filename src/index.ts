@@ -2686,7 +2686,7 @@ async function buildOpenGovTestPayload(env: Env) {
       name: "oauth",
       ok: true,
       status: 200,
-      message: "OAuth token request succeeded.",
+      message: "OAuth token request succeeded. The Worker can authenticate to PLCE v2.",
     });
   } catch (error) {
     const known = error instanceof OpenGovApiError ? error : new OpenGovApiError(500, "OAuth test failed.");
@@ -2694,7 +2694,10 @@ async function buildOpenGovTestPayload(env: Env) {
       name: "oauth",
       ok: false,
       status: known.status,
-      message: known.message,
+      message:
+        known.status === 401
+          ? "OAuth credentials were rejected by OpenGov before any community-specific API call was made."
+          : known.message,
       details: known.details || undefined,
     });
 
@@ -3197,7 +3200,7 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Opportunity DEPLOY TEST A</title>
+    <title>Opportunity</title>
     <style nonce="${escapeHtml(nonce)}">
       :root {
         --bg: #edf4fb;
@@ -3302,21 +3305,6 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
 
       .main {
         padding: 28px 26px 40px;
-      }
-
-      .deploy-marker {
-        margin-bottom: 18px;
-        padding: 14px 16px;
-        border-radius: 12px;
-        border: 2px solid #c2410c;
-        background: linear-gradient(180deg, #fff1e6, #ffd9bf);
-        color: #7c2d12;
-      }
-
-      .deploy-marker strong {
-        display: block;
-        font-size: 1rem;
-        margin-bottom: 4px;
       }
 
       .topbar,
@@ -3700,10 +3688,6 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         </div>
       </aside>
       <main class="main">
-        <section class="deploy-marker">
-          <strong>DEPLOYMENT MARKER: OPENAI TEST PANEL BUILD A</strong>
-          <span>If you can see this banner, the homepage is serving the updated index.ts file.</span>
-        </section>
         <header class="topbar">
           <div class="topbar-copy">
             <p class="eyebrow">Staff Dashboard</p>
@@ -3916,10 +3900,13 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         const community = payload && payload.community ? String(payload.community) : "unknown";
         const configured = Boolean(payload && payload.configured);
         const overallOk = Boolean(payload && payload.ok);
+        const oauthCheck = checks.find((check) => check && check.name === "oauth");
 
-        openGovTestSummary.textContent = configured
-          ? ("Community " + community + " · " + (overallOk ? "all configured checks passed" : "one or more checks failed"))
-          : "PLCE v2 OAuth credentials are not configured in the Worker.";
+        openGovTestSummary.textContent = !configured
+          ? "PLCE v2 OAuth credentials are not configured in the Worker."
+          : oauthCheck && oauthCheck.status === 401
+            ? "OAuth credentials were rejected before the Worker reached the community-specific PLCE v2 endpoints. This points to OPENGOV_CLIENT_ID or OPENGOV_KEY, not the community slug."
+            : ("Community " + community + " · " + (overallOk ? "all configured checks passed" : "one or more checks failed"));
 
         openGovTestResults.innerHTML = checks.length
           ? checks.map((check) => {
