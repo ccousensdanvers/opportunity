@@ -2651,6 +2651,97 @@ function buildOpenGovErrorResponse(
   );
 }
 
+async function buildOpenGovTestPayload(env: Env) {
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const configured = Boolean(env.OPENGOV_CLIENT_ID && env.OPENGOV_KEY);
+
+  if (!configured) {
+    return {
+      ok: false,
+      community,
+      configured,
+      checks: [
+        {
+          name: "oauth",
+          ok: false,
+          status: 503,
+          message: "PLCE v2 OAuth credentials are not configured.",
+        },
+      ],
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  const checks: Array<{
+    name: string;
+    ok: boolean;
+    status: number;
+    message: string;
+    details?: string;
+  }> = [];
+
+  try {
+    await fetchOpenGovAccessToken(env);
+    checks.push({
+      name: "oauth",
+      ok: true,
+      status: 200,
+      message: "OAuth token request succeeded.",
+    });
+  } catch (error) {
+    const known = error instanceof OpenGovApiError ? error : new OpenGovApiError(500, "OAuth test failed.");
+    checks.push({
+      name: "oauth",
+      ok: false,
+      status: known.status,
+      message: known.message,
+      details: known.details || undefined,
+    });
+
+    return {
+      ok: false,
+      community,
+      configured,
+      checks,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  for (const target of [
+    { name: "organization", path: "organization" },
+    { name: "record-types", path: "record-types" },
+  ]) {
+    try {
+      await fetchOpenGovPlceJson(env, target.path);
+      checks.push({
+        name: target.name,
+        ok: true,
+        status: 200,
+        message: `${target.name} request succeeded.`,
+      });
+    } catch (error) {
+      const known = error instanceof OpenGovApiError
+        ? error
+        : new OpenGovApiError(500, `${target.name} test failed.`);
+      checks.push({
+        name: target.name,
+        ok: false,
+        status: known.status,
+        message: known.message,
+        details: known.details || undefined,
+      });
+    }
+  }
+
+  return {
+    ok: checks.every((check) => check.ok),
+    community,
+    configured,
+    checks,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
 function buildOpportunityInputs(
   briefs: CaseBrief[],
   parcels: ParcelUpsertInput[],
@@ -3106,7 +3197,7 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Opportunity</title>
+    <title>Opportunity DEPLOY TEST A</title>
     <style nonce="${escapeHtml(nonce)}">
       :root {
         --bg: #edf4fb;
@@ -3211,6 +3302,21 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
 
       .main {
         padding: 28px 26px 40px;
+      }
+
+      .deploy-marker {
+        margin-bottom: 18px;
+        padding: 14px 16px;
+        border-radius: 12px;
+        border: 2px solid #c2410c;
+        background: linear-gradient(180deg, #fff1e6, #ffd9bf);
+        color: #7c2d12;
+      }
+
+      .deploy-marker strong {
+        display: block;
+        font-size: 1rem;
+        margin-bottom: 4px;
       }
 
       .topbar,
@@ -3594,6 +3700,10 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         </div>
       </aside>
       <main class="main">
+        <section class="deploy-marker">
+          <strong>DEPLOYMENT MARKER: OPENAI TEST PANEL BUILD A</strong>
+          <span>If you can see this banner, the homepage is serving the updated index.ts file.</span>
+        </section>
         <header class="topbar">
           <div class="topbar-copy">
             <p class="eyebrow">Staff Dashboard</p>
@@ -3665,6 +3775,24 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
             <ul class="recommendation-list">${strategicRecommendationsMarkup}</ul>
           </section>
 
+          <section class="panel strategic-panel">
+            <div class="panel-head">
+              <div>
+                <p class="eyebrow">OpenGov API Test</p>
+                <h3>PLCE v2 connectivity</h3>
+                <p>Use this panel to check OAuth, organization, and record-type access from the Worker.</p>
+              </div>
+              <button id="opengov-test-button" class="status-pill" type="button" style="border:0; cursor:pointer;">Run test</button>
+            </div>
+            <div id="opengov-test-summary" class="strategic-meta">Waiting to run OpenGov test.</div>
+            <ul id="opengov-test-results" class="recommendation-list">
+              <li class="recommendation-item">
+                <strong>OAuth</strong>
+                <p>No test has been run yet.</p>
+              </li>
+            </ul>
+          </section>
+
           <div class="side-stack">
             <section class="panel">
               <div class="panel-head">
@@ -3710,6 +3838,9 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
       const statusFilter = document.getElementById("status-filter");
       const signalList = document.getElementById("signal-list");
       const briefList = document.getElementById("brief-list");
+      const openGovTestButton = document.getElementById("opengov-test-button");
+      const openGovTestSummary = document.getElementById("opengov-test-summary");
+      const openGovTestResults = document.getElementById("opengov-test-results");
 
       function escapeHtml(value) {
         return value
@@ -3776,6 +3907,57 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         }).join("");
       }
 
+      function renderOpenGovTestResult(payload) {
+        if (!openGovTestSummary || !openGovTestResults) {
+          return;
+        }
+
+        const checks = Array.isArray(payload && payload.checks) ? payload.checks : [];
+        const community = payload && payload.community ? String(payload.community) : "unknown";
+        const configured = Boolean(payload && payload.configured);
+        const overallOk = Boolean(payload && payload.ok);
+
+        openGovTestSummary.textContent = configured
+          ? ("Community " + community + " · " + (overallOk ? "all configured checks passed" : "one or more checks failed"))
+          : "PLCE v2 OAuth credentials are not configured in the Worker.";
+
+        openGovTestResults.innerHTML = checks.length
+          ? checks.map((check) => {
+            const statusLabel = typeof check.status === "number" ? String(check.status) : "n/a";
+            const details = check.details ? '<p>' + escapeHtml(String(check.details)) + '</p>' : "";
+            return '<li class="recommendation-item">' +
+              '<strong>' + escapeHtml(String(check.name || "check")) + ' · ' + escapeHtml(statusLabel) + ' · ' + escapeHtml(check.ok ? "ok" : "failed") + '</strong>' +
+              '<p>' + escapeHtml(String(check.message || "")) + '</p>' +
+              details +
+            '</li>';
+          }).join("")
+          : '<li class="recommendation-item"><strong>No checks returned.</strong><p>The Worker did not return any OpenGov diagnostics.</p></li>';
+      }
+
+      async function runOpenGovTest() {
+        if (!openGovTestSummary || !openGovTestResults) {
+          return;
+        }
+
+        openGovTestSummary.textContent = "Running OpenGov PLCE v2 test through the Worker.";
+        openGovTestResults.innerHTML = '<li class="recommendation-item"><strong>Testing</strong><p>Checking OAuth, organization, and record-types.</p></li>';
+
+        try {
+          const response = await fetch("/api/opengov/test", {
+            headers: {
+              accept: "application/json",
+            },
+          });
+          const payload = await response.json();
+          renderOpenGovTestResult(payload);
+        } catch (error) {
+          openGovTestSummary.textContent = "OpenGov PLCE v2 test failed before the Worker returned a result.";
+          openGovTestResults.innerHTML = '<li class="recommendation-item"><strong>Request failed</strong><p>' +
+            escapeHtml(error instanceof Error ? error.message : "Unknown fetch error") +
+            '</p></li>';
+        }
+      }
+
       function applyFilters() {
         const term = searchInput.value.trim().toLowerCase();
         const corridor = corridorFilter.value;
@@ -3798,10 +3980,14 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
       renderRows(initialData.sites);
       renderSignals(initialData.signals);
       renderBriefs(initialData.briefs);
+      runOpenGovTest();
 
       searchInput.addEventListener("input", applyFilters);
       corridorFilter.addEventListener("change", applyFilters);
       statusFilter.addEventListener("change", applyFilters);
+      if (openGovTestButton) {
+        openGovTestButton.addEventListener("click", runOpenGovTest);
+      }
     </script>
   </body>
 </html>`;
@@ -4414,6 +4600,10 @@ export default {
       } catch (error) {
         return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov record types lookup failed."));
       }
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opengov/test") {
+      return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env)));
     }
 
     if (request.method === "GET" && url.pathname === "/api/debug/signals") {
