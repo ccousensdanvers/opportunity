@@ -19,6 +19,9 @@ type Readiness = "Early" | "Emerging" | "Advancing";
 interface Env {
   OPPORTUNITYDB?: D1Database;
   OPENGOV_TURNSTILE_TOKEN?: string;
+  OPENGOV_CLIENT_ID?: string;
+  OPENGOV_KEY?: string;
+  OPENGOV_COMMUNITY?: string;
 }
 
 interface IngestMessage {
@@ -81,6 +84,12 @@ interface OpenGovPermitAttemptDebug {
   parsedCount: number;
   bodyPreview: string;
   error?: string;
+}
+
+interface OpenGovTokenResponse {
+  access_token?: string;
+  token_type?: string;
+  expires_in?: number;
 }
 
 interface CaseBrief {
@@ -162,6 +171,9 @@ const ZBA_RSS_URL =
 const PROJECTS_PAGE_URL = "https://www.danversma.gov/235/Projects";
 const DANVERS_OPENGOV_SEARCH_URL = "https://api-east.viewpointcloud.com/v2/danversma/search_results";
 const DANVERS_OPENGOV_PORTAL_URL = "https://danversma.portal.opengov.com/search";
+const OPENGOV_OAUTH_URL = "https://accounts.viewpointcloud.com/oauth/token";
+const OPENGOV_PLCE_BASE_URL = "https://api.plce.opengov.com/plce";
+const DEFAULT_OPENGOV_COMMUNITY = "danversma";
 const DANVERS_PARCELS_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
 const DANVERS_ASSESSOR_TABLE_URL =
@@ -526,6 +538,7 @@ function buildStatusPayload(env?: Env) {
         queue: Boolean(env?.OPPORTUNITYDB),
         strategicBriefs: Boolean(env?.OPPORTUNITYDB),
         parcelContext: true,
+        openGovPlceCredentials: Boolean(env?.OPENGOV_CLIENT_ID && env?.OPENGOV_KEY),
       },
     },
   };
@@ -968,46 +981,46 @@ function normalizePermitRecord(
       "full_address",
     ]) ?? searchedAddress;
   const permitType = lookupFirstString(candidate, [
-    "permitType",
-    "type",
-    "recordType",
-    "recordName",
-    "applicationType",
-    "workType",
-    "description",
-    "projectType",
-    "recordTypeName",
-    "category",
-    "subType",
-    "subtype",
-    "displayName",
-  ]);
+      "permitType",
+      "type",
+      "recordType",
+      "recordName",
+      "applicationType",
+      "workType",
+      "description",
+      "projectType",
+      "recordTypeName",
+      "category",
+      "subType",
+      "subtype",
+      "displayName",
+    ]);
   const status = lookupFirstString(candidate, [
-    "status",
-    "permitStatus",
-    "currentStatus",
-    "workflowStatus",
-    "stage",
-    "statusLabel",
-  ]);
+      "status",
+      "permitStatus",
+      "currentStatus",
+      "workflowStatus",
+      "stage",
+      "statusLabel",
+    ]);
   const permitNumber = lookupFirstString(candidate, [
-    "permitNumber",
-    "applicationNumber",
-    "recordNumber",
-    "number",
-    "recordId",
-    "caseNumber",
-    "record_number",
-    "displayId",
-  ]);
+      "permitNumber",
+      "applicationNumber",
+      "recordNumber",
+      "number",
+      "recordId",
+      "caseNumber",
+      "record_number",
+      "displayId",
+    ]);
   const applicantName = lookupFirstString(candidate, [
-    "applicantName",
-    "applicant",
-    "contactName",
-    "ownerName",
-    "name",
-    "applicant_name",
-  ]) ?? "";
+      "applicantName",
+      "applicant",
+      "contactName",
+      "ownerName",
+      "name",
+      "applicant_name",
+    ]) ?? "";
   const detailUrl = resolvePermitDetailUrl(
     lookupFirstString(candidate, [
       "detailUrl",
@@ -2521,6 +2534,71 @@ async function fetchParcelContextForAddresses(addresses: string[]): Promise<Parc
   }
 
   return contexts;
+}
+
+async function fetchOpenGovAccessToken(env: Env): Promise<string> {
+  if (!env.OPENGOV_CLIENT_ID || !env.OPENGOV_KEY) {
+    throw new Error("OpenGov credentials are not configured.");
+  }
+
+  const response = await fetch(OPENGOV_OAUTH_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: env.OPENGOV_CLIENT_ID,
+      client_secret: env.OPENGOV_KEY,
+    }).toString(),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`OpenGov token request failed with ${response.status}: ${body.slice(0, 300)}`);
+  }
+
+  const payload = await response.json() as OpenGovTokenResponse;
+  if (!payload.access_token) {
+    throw new Error("OpenGov token response did not include an access token.");
+  }
+
+  return payload.access_token;
+}
+
+async function fetchOpenGovPlceJson(
+  env: Env,
+  path: string,
+  searchParams?: Record<string, string>,
+): Promise<unknown> {
+  const token = await fetchOpenGovAccessToken(env);
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const url = new URL(`${OPENGOV_PLCE_BASE_URL}/v2/${community}/${path}`);
+
+  if (searchParams) {
+    for (const [key, value] of Object.entries(searchParams)) {
+      url.searchParams.set(key, value);
+    }
+  }
+
+  const response = await fetch(url.toString(), {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/json",
+    },
+  });
+
+  const body = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`OpenGov PLCE request failed with ${response.status}: ${body.slice(0, 500)}`);
+  }
+
+  try {
+    return JSON.parse(body) as unknown;
+  } catch {
+    return { raw: body };
+  }
 }
 
 function buildOpportunityInputs(
@@ -4584,6 +4662,54 @@ export default {
           updatedAt: new Date().toISOString(),
         }),
       );
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opengov/organization") {
+      try {
+        const organization = await fetchOpenGovPlceJson(env, "organization");
+        return withSecurityHeaders(
+          Response.json({
+            ok: true,
+            community: env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY,
+            organization,
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+      } catch (error) {
+        return withSecurityHeaders(
+          Response.json(
+            {
+              ok: false,
+              error: error instanceof Error ? error.message : "OpenGov organization lookup failed.",
+            },
+            { status: 500 },
+          ),
+        );
+      }
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opengov/record-types") {
+      try {
+        const recordTypes = await fetchOpenGovPlceJson(env, "record-types");
+        return withSecurityHeaders(
+          Response.json({
+            ok: true,
+            community: env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY,
+            recordTypes,
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+      } catch (error) {
+        return withSecurityHeaders(
+          Response.json(
+            {
+              ok: false,
+              error: error instanceof Error ? error.message : "OpenGov record types lookup failed.",
+            },
+            { status: 500 },
+          ),
+        );
+      }
     }
 
     if (request.method === "GET" && url.pathname === "/api/debug/signals") {
