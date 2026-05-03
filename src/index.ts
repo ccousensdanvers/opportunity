@@ -1421,17 +1421,28 @@ async function upsertOpenGovRecordTypes(db: D1Database, env: Env, recordTypes: O
   return unique.length;
 }
 
-async function ingestOpenGovRecordTypes(db: D1Database, env: Env): Promise<{ fetched: number; stored: number; sample: Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: boolean | null }> }> {
-  const payload = await fetchOpenGovPlceJson(env, "record-types", { "page[size]": "100" }) as { data?: unknown[] };
-  const items = Array.isArray(payload) ? payload : (Array.isArray(payload?.data) ? payload.data : []);
+async function ingestOpenGovRecordTypes(db: D1Database, env: Env): Promise<{ fetched: number; stored: number; pathUsed: "record-types" | "record-types?page[size]=100"; sample: Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: boolean | null }> }> {
+  let payload: unknown;
+  let pathUsed: "record-types" | "record-types?page[size]=100" = "record-types";
+  try {
+    payload = await fetchOpenGovPlceJson(env, "record-types");
+  } catch {
+    payload = await fetchOpenGovPlceJson(env, "record-types", { "page[size]": "100" });
+    pathUsed = "record-types?page[size]=100";
+  }
+  const payloadObject = payload && typeof payload === "object" ? payload as { data?: unknown[] } : null;
+  const items: unknown[] = Array.isArray(payload)
+    ? payload
+    : (Array.isArray(payloadObject?.data) ? payloadObject.data : []);
   const normalized = items
-    .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object")
-    .map((value) => normalizeOpenGovRecordType(value))
-    .filter((value): value is OpenGovRecordTypeRecord & { id: string } => Boolean(value.id));
+    .filter((value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object")
+    .map((value: Record<string, unknown>) => normalizeOpenGovRecordType(value))
+    .filter((value: OpenGovRecordTypeRecord): value is OpenGovRecordTypeRecord & { id: string } => Boolean(value.id));
   const stored = await upsertOpenGovRecordTypes(db, env, normalized);
   return {
     fetched: items.length,
     stored,
+    pathUsed,
     sample: normalized.slice(0, 8).map((value) => ({ id: value.id, name: value.name, slug: value.slug, category: value.category, module: value.module, active: value.active })),
   };
 }
@@ -1923,7 +1934,10 @@ async function buildOpenGovPermitsTestPayload(env: Env, db?: D1Database) {
   const recordTypeGuesses = ["building-permit", "electrical-permit", "plumbing-permit", "sign-permit"];
   let recordTypesFetched = 0;
   let recordTypesStored = 0;
+  let recordTypesPathUsed: "record-types" | "record-types?page[size]=100" | null = null;
+  let recordTypesStorageError: string | null = null;
   let recordTypesSample: Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: boolean | null }> = [];
+  let recordTypesStoredSampleFromDb: Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: number | null; sourceUpdatedAt: string | null; updatedAt: string }> = [];
   const checks: OpenGovPlceProbeResult[] = [];
   const recordTypesLiveIds: string[] = [];
 
@@ -1958,10 +1972,14 @@ async function buildOpenGovPermitsTestPayload(env: Env, db?: D1Database) {
       const ingest = await ingestOpenGovRecordTypes(db, env);
       recordTypesFetched = ingest.fetched;
       recordTypesStored = ingest.stored;
+      recordTypesPathUsed = ingest.pathUsed;
       recordTypesSample = ingest.sample;
-    } catch {
-      // non-fatal for diagnostics
+      recordTypesStoredSampleFromDb = await listStoredOpenGovRecordTypes(db, 8);
+    } catch (error) {
+      recordTypesStorageError = error instanceof Error ? error.message : String(error);
     }
+  } else {
+    recordTypesStorageError = "No D1 database was passed to buildOpenGovPermitsTestPayload.";
   }
 
   checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5" }));
@@ -1983,7 +2001,10 @@ async function buildOpenGovPermitsTestPayload(env: Env, db?: D1Database) {
     recordTypeIdsFromApi: recordTypesLiveIds.slice(0, 10),
     recordTypesFetched,
     recordTypesStored,
+    recordTypesPathUsed,
     recordTypesSample,
+    recordTypesStoredSampleFromDb,
+    recordTypesStorageError,
     experimentalRecordQueryProbes: true,
     checks,
     updatedAt: new Date().toISOString(),
@@ -4544,12 +4565,22 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         const community = payload && payload.community ? String(payload.community) : "unknown";
         const configured = Boolean(payload && payload.configured);
         const overallOk = Boolean(payload && payload.ok);
+        const storageError = payload && payload.recordTypesStorageError ? String(payload.recordTypesStorageError) : "";
+        const recordTypesPathUsed = payload && payload.recordTypesPathUsed ? String(payload.recordTypesPathUsed) : "";
 
         openGovTestSummary.textContent = !configured
           ? "PLCE v2 API key is not configured in the Worker."
           : ("Community " + community + " · " + (overallOk ? "all configured checks passed" : "one or more checks failed"));
 
-        openGovTestResults.innerHTML = checks.length
+        const storageNotes = [];
+        if (recordTypesPathUsed) {
+          storageNotes.push('<li class="recommendation-item"><strong>record-types ingest path</strong><p>' + escapeHtml(recordTypesPathUsed) + '</p></li>');
+        }
+        if (storageError) {
+          storageNotes.push('<li class="recommendation-item"><strong>Record type storage error</strong><p>' + escapeHtml(storageError) + '</p></li>');
+        }
+
+        openGovTestResults.innerHTML = (storageNotes.join("") + (checks.length
           ? checks.map((check) => {
             const statusLabel = typeof check.status === "number" ? String(check.status) : "n/a";
             const pathLabel = check.path ? '<p><strong>request:</strong> ' + escapeHtml(String(check.path)) + '</p>' : "";
@@ -4561,7 +4592,7 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
               details +
             '</li>';
           }).join("")
-          : '<li class="recommendation-item"><strong>No checks returned.</strong><p>The Worker did not return any OpenGov diagnostics.</p></li>';
+          : '<li class="recommendation-item"><strong>No checks returned.</strong><p>The Worker did not return any OpenGov diagnostics.</p></li>'));
       }
 
       async function runOpenGovTest() {
@@ -5229,6 +5260,7 @@ export default {
             community: env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY,
             recordTypesFetched: ingest.fetched,
             recordTypesStored: ingest.stored,
+            recordTypesPathUsed: ingest.pathUsed,
             recordTypesSample: ingest.sample,
             storedCount: stored.length,
             storedRecordTypes: stored,
@@ -5286,6 +5318,9 @@ export default {
     if (request.method === "GET" && url.pathname === "/api/opengov/permits-test") {
       const address = url.searchParams.get("address")?.trim() ?? "";
       try {
+        if (!env.OPPORTUNITYDB) {
+          return withSecurityHeaders(missingDatabaseResponse());
+        }
         return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env, address)));
       } catch (error) {
         return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov permits-test lookup failed."));
