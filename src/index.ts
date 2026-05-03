@@ -1117,6 +1117,19 @@ interface OpenGovPlceProbeResult {
   error?: string;
 }
 
+interface OpenGovRecordTypeRecord {
+  id: string | null;
+  type: string | null;
+  name: string | null;
+  description: string | null;
+  slug: string | null;
+  category: string | null;
+  module: string | null;
+  active: boolean | null;
+  sourceUpdatedAt: string | null;
+  rawJson: Record<string, unknown>;
+}
+
 interface OpenGovLocationRecord {
   id: string | null;
   type: string | null;
@@ -1321,6 +1334,114 @@ export function normalizeOpenGovLocation(candidate: Record<string, unknown>): Op
     archived: readBoolean("archived", "isArchived", "is_archived"),
     sourceUpdatedAt: readString("updatedAt", "updated_at", "modifiedAt", "modified_at", "lastModified", "last_modified"),
   };
+}
+
+export function normalizeOpenGovRecordType(candidate: Record<string, unknown>): OpenGovRecordTypeRecord {
+  const attributes = (
+    candidate.attributes && typeof candidate.attributes === "object"
+      ? candidate.attributes
+      : {}
+  ) as Record<string, unknown>;
+  const sourceObjects = collectNestedObjects(candidate);
+  if (!sourceObjects.includes(attributes)) sourceObjects.unshift(attributes);
+  const sourceEntries = sourceObjects.map((obj) => ({
+    exact: obj,
+    normalized: new Map(Object.entries(obj).map(([key, value]) => [normalizeLookupKey(key), value])),
+  }));
+  const readValue = (...keys: string[]): unknown => {
+    for (const key of keys) {
+      const normalizedKey = normalizeLookupKey(key);
+      for (const source of sourceEntries) {
+        if (Object.prototype.hasOwnProperty.call(source.exact, key)) return source.exact[key];
+        if (source.normalized.has(normalizedKey)) return source.normalized.get(normalizedKey);
+      }
+    }
+    return null;
+  };
+  const readString = (...keys: string[]): string | null => coerceOptionalString(readValue(...keys));
+  const readBoolean = (...keys: string[]): boolean | null => coerceOptionalBoolean(readValue(...keys));
+
+  const rootId = coerceOptionalString(candidate.id);
+  const fallbackId = readString("recordTypeId", "record_type_id", "typeId", "type_id", "id");
+  const activeValue = readBoolean("active", "enabled", "isActive", "is_active");
+  const archivedValue = readBoolean("archived", "isArchived", "is_archived");
+
+  return {
+    id: rootId ?? fallbackId,
+    type: coerceOptionalString(candidate.type),
+    name: readString("name", "displayName", "display_name", "label", "title"),
+    description: readString("description", "desc", "helpText", "help_text"),
+    slug: readString("slug", "key", "code", "recordType", "record_type"),
+    category: readString("category", "group", "department", "classification"),
+    module: readString("module", "moduleName", "module_name", "product", "area"),
+    active: activeValue ?? (archivedValue === null ? null : !archivedValue),
+    sourceUpdatedAt: readString("updatedAt", "updated_at", "modifiedAt", "modified_at", "lastModified", "last_modified"),
+    rawJson: candidate,
+  };
+}
+
+async function upsertOpenGovRecordTypes(db: D1Database, env: Env, recordTypes: OpenGovRecordTypeRecord[]): Promise<number> {
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const now = new Date().toISOString();
+  const unique = Array.from(new Map(recordTypes.filter((r) => Boolean(r.id)).map((r) => [r.id as string, r])).values());
+  try {
+    for (const recordType of unique) {
+      await db.prepare(`INSERT INTO opengov_record_types (
+          id, source_community, type, name, description, slug, category, module, active, raw_json, source_updated_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id, source_community) DO UPDATE SET
+          type = excluded.type,
+          name = excluded.name,
+          description = excluded.description,
+          slug = excluded.slug,
+          category = excluded.category,
+          module = excluded.module,
+          active = excluded.active,
+          raw_json = excluded.raw_json,
+          source_updated_at = excluded.source_updated_at,
+          updated_at = excluded.updated_at`)
+        .bind(
+          recordType.id,
+          community,
+          recordType.type,
+          recordType.name,
+          recordType.description,
+          recordType.slug,
+          recordType.category,
+          recordType.module,
+          recordType.active === null ? null : (recordType.active ? 1 : 0),
+          JSON.stringify(recordType.rawJson),
+          recordType.sourceUpdatedAt,
+          now,
+        ).run();
+    }
+  } catch (error) {
+    throw new Error(`Failed to upsert OpenGov record types. Confirm migration 0007 is applied. ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return unique.length;
+}
+
+async function ingestOpenGovRecordTypes(db: D1Database, env: Env): Promise<{ fetched: number; stored: number; sample: Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: boolean | null }> }> {
+  const payload = await fetchOpenGovPlceJson(env, "record-types", { "page[size]": "100" }) as { data?: unknown[] };
+  const items = Array.isArray(payload) ? payload : (Array.isArray(payload?.data) ? payload.data : []);
+  const normalized = items
+    .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object")
+    .map((value) => normalizeOpenGovRecordType(value))
+    .filter((value): value is OpenGovRecordTypeRecord & { id: string } => Boolean(value.id));
+  const stored = await upsertOpenGovRecordTypes(db, env, normalized);
+  return {
+    fetched: items.length,
+    stored,
+    sample: normalized.slice(0, 8).map((value) => ({ id: value.id, name: value.name, slug: value.slug, category: value.category, module: value.module, active: value.active })),
+  };
+}
+
+async function listStoredOpenGovRecordTypes(db: D1Database, limit = 200): Promise<Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: number | null; sourceUpdatedAt: string | null; updatedAt: string }>> {
+  const rows = await db.prepare(`SELECT id, name, slug, category, module, active, source_updated_at AS sourceUpdatedAt, updated_at AS updatedAt
+      FROM opengov_record_types
+      ORDER BY COALESCE(name, ''), COALESCE(category, ''), id
+      LIMIT ?`).bind(limit).all();
+  return (rows.results ?? []) as Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: number | null; sourceUpdatedAt: string | null; updatedAt: string }>;
 }
 
 function scoreLocationMatch(input: ParsedAddressParts, location: OpenGovLocationRecord): number {
@@ -1797,9 +1918,12 @@ async function buildPermitDebugPayload(env?: Env, limit = 8) {
   };
 }
 
-async function buildOpenGovPermitsTestPayload(env: Env) {
+async function buildOpenGovPermitsTestPayload(env: Env, db?: D1Database) {
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
   const recordTypeGuesses = ["building-permit", "electrical-permit", "plumbing-permit", "sign-permit"];
+  let recordTypesFetched = 0;
+  let recordTypesStored = 0;
+  let recordTypesSample: Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: boolean | null }> = [];
   const checks: OpenGovPlceProbeResult[] = [];
   const recordTypesLiveIds: string[] = [];
 
@@ -1814,6 +1938,7 @@ async function buildOpenGovPermitsTestPayload(env: Env) {
         : Array.isArray((recordTypesPayload as { data?: unknown[] })?.data)
           ? (recordTypesPayload as { data?: unknown[] }).data ?? []
           : [];
+      recordTypesFetched = rootItems.length;
       for (const item of rootItems) {
         if (!item || typeof item !== "object") continue;
         const candidate = item as Record<string, unknown>;
@@ -1825,6 +1950,17 @@ async function buildOpenGovPermitsTestPayload(env: Env) {
       }
     } catch {
       // keep guessed tests even if detailed record-type parsing fails
+    }
+  }
+
+  if (db) {
+    try {
+      const ingest = await ingestOpenGovRecordTypes(db, env);
+      recordTypesFetched = ingest.fetched;
+      recordTypesStored = ingest.stored;
+      recordTypesSample = ingest.sample;
+    } catch {
+      // non-fatal for diagnostics
     }
   }
 
@@ -1845,6 +1981,10 @@ async function buildOpenGovPermitsTestPayload(env: Env) {
     community,
     recordTypesTested: recordTypeGuesses,
     recordTypeIdsFromApi: recordTypesLiveIds.slice(0, 10),
+    recordTypesFetched,
+    recordTypesStored,
+    recordTypesSample,
+    experimentalRecordQueryProbes: true,
     checks,
     updatedAt: new Date().toISOString(),
   };
@@ -3192,7 +3332,7 @@ function buildOpenGovErrorResponse(
 async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
   const defaultAddress = "10 Damon Street";
   const address = normalizeWhitespace(requestedAddress ?? "") || defaultAddress;
-  const base = await buildOpenGovPermitsTestPayload(env);
+  const base = await buildOpenGovPermitsTestPayload(env, env.OPPORTUNITYDB);
   let locationFetchError: { message: string; details?: string } | null = null;
   let matched: OpenGovLocationMatchResult = {
     input: parseAddressParts(address),
@@ -5078,12 +5218,20 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/api/opengov/record-types") {
       try {
-        const recordTypes = await fetchOpenGovPlceJson(env, "record-types");
+        if (!env.OPPORTUNITYDB) {
+          return withSecurityHeaders(Response.json({ ok: false, error: "OPPORTUNITYDB binding is not configured." }, { status: 503 }));
+        }
+        const ingest = await ingestOpenGovRecordTypes(env.OPPORTUNITYDB, env);
+        const stored = await listStoredOpenGovRecordTypes(env.OPPORTUNITYDB, 250);
         return withSecurityHeaders(
           Response.json({
             ok: true,
             community: env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY,
-            recordTypes,
+            recordTypesFetched: ingest.fetched,
+            recordTypesStored: ingest.stored,
+            recordTypesSample: ingest.sample,
+            storedCount: stored.length,
+            storedRecordTypes: stored,
             updatedAt: new Date().toISOString(),
           }),
         );
