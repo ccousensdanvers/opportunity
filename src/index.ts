@@ -1237,56 +1237,91 @@ function parseAddressParts(address: string): ParsedAddressParts {
   };
 }
 
-function normalizeOpenGovLocation(candidate: Record<string, unknown>): OpenGovLocationRecord {
+function normalizeLookupKey(key: string): string {
+  return key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function collectNestedObjects(root: unknown): Record<string, unknown>[] {
+  const queue: unknown[] = [root];
+  const seen = new Set<Record<string, unknown>>();
+  const collected: Record<string, unknown>[] = [];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!isPlainObject(current) || seen.has(current)) continue;
+    seen.add(current);
+    collected.push(current);
+    for (const value of Object.values(current)) {
+      if (isPlainObject(value)) queue.push(value);
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          if (isPlainObject(entry)) queue.push(entry);
+        }
+      }
+    }
+  }
+  return collected;
+}
+
+export function normalizeOpenGovLocation(candidate: Record<string, unknown>): OpenGovLocationRecord {
   const attributes = (
     candidate.attributes && typeof candidate.attributes === "object"
       ? candidate.attributes
       : {}
   ) as Record<string, unknown>;
-  const readString = (...keys: string[]): string | null => {
+  const sourceObjects = collectNestedObjects(candidate);
+  if (!sourceObjects.includes(attributes)) {
+    sourceObjects.unshift(attributes);
+  }
+  const sourceEntries = sourceObjects.map((obj) => ({
+    exact: obj,
+    normalized: new Map(Object.entries(obj).map(([key, value]) => [normalizeLookupKey(key), value])),
+  }));
+  const readValue = (...keys: string[]): unknown => {
     for (const key of keys) {
-      const value = coerceOptionalString(attributes[key]);
-      if (value !== null) return value;
+      const normalizedKey = normalizeLookupKey(key);
+      for (const source of sourceEntries) {
+        if (Object.prototype.hasOwnProperty.call(source.exact, key)) return source.exact[key];
+        if (source.normalized.has(normalizedKey)) return source.normalized.get(normalizedKey);
+      }
     }
     return null;
+  };
+  const readString = (...keys: string[]): string | null => {
+    return coerceOptionalString(readValue(...keys));
   };
   const readNumber = (...keys: string[]): number | null => {
-    for (const key of keys) {
-      const value = coerceOptionalNumber(attributes[key]);
-      if (value !== null) return value;
-    }
-    return null;
+    return coerceOptionalNumber(readValue(...keys));
   };
   const readBoolean = (...keys: string[]): boolean | null => {
-    for (const key of keys) {
-      const value = coerceOptionalBoolean(attributes[key]);
-      if (value !== null) return value;
-    }
-    return null;
+    return coerceOptionalBoolean(readValue(...keys));
   };
 
   return {
     id: coerceOptionalString(candidate.id),
-    type: coerceOptionalString(candidate.type),
-    name: readString("name"),
-    latitude: readNumber("latitude"),
-    longitude: readNumber("longitude"),
-    locationType: readString("locationType", "location_type"),
-    ownerName: readString("ownerName", "owner_name"),
-    ownerStreetNumber: readString("ownerStreetNumber", "owner_street_number"),
-    ownerStreetName: readString("ownerStreetName", "owner_street_name"),
-    ownerUnit: readString("ownerUnit", "owner_unit"),
+    type: coerceOptionalString(candidate.type) ?? readString("locationType", "location_type", "kind"),
+    name: readString("name", "displayName", "display_name", "label", "fullAddress", "full_address", "formattedAddress", "formatted_address"),
+    latitude: readNumber("latitude", "lat", "y"),
+    longitude: readNumber("longitude", "lng", "lon", "long", "x"),
+    locationType: readString("locationType", "location_type", "location kind", "kind", "type"),
+    ownerName: readString("ownerName", "owner_name", "propertyOwner", "property_owner", "owner"),
+    ownerStreetNumber: readString("ownerStreetNumber", "owner_street_number", "ownerAddressNumber", "owner_address_number"),
+    ownerStreetName: readString("ownerStreetName", "owner_street_name", "ownerStreet", "owner_street", "ownerAddress1", "owner_address_1", "ownerAddressLine1", "owner_address_line_1"),
+    ownerUnit: readString("ownerUnit", "owner_unit", "ownerAddress2", "owner_address_2", "ownerAddressLine2", "owner_address_line_2"),
     ownerCity: readString("ownerCity", "owner_city"),
     ownerState: readString("ownerState", "owner_state"),
-    ownerPostalCode: readString("ownerPostalCode", "owner_postal_code"),
+    ownerPostalCode: readString("ownerPostalCode", "owner_postal_code", "ownerZip", "owner_zip", "ownerZipCode", "owner_zip_code"),
     ownerCountry: readString("ownerCountry", "owner_country"),
     ownerEmail: readString("ownerEmail", "owner_email"),
-    streetNo: readString("streetNo", "street_no"),
-    streetName: readString("streetName", "street_name"),
-    unit: readString("unit"),
-    city: readString("city"),
-    state: readString("state"),
-    postalCode: readString("postalCode", "postal_code"),
+    streetNo: readString("streetNo", "street_no", "streetNumber", "street_number", "addressNumber", "address_number", "houseNumber", "house_number", "number"),
+    streetName: readString("streetName", "street_name", "street", "streetAddress", "street_address", "addressStreet", "address_street", "roadName", "road_name", "address1", "address_1", "line1", "addressLine1", "address_line_1"),
+    unit: readString("unit", "suite", "apartment", "apt", "address2", "address_2", "line2", "addressLine2", "address_line_2"),
+    city: readString("city", "municipality", "town", "locality"),
+    state: readString("state", "province", "region"),
+    postalCode: readString("postalCode", "postal_code", "zip", "zipcode", "zipCode", "zip_code"),
     country: readString("country"),
     secondaryLatitude: readNumber("secondaryLatitude", "secondary_latitude"),
     secondaryLongitude: readNumber("secondaryLongitude", "secondary_longitude"),
@@ -1294,22 +1329,22 @@ function normalizeOpenGovLocation(candidate: Record<string, unknown>): OpenGovLo
     segmentSecondaryLabel: readString("segmentSecondaryLabel", "segment_secondary_label"),
     segmentLabel: readString("segmentLabel", "segment_label"),
     segmentLength: readNumber("segmentLength", "segment_length"),
-    ownerPhoneNo: readString("ownerPhoneNo", "owner_phone_no"),
-    lotArea: readNumber("lotArea", "lot_area"),
-    gisID: readString("gisID", "gis_id"),
-    mbl: readString("mbl"),
-    matID: readString("matID", "mat_id"),
+    ownerPhoneNo: readString("ownerPhoneNo", "owner_phone_no", "ownerPhone", "owner_phone", "phone", "phoneNumber", "phone_number"),
+    lotArea: readNumber("lotArea", "lot_area", "lotSize", "lot_size", "parcelArea", "parcel_area"),
+    gisID: readString("gisID", "gis_id", "gisId", "parcelId", "parcel_id", "parcelID", "parcel_number", "parcelNumber"),
+    mbl: readString("mbl", "mapBlockLot", "map_block_lot", "mapLot", "map_lot"),
+    matID: readString("matID", "mat_id", "matId"),
     occupancyType: readString("occupancyType", "occupancy_type"),
-    propertyUse: readString("propertyUse", "property_use"),
-    sewage: readString("sewage"),
+    propertyUse: readString("propertyUse", "property_use", "use", "landUse", "land_use"),
+    sewage: readString("sewage", "sewer"),
     water: readString("water"),
     yearBuilt: readNumber("yearBuilt", "year_built"),
-    zoning: readString("zoning"),
+    zoning: readString("zoning", "zone", "zoningDistrict", "zoning_district"),
     buildingType: readString("buildingType", "building_type"),
-    notes: readString("notes"),
+    notes: readString("notes", "description", "comments"),
     subdivision: readString("subdivision"),
-    archived: readBoolean("archived"),
-    sourceUpdatedAt: readString("updatedAt", "updated_at"),
+    archived: readBoolean("archived", "isArchived", "is_archived"),
+    sourceUpdatedAt: readString("updatedAt", "updated_at", "modifiedAt", "modified_at", "lastModified", "last_modified"),
   };
 }
 
@@ -1379,6 +1414,39 @@ async function fetchOpenGovLocations(env: Env, maxPages = 1): Promise<{ path: st
     }
   }
   return { path: paths.join(", "), records: allRecords };
+}
+
+async function fetchOpenGovLocationNormalizationProbe(env: Env): Promise<{
+  pathQueried: string;
+  sample: Array<{
+    raw: Record<string, unknown>;
+    normalized: OpenGovLocationRecord;
+    nonNullFields: string[];
+    nullFields: string[];
+  }>;
+}> {
+  const pageNumber = 1;
+  const pageSize = 3;
+  const payload = await fetchOpenGovPlceJson(env, "locations", {
+    "page[number]": String(pageNumber),
+    "page[size]": String(pageSize),
+  }) as { data?: unknown[] };
+  const rawRecords = (Array.isArray(payload?.data) ? payload.data : [])
+    .filter((value): value is Record<string, unknown> => isPlainObject(value));
+  const sample = rawRecords.map((raw) => {
+    const normalized = normalizeOpenGovLocation(raw);
+    const entries = Object.entries(normalized);
+    return {
+      raw,
+      normalized,
+      nonNullFields: entries.filter(([, value]) => value !== null).map(([key]) => key),
+      nullFields: entries.filter(([, value]) => value === null).map(([key]) => key),
+    };
+  });
+  return {
+    pathQueried: `locations?page[number]=${pageNumber}&page[size]=${pageSize}`,
+    sample,
+  };
 }
 
 async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenGovLocationRecord[]): Promise<number> {
@@ -5073,6 +5141,22 @@ export default {
         );
       } catch (error) {
         return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov locations lookup failed."));
+      }
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opengov/locations-probe") {
+      try {
+        const probe = await fetchOpenGovLocationNormalizationProbe(env);
+        return withSecurityHeaders(
+          Response.json({
+            ok: true,
+            community: env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY,
+            ...probe,
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+      } catch (error) {
+        return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov location normalization probe failed."));
       }
     }
 
