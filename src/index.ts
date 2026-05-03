@@ -20,6 +20,7 @@ interface Env {
   OPPORTUNITYDB?: D1Database;
   OPENGOV_KEY?: string;
   OPENGOV_COMMUNITY?: string;
+  OPENGOV_RECORDS_ENABLED?: string;
 }
 
 interface IngestMessage {
@@ -1492,35 +1493,70 @@ async function fetchOpenGovLocationsPage(
   env: Env,
   pageNumber = 1,
   pageSize = 100,
-): Promise<{ path: string; records: OpenGovLocationRecord[]; hasNextPage: boolean }> {
+): Promise<{ path: string; records: OpenGovLocationRecord[]; hasNextPage: boolean; nextPath: string | null; page: number; totalPages: number | null; totalRecords: number | null }> {
   const safePageSize = Math.max(1, Math.min(100, Math.trunc(pageSize)));
   const safePageNumber = Math.max(1, Math.trunc(pageNumber));
   const path = `locations?page[number]=${safePageNumber}&page[size]=${safePageSize}`;
   const payload = await fetchOpenGovPlceJson(env, "locations", {
     "page[number]": String(safePageNumber),
     "page[size]": String(safePageSize),
-  }) as { data?: unknown[]; links?: { next?: unknown } };
+  }) as { data?: unknown[]; links?: { next?: unknown }; meta?: { page?: unknown; totalPages?: unknown; totalRecords?: unknown } };
   const data = Array.isArray(payload?.data) ? payload.data : [];
   const records = data
     .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object")
     .map((value) => normalizeOpenGovLocation(value));
   const hasNextPage = Boolean(payload?.links && typeof payload.links === "object" && payload.links.next);
-  return { path, records, hasNextPage };
+  const nextPath = typeof payload?.links?.next === "string"
+    ? (() => {
+      try {
+        const parsed = new URL(payload.links.next);
+        return `${parsed.pathname.split("/").slice(-1)[0]}${parsed.search}`;
+      } catch {
+        return null;
+      }
+    })()
+    : null;
+  return {
+    path,
+    records,
+    hasNextPage,
+    nextPath,
+    page: Number(payload?.meta?.page ?? safePageNumber),
+    totalPages: coerceOptionalNumber(payload?.meta?.totalPages) ?? null,
+    totalRecords: coerceOptionalNumber(payload?.meta?.totalRecords) ?? null,
+  };
 }
 
-async function fetchOpenGovLocations(env: Env, maxPages = 1): Promise<{ path: string; records: OpenGovLocationRecord[] }> {
-  const cappedPages = Math.max(1, Math.min(20, Math.trunc(maxPages)));
+async function fetchOpenGovLocations(env: Env, maxPages = 1000): Promise<{ path: string; records: OpenGovLocationRecord[]; fetched: number; normalized: number; pagesFetched: number; totalPages: number | null; totalRecords: number | null }> {
+  const cappedPages = Math.max(1, Math.min(1000, Math.trunc(maxPages)));
   const allRecords: OpenGovLocationRecord[] = [];
   const paths: string[] = [];
+  let totalPages: number | null = null;
+  let totalRecords: number | null = null;
   for (let page = 1; page <= cappedPages; page += 1) {
     const result = await fetchOpenGovLocationsPage(env, page, 100);
     paths.push(result.path);
     allRecords.push(...result.records);
-    if (!result.hasNextPage || result.records.length < 100) {
+    if (result.totalPages !== null) totalPages = result.totalPages;
+    if (result.totalRecords !== null) totalRecords = result.totalRecords;
+    if (!result.hasNextPage || (result.totalPages !== null && result.page >= result.totalPages)) {
       break;
     }
   }
-  return { path: paths.join(", "), records: allRecords };
+  return {
+    path: paths.join(", "),
+    records: allRecords,
+    fetched: allRecords.length,
+    normalized: allRecords.length,
+    pagesFetched: paths.length,
+    totalPages,
+    totalRecords,
+  };
+}
+
+function recordsEnabled(env: Env): boolean {
+  const value = env.OPENGOV_RECORDS_ENABLED?.trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
 }
 
 async function fetchOpenGovLocationNormalizationProbe(env: Env): Promise<{
@@ -1748,16 +1784,31 @@ async function ingestOpenGovLocationsAndPermitsForBriefs(db: D1Database, env: En
   const addresses = Array.from(new Set(briefs.flatMap((brief) => brief.addresses).map((value) => normalizeWhitespace(value)).filter(Boolean)));
   if (!addresses.length) return { locationsStored: 0, permitsStored: 0, addressesMatched: 0 };
 
-  const locationFetch = await fetchOpenGovLocations(env, 5);
+  const locationFetch = await fetchOpenGovLocations(env);
   const locationsStored = await upsertOpenGovLocations(db, env, locationFetch.records);
   let permitsStored = 0;
   let addressesMatched = 0;
+  const threshold = 260;
+
+  for (const brief of briefs) {
+    for (const address of brief.addresses) {
+      const match = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
+      const score = match.bestMatch ? scoreLocationMatch(match.input, match.bestMatch) : 0;
+      if (!match.bestMatch?.id || score < threshold) continue;
+      addressesMatched += 1;
+      await upsertOpenGovLocationMatch(db, brief, address, match.bestMatch, score, "address + parcel/location similarity");
+    }
+  }
+
+  // TODO: OpenGov PLCE records access/filters not available under current API scope. Awaiting supported listRecords parameters for filtering by location ID.
+  if (!recordsEnabled(env)) {
+    return { locationsStored, permitsStored, addressesMatched };
+  }
 
   for (const address of addresses) {
     const match = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
     const locationId = match.bestMatch?.id;
     if (!locationId) continue;
-    addressesMatched += 1;
     try {
       const payload = await fetchOpenGovPlceJson(env, "records", { "filter[locationID]": locationId, "page[size]": "25" });
       const records = parseOpenGovPermitResults(payload, address);
@@ -1768,6 +1819,67 @@ async function ingestOpenGovLocationsAndPermitsForBriefs(db: D1Database, env: En
   }
 
   return { locationsStored, permitsStored, addressesMatched };
+}
+
+async function upsertOpenGovLocationMatch(
+  db: D1Database,
+  brief: CaseBrief,
+  discoveredAddress: string,
+  location: OpenGovLocationRecord,
+  matchScore: number,
+  matchReason: string,
+): Promise<void> {
+  const normalizedAddress = normalizeAddress(discoveredAddress);
+  const rowId = `${slugify(brief.board)}|${brief.id}|${normalizedAddress}|${location.id ?? ""}`;
+  const now = new Date().toISOString();
+  await db.prepare(`INSERT INTO opengov_location_matches (
+      id, source_kind, source_id, source_title, discovered_address, normalized_address, location_id, match_score, match_reason,
+      location_type, street_no, street_name, city, state, postal_code, mbl, mat_id, gis_id, owner_name, latitude, longitude, source_updated_at, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      source_title = excluded.source_title,
+      match_score = excluded.match_score,
+      match_reason = excluded.match_reason,
+      location_type = excluded.location_type,
+      street_no = excluded.street_no,
+      street_name = excluded.street_name,
+      city = excluded.city,
+      state = excluded.state,
+      postal_code = excluded.postal_code,
+      mbl = excluded.mbl,
+      mat_id = excluded.mat_id,
+      gis_id = excluded.gis_id,
+      owner_name = excluded.owner_name,
+      latitude = excluded.latitude,
+      longitude = excluded.longitude,
+      source_updated_at = excluded.source_updated_at,
+      updated_at = excluded.updated_at`)
+    .bind(
+      rowId,
+      brief.source,
+      brief.id,
+      brief.title,
+      discoveredAddress,
+      normalizedAddress,
+      location.id,
+      Math.round(matchScore),
+      matchReason,
+      location.locationType,
+      location.streetNo,
+      location.streetName,
+      location.city,
+      location.state,
+      location.postalCode,
+      location.mbl,
+      location.matID,
+      location.gisID,
+      location.ownerName,
+      location.latitude,
+      location.longitude,
+      location.sourceUpdatedAt,
+      now,
+      now,
+    ).run();
 }
 
 async function listStoredPermitRecords(db: D1Database, limit = 50): Promise<PermitRecord[]> {
@@ -1931,7 +2043,8 @@ async function buildPermitDebugPayload(env?: Env, limit = 8) {
 
 async function buildOpenGovPermitsTestPayload(env: Env, db?: D1Database) {
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
-  const recordTypeGuesses = ["building-permit", "electrical-permit", "plumbing-permit", "sign-permit"];
+  const experimental = false;
+  const recordsFeatureEnabled = recordsEnabled(env);
   let recordTypesFetched = 0;
   let recordTypesStored = 0;
   let recordTypesPathUsed: "record-types" | "record-types?page[size]=100" | null = null;
@@ -1982,30 +2095,26 @@ async function buildOpenGovPermitsTestPayload(env: Env, db?: D1Database) {
     recordTypesStorageError = "No D1 database was passed to buildOpenGovPermitsTestPayload.";
   }
 
-  checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5" }));
-  checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", search: "danvers" }));
-  checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", q: "danvers" }));
-  for (const recordType of recordTypeGuesses) {
-    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", recordType }));
-    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", recordTypeId: recordType }));
+  if (recordsFeatureEnabled) {
+    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5" }));
   }
 
-  for (const recordTypeId of recordTypesLiveIds.slice(0, 6)) {
-    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", recordTypeId }));
-  }
-
+  const recordTypesAvailable = recordTypesFetched > 0;
+  const recordsStatus = !recordsFeatureEnabled ? "disabled" : (recordTypesAvailable ? "available" : "unavailable");
   return {
-    ok: checks.every((check) => check.ok),
+    ok: true,
     community,
-    recordTypesTested: recordTypeGuesses,
     recordTypeIdsFromApi: recordTypesLiveIds.slice(0, 10),
+    recordTypesAvailable,
     recordTypesFetched,
     recordTypesStored,
     recordTypesPathUsed,
     recordTypesSample,
     recordTypesStoredSampleFromDb,
     recordTypesStorageError,
-    experimentalRecordQueryProbes: true,
+    recordsEnabled: recordsFeatureEnabled,
+    recordsStatus,
+    experimentalRecordQueryProbes: experimental,
     checks,
     updatedAt: new Date().toISOString(),
   };
@@ -2971,6 +3080,9 @@ function buildParcelAliases(attributes: DanversParcelAttributes): ParcelUpsertIn
 
 function mapDanversParcelFeatureToInput(feature: DanversParcelFeature): ParcelUpsertInput | null {
   const attributes = feature.attributes;
+  if (!attributes) {
+    return null;
+  }
   const mapLot = attributes?.MAP_PAR_ID?.trim();
 
   if (!mapLot) {
@@ -3363,8 +3475,16 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
     bestMatch: null,
     nearMatches: [],
   };
+  let locationsFetchedThisRun = 0;
+  let locationsStoredThisRun = 0;
+  let locationsTotalRecords: number | null = null;
   try {
     const locationFetch = await fetchOpenGovLocations(env);
+    locationsFetchedThisRun = locationFetch.fetched;
+    locationsTotalRecords = locationFetch.totalRecords;
+    if (env.OPPORTUNITYDB) {
+      locationsStoredThisRun = await upsertOpenGovLocations(env.OPPORTUNITYDB, env, locationFetch.records);
+    }
     matched = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
   } catch (error) {
     locationFetchError = {
@@ -3373,23 +3493,15 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
     };
   }
 
-  let permitsByLocation: unknown = null;
-  if (matched.bestMatch?.id) {
-    try {
-      permitsByLocation = await fetchOpenGovPlceJson(env, "records", {
-        "page[size]": "25",
-        locationId: matched.bestMatch.id,
-      });
-    } catch (error) {
-      permitsByLocation = {
-        error: error instanceof Error ? error.message : "Permit lookup by locationId failed.",
-      };
-    }
-  }
-
   return {
     ...base,
     addressQueried: address,
+    locationsAvailable: locationsFetchedThisRun > 0,
+    locationsFetchedThisRun,
+    locationsStoredThisRun,
+    locationsTotalRecords,
+    matchedLocation: matched.bestMatch,
+    status: "OpenGov locations enabled; records unavailable/not enabled",
     debug: {
       normalizedInputAddress: matched.input,
       plcPathQueried: matched.pathQueried,
@@ -3397,7 +3509,6 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
       parcelCandidatesConsidered: matched.parcelCandidatesConsidered,
       bestMatchedLocations: matched.bestMatch ? [matched.bestMatch] : [],
       nearMatches: matched.nearMatches,
-      permitLookupByLocationId: matched.bestMatch?.id ? { locationId: matched.bestMatch.id, result: permitsByLocation } : null,
       locationFetchError,
     },
   };
@@ -3405,14 +3516,10 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
 
 function buildOpportunityInputs(
   briefs: CaseBrief[],
-  parcels: ParcelUpsertInput[],
 ): OpportunityParcelInput[] {
   const derivedFromBriefs = briefs.flatMap((brief) => {
     if (!brief.addresses.length) {
-      return [{
-        id: brief.id,
-        address: null,
-      }];
+      return [];
     }
 
     return brief.addresses.map((address, index) => ({
@@ -3433,7 +3540,7 @@ async function runAutomaticIngest(db: D1Database, env: Env): Promise<IngestRunSu
   const parcels = await fetchDanversParcels(priorityAddresses);
   await upsertParcels(db, parcels);
 
-  const opportunities = buildOpportunityInputs(briefs, parcels);
+  const opportunities = buildOpportunityInputs(briefs);
   const results = await matchAndPersistOpportunities(db, opportunities);
   if (env.OPENGOV_KEY?.trim()) {
     try {
