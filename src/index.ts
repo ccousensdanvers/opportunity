@@ -439,18 +439,18 @@ const SITES: OpportunitySite[] = [
 const ACTIVITIES: ActivityItem[] = [
   {
     time: "08:30",
-    title: "Parcel context is live; permit integration is still gated",
-    detail: "Manual and scheduled runs now screen brief-linked parcels against Danvers assessor, utility, flood, wetlands, and groundwater context. OpenGov permit lookups were tested but are still blocked by platform access controls.",
+    title: "OpenGov test panel now reports exact query params per check",
+    detail: "The PLCE v2 dashboard diagnostics now show each test path and query arguments so staff can see what succeeded, what failed, and what to replay outside the UI.",
   },
   {
     time: "09:15",
-    title: "Parcel drilldowns are live",
-    detail: "Staff can open parcel detail pages from case briefs to see ownership, zoning, value, utility context, environmental flags, and related matched opportunity records.",
+    title: "Record-type tests now include live IDs from OpenGov",
+    detail: "Instead of only trying guessed permit slugs, the Worker now pulls record-types first and tests a sample of IDs returned by the API response.",
   },
   {
     time: "Next",
-    title: "Current build focus: supported permit data access",
-    detail: "Next up is confirming whether Danvers can expose permit data through an OpenGov-supported export, reporting feed, or admin-enabled API instead of blocked public search requests.",
+    title: "Current build focus: move from diagnostics to repeatable permit ingest",
+    detail: "Next up is documenting the best-performing records filters from the new diagnostics and turning those into a stable parcel-linked permit ingestion path.",
   },
 ];
 
@@ -758,23 +758,23 @@ function buildSummaryMetrics(
 
 class HeadingCollector {
   private active = false;
-  private text = "";
+  private textContent = "";
 
   constructor(private onComplete: (value: string) => void) {}
 
   element(element: Element) {
     this.active = true;
-    this.text = "";
+    this.textContent = "";
     element.onEndTag(() => {
       this.active = false;
-      this.onComplete(normalizeWhitespace(this.text));
-      this.text = "";
+      this.onComplete(normalizeWhitespace(this.textContent));
+      this.textContent = "";
     });
   }
 
   text(text: Text) {
     if (this.active) {
-      this.text += text.text;
+      this.textContent += text.text;
     }
   }
 }
@@ -782,7 +782,7 @@ class HeadingCollector {
 class AgendaLinkCollector {
   private active = false;
   private href = "";
-  private text = "";
+  private textContent = "";
 
   constructor(
     private getBoard: () => string | null,
@@ -798,23 +798,23 @@ class AgendaLinkCollector {
 
     this.active = true;
     this.href = href.startsWith("http") ? href : `https://www.danversma.gov${href}`;
-    this.text = "";
+    this.textContent = "";
 
     element.onEndTag(() => {
       this.active = false;
       const board = this.getBoard();
       const meetingDate = this.getMeetingDate();
-      const title = normalizeWhitespace(this.text);
+      const title = normalizeWhitespace(this.textContent);
 
       if (!board || !meetingDate || !title || title === "Agenda" || title === "Previous Versions") {
         this.href = "";
-        this.text = "";
+        this.textContent = "";
         return;
       }
 
       if (board !== "Planning Board" && board !== "Zoning Board of Appeals") {
         this.href = "";
-        this.text = "";
+        this.textContent = "";
         return;
       }
 
@@ -827,13 +827,13 @@ class AgendaLinkCollector {
       });
 
       this.href = "";
-      this.text = "";
+      this.textContent = "";
     });
   }
 
   text(text: Text) {
     if (this.active) {
-      this.text += text.text;
+      this.textContent += text.text;
     }
   }
 }
@@ -1130,6 +1130,687 @@ interface OpenGovPlceProbeResult {
   error?: string;
 }
 
+interface OpenGovRecordTypeRecord {
+  id: string | null;
+  type: string | null;
+  name: string | null;
+  description: string | null;
+  slug: string | null;
+  category: string | null;
+  module: string | null;
+  active: boolean | null;
+  sourceUpdatedAt: string | null;
+  rawJson: Record<string, unknown>;
+}
+
+interface OpenGovLocationRecord {
+  id: string | null;
+  type: string | null;
+  name: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  locationType: string | null;
+  ownerName: string | null;
+  ownerStreetNumber: string | null;
+  ownerStreetName: string | null;
+  ownerUnit: string | null;
+  ownerCity: string | null;
+  ownerState: string | null;
+  ownerPostalCode: string | null;
+  ownerCountry: string | null;
+  ownerEmail: string | null;
+  streetNo: string | null;
+  streetName: string | null;
+  unit: string | null;
+  city: string | null;
+  state: string | null;
+  postalCode: string | null;
+  country: string | null;
+  secondaryLatitude: number | null;
+  secondaryLongitude: number | null;
+  segmentPrimaryLabel: string | null;
+  segmentSecondaryLabel: string | null;
+  segmentLabel: string | null;
+  segmentLength: number | null;
+  ownerPhoneNo: string | null;
+  lotArea: number | null;
+  gisID: string | null;
+  occupancyType: string | null;
+  propertyUse: string | null;
+  sewage: string | null;
+  water: string | null;
+  yearBuilt: number | null;
+  zoning: string | null;
+  buildingType: string | null;
+  notes: string | null;
+  subdivision: string | null;
+  archived: boolean | null;
+  mbl: string | null;
+  matID: string | null;
+  sourceUpdatedAt: string | null;
+}
+
+function coerceOptionalBoolean(value: unknown): boolean | null {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (value.toLowerCase() === "true") return true;
+    if (value.toLowerCase() === "false") return false;
+  }
+  return null;
+}
+
+interface ParsedAddressParts {
+  original: string;
+  normalized: string;
+  streetNo: string;
+  streetNoBase: string;
+  streetNoSuffix: string;
+  streetName: string;
+}
+
+interface OpenGovLocationMatchResult {
+  input: ParsedAddressParts;
+  pathQueried: string;
+  totalLocationsChecked: number;
+  parcelCandidatesConsidered: number;
+  bestMatch: OpenGovLocationRecord | null;
+  nearMatches: OpenGovLocationRecord[];
+}
+
+function buildOpenGovDirectAuthHeaders(apiKey: string): HeadersInit {
+  return {
+    Authorization: `Token ${apiKey}`,
+    Accept: "application/vnd.api+json",
+  };
+}
+
+function normalizeStreetName(value: string): string {
+  return normalizeWhitespace(value)
+    .toLowerCase()
+    .replace(/[.,]/g, "")
+    .replace(/\bstreet\b/g, "st")
+    .replace(/\bavenue\b/g, "ave")
+    .replace(/\broad\b/g, "rd")
+    .replace(/\bdrive\b/g, "dr")
+    .replace(/\blane\b/g, "ln")
+    .replace(/\bcourt\b/g, "ct")
+    .replace(/\bplace\b/g, "pl")
+    .replace(/\bterrace\b/g, "ter")
+    .replace(/\bboulevard\b/g, "blvd");
+}
+
+function parseAddressParts(address: string): ParsedAddressParts {
+  const normalized = normalizeWhitespace(address);
+  const match = normalized.match(/^(\d+)([a-zA-Z]?)\s+(.*)$/);
+  if (!match) {
+    return {
+      original: address,
+      normalized: normalized.toLowerCase(),
+      streetNo: "",
+      streetNoBase: "",
+      streetNoSuffix: "",
+      streetName: normalizeStreetName(normalized),
+    };
+  }
+
+  return {
+    original: address,
+    normalized: normalized.toLowerCase(),
+    streetNo: `${match[1]}${match[2]}`.toLowerCase(),
+    streetNoBase: match[1],
+    streetNoSuffix: match[2].toLowerCase(),
+    streetName: normalizeStreetName(match[3]),
+  };
+}
+
+function normalizeLookupKey(key: string): string {
+  return key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+}
+
+export function normalizeOpenGovLocation(candidate: Record<string, unknown>): OpenGovLocationRecord {
+  const attributes = (
+    candidate.attributes && typeof candidate.attributes === "object"
+      ? candidate.attributes
+      : {}
+  ) as Record<string, unknown>;
+  const sourceObjects = collectNestedObjects(candidate);
+  if (!sourceObjects.includes(attributes)) {
+    sourceObjects.unshift(attributes);
+  }
+  const sourceEntries = sourceObjects.map((obj) => ({
+    exact: obj,
+    normalized: new Map(Object.entries(obj).map(([key, value]) => [normalizeLookupKey(key), value])),
+  }));
+  const readValue = (...keys: string[]): unknown => {
+    for (const key of keys) {
+      const normalizedKey = normalizeLookupKey(key);
+      for (const source of sourceEntries) {
+        if (Object.prototype.hasOwnProperty.call(source.exact, key)) return source.exact[key];
+        if (source.normalized.has(normalizedKey)) return source.normalized.get(normalizedKey);
+      }
+    }
+    return null;
+  };
+  const readString = (...keys: string[]): string | null => {
+    return coerceOptionalString(readValue(...keys));
+  };
+  const readNumber = (...keys: string[]): number | null => {
+    return coerceOptionalNumber(readValue(...keys));
+  };
+  const readBoolean = (...keys: string[]): boolean | null => {
+    return coerceOptionalBoolean(readValue(...keys));
+  };
+
+  return {
+    id: coerceOptionalString(candidate.id),
+    type: coerceOptionalString(candidate.type) ?? readString("locationType", "location_type", "kind"),
+    name: readString("name", "displayName", "display_name", "label", "fullAddress", "full_address", "formattedAddress", "formatted_address"),
+    latitude: readNumber("latitude", "lat", "y"),
+    longitude: readNumber("longitude", "lng", "lon", "long", "x"),
+    locationType: readString("locationType", "location_type", "location kind", "kind", "type"),
+    ownerName: readString("ownerName", "owner_name", "propertyOwner", "property_owner", "owner"),
+    ownerStreetNumber: readString("ownerStreetNumber", "owner_street_number", "ownerAddressNumber", "owner_address_number"),
+    ownerStreetName: readString("ownerStreetName", "owner_street_name", "ownerStreet", "owner_street", "ownerAddress1", "owner_address_1", "ownerAddressLine1", "owner_address_line_1"),
+    ownerUnit: readString("ownerUnit", "owner_unit", "ownerAddress2", "owner_address_2", "ownerAddressLine2", "owner_address_line_2"),
+    ownerCity: readString("ownerCity", "owner_city"),
+    ownerState: readString("ownerState", "owner_state"),
+    ownerPostalCode: readString("ownerPostalCode", "owner_postal_code", "ownerZip", "owner_zip", "ownerZipCode", "owner_zip_code"),
+    ownerCountry: readString("ownerCountry", "owner_country"),
+    ownerEmail: readString("ownerEmail", "owner_email"),
+    streetNo: readString("streetNo", "street_no", "streetNumber", "street_number", "addressNumber", "address_number", "houseNumber", "house_number", "number"),
+    streetName: readString("streetName", "street_name", "street", "streetAddress", "street_address", "addressStreet", "address_street", "roadName", "road_name", "address1", "address_1", "line1", "addressLine1", "address_line_1"),
+    unit: readString("unit", "suite", "apartment", "apt", "address2", "address_2", "line2", "addressLine2", "address_line_2"),
+    city: readString("city", "municipality", "town", "locality"),
+    state: readString("state", "province", "region"),
+    postalCode: readString("postalCode", "postal_code", "zip", "zipcode", "zipCode", "zip_code"),
+    country: readString("country"),
+    secondaryLatitude: readNumber("secondaryLatitude", "secondary_latitude"),
+    secondaryLongitude: readNumber("secondaryLongitude", "secondary_longitude"),
+    segmentPrimaryLabel: readString("segmentPrimaryLabel", "segment_primary_label"),
+    segmentSecondaryLabel: readString("segmentSecondaryLabel", "segment_secondary_label"),
+    segmentLabel: readString("segmentLabel", "segment_label"),
+    segmentLength: readNumber("segmentLength", "segment_length"),
+    ownerPhoneNo: readString("ownerPhoneNo", "owner_phone_no", "ownerPhone", "owner_phone", "phone", "phoneNumber", "phone_number"),
+    lotArea: readNumber("lotArea", "lot_area", "lotSize", "lot_size", "parcelArea", "parcel_area"),
+    gisID: readString("gisID", "gis_id", "gisId", "parcelId", "parcel_id", "parcelID", "parcel_number", "parcelNumber"),
+    mbl: readString("mbl", "mapBlockLot", "map_block_lot", "mapLot", "map_lot"),
+    matID: readString("matID", "mat_id", "matId"),
+    occupancyType: readString("occupancyType", "occupancy_type"),
+    propertyUse: readString("propertyUse", "property_use", "use", "landUse", "land_use"),
+    sewage: readString("sewage", "sewer"),
+    water: readString("water"),
+    yearBuilt: readNumber("yearBuilt", "year_built"),
+    zoning: readString("zoning", "zone", "zoningDistrict", "zoning_district"),
+    buildingType: readString("buildingType", "building_type"),
+    notes: readString("notes", "description", "comments"),
+    subdivision: readString("subdivision"),
+    archived: readBoolean("archived", "isArchived", "is_archived"),
+    sourceUpdatedAt: readString("updatedAt", "updated_at", "modifiedAt", "modified_at", "lastModified", "last_modified"),
+  };
+}
+
+export function normalizeOpenGovRecordType(candidate: Record<string, unknown>): OpenGovRecordTypeRecord {
+  const attributes = (
+    candidate.attributes && typeof candidate.attributes === "object"
+      ? candidate.attributes
+      : {}
+  ) as Record<string, unknown>;
+  const sourceObjects = collectNestedObjects(candidate);
+  if (!sourceObjects.includes(attributes)) sourceObjects.unshift(attributes);
+  const sourceEntries = sourceObjects.map((obj) => ({
+    exact: obj,
+    normalized: new Map(Object.entries(obj).map(([key, value]) => [normalizeLookupKey(key), value])),
+  }));
+  const readValue = (...keys: string[]): unknown => {
+    for (const key of keys) {
+      const normalizedKey = normalizeLookupKey(key);
+      for (const source of sourceEntries) {
+        if (Object.prototype.hasOwnProperty.call(source.exact, key)) return source.exact[key];
+        if (source.normalized.has(normalizedKey)) return source.normalized.get(normalizedKey);
+      }
+    }
+    return null;
+  };
+  const readString = (...keys: string[]): string | null => coerceOptionalString(readValue(...keys));
+  const readBoolean = (...keys: string[]): boolean | null => coerceOptionalBoolean(readValue(...keys));
+
+  const rootId = coerceOptionalString(candidate.id);
+  const fallbackId = readString("recordTypeId", "record_type_id", "typeId", "type_id", "id");
+  const activeValue = readBoolean("active", "enabled", "isActive", "is_active");
+  const archivedValue = readBoolean("archived", "isArchived", "is_archived");
+
+  return {
+    id: rootId ?? fallbackId,
+    type: coerceOptionalString(candidate.type),
+    name: readString("name", "displayName", "display_name", "label", "title"),
+    description: readString("description", "desc", "helpText", "help_text"),
+    slug: readString("slug", "key", "code", "recordType", "record_type"),
+    category: readString("category", "group", "department", "classification"),
+    module: readString("module", "moduleName", "module_name", "product", "area"),
+    active: activeValue ?? (archivedValue === null ? null : !archivedValue),
+    sourceUpdatedAt: readString("updatedAt", "updated_at", "modifiedAt", "modified_at", "lastModified", "last_modified"),
+    rawJson: candidate,
+  };
+}
+
+async function upsertOpenGovRecordTypes(db: D1Database, env: Env, recordTypes: OpenGovRecordTypeRecord[]): Promise<number> {
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const now = new Date().toISOString();
+  const unique = Array.from(new Map(recordTypes.filter((r) => Boolean(r.id)).map((r) => [r.id as string, r])).values());
+  try {
+    for (const recordType of unique) {
+      await db.prepare(`INSERT INTO opengov_record_types (
+          id, source_community, type, name, description, slug, category, module, active, raw_json, source_updated_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id, source_community) DO UPDATE SET
+          type = excluded.type,
+          name = excluded.name,
+          description = excluded.description,
+          slug = excluded.slug,
+          category = excluded.category,
+          module = excluded.module,
+          active = excluded.active,
+          raw_json = excluded.raw_json,
+          source_updated_at = excluded.source_updated_at,
+          updated_at = excluded.updated_at`)
+        .bind(
+          recordType.id,
+          community,
+          recordType.type,
+          recordType.name,
+          recordType.description,
+          recordType.slug,
+          recordType.category,
+          recordType.module,
+          recordType.active === null ? null : (recordType.active ? 1 : 0),
+          JSON.stringify(recordType.rawJson),
+          recordType.sourceUpdatedAt,
+          now,
+        ).run();
+    }
+  } catch (error) {
+    throw new Error(`Failed to upsert OpenGov record types. Confirm migration 0007 is applied. ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return unique.length;
+}
+
+async function ingestOpenGovRecordTypes(db: D1Database, env: Env): Promise<{ fetched: number; stored: number; sample: Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: boolean | null }> }> {
+  const payload = await fetchOpenGovPlceJson(env, "record-types", { "page[size]": "100" }) as { data?: unknown[] };
+  const items = Array.isArray(payload) ? payload : (Array.isArray(payload?.data) ? payload.data : []);
+  const normalized = items
+    .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object")
+    .map((value) => normalizeOpenGovRecordType(value))
+    .filter((value): value is OpenGovRecordTypeRecord & { id: string } => Boolean(value.id));
+  const stored = await upsertOpenGovRecordTypes(db, env, normalized);
+  return {
+    fetched: items.length,
+    stored,
+    sample: normalized.slice(0, 8).map((value) => ({ id: value.id, name: value.name, slug: value.slug, category: value.category, module: value.module, active: value.active })),
+  };
+}
+
+async function listStoredOpenGovRecordTypes(db: D1Database, limit = 200): Promise<Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: number | null; sourceUpdatedAt: string | null; updatedAt: string }>> {
+  const rows = await db.prepare(`SELECT id, name, slug, category, module, active, source_updated_at AS sourceUpdatedAt, updated_at AS updatedAt
+      FROM opengov_record_types
+      ORDER BY COALESCE(name, ''), COALESCE(category, ''), id
+      LIMIT ?`).bind(limit).all();
+  return (rows.results ?? []) as Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: number | null; sourceUpdatedAt: string | null; updatedAt: string }>;
+}
+
+function scoreLocationMatch(input: ParsedAddressParts, location: OpenGovLocationRecord): number {
+  const locNo = (location.streetNo ?? "").toLowerCase();
+  const locNoMatch = locNo.match(/^(\d+)([a-zA-Z]?)$/);
+  const locBase = locNoMatch?.[1] ?? "";
+  const locSuffix = (locNoMatch?.[2] ?? "").toLowerCase();
+  const locStreet = normalizeStreetName(location.streetName ?? "");
+  let score = 0;
+
+  if (location.locationType === "PARCEL") {
+    score += 100;
+  } else if (location.locationType === "SEGMENT") {
+    score += 15;
+  }
+
+  if ((location.city ?? "").toLowerCase() === "danvers") score += 25;
+  if ((location.state ?? "").toUpperCase() === "MA") score += 20;
+  if ((location.postalCode ?? "").startsWith("01923")) score += 20;
+
+  if (input.streetName && locStreet === input.streetName) {
+    score += 70;
+  } else if (input.streetName && locStreet.includes(input.streetName)) {
+    score += 25;
+  }
+
+  if (input.streetNo && locNo === input.streetNo) {
+    score += 80;
+  } else if (input.streetNoBase && locBase === input.streetNoBase) {
+    score += input.streetNoSuffix === "" || locSuffix === "" ? 45 : 30;
+  }
+
+  return score;
+}
+
+async function fetchOpenGovLocationsPage(
+  env: Env,
+  pageNumber = 1,
+  pageSize = 100,
+): Promise<{ path: string; records: OpenGovLocationRecord[]; hasNextPage: boolean }> {
+  const safePageSize = Math.max(1, Math.min(100, Math.trunc(pageSize)));
+  const safePageNumber = Math.max(1, Math.trunc(pageNumber));
+  const path = `locations?page[number]=${safePageNumber}&page[size]=${safePageSize}`;
+  const payload = await fetchOpenGovPlceJson(env, "locations", {
+    "page[number]": String(safePageNumber),
+    "page[size]": String(safePageSize),
+  }) as { data?: unknown[]; links?: { next?: unknown } };
+  const data = Array.isArray(payload?.data) ? payload.data : [];
+  const records = data
+    .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object")
+    .map((value) => normalizeOpenGovLocation(value));
+  const hasNextPage = Boolean(payload?.links && typeof payload.links === "object" && payload.links.next);
+  return { path, records, hasNextPage };
+}
+
+async function fetchOpenGovLocations(env: Env, maxPages = 1): Promise<{ path: string; records: OpenGovLocationRecord[] }> {
+  const cappedPages = Math.max(1, Math.min(20, Math.trunc(maxPages)));
+  const allRecords: OpenGovLocationRecord[] = [];
+  const paths: string[] = [];
+  for (let page = 1; page <= cappedPages; page += 1) {
+    const result = await fetchOpenGovLocationsPage(env, page, 100);
+    paths.push(result.path);
+    allRecords.push(...result.records);
+    if (!result.hasNextPage || result.records.length < 100) {
+      break;
+    }
+  }
+  return { path: paths.join(", "), records: allRecords };
+}
+
+async function fetchOpenGovLocationNormalizationProbe(env: Env): Promise<{
+  pathQueried: string;
+  sample: Array<{
+    raw: Record<string, unknown>;
+    normalized: OpenGovLocationRecord;
+    nonNullFields: string[];
+    nullFields: string[];
+  }>;
+}> {
+  const pageNumber = 1;
+  const pageSize = 3;
+  const payload = await fetchOpenGovPlceJson(env, "locations", {
+    "page[number]": String(pageNumber),
+    "page[size]": String(pageSize),
+  }) as { data?: unknown[] };
+  const rawRecords = (Array.isArray(payload?.data) ? payload.data : [])
+    .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object");
+  const sample = rawRecords.map((raw) => {
+    const normalized = normalizeOpenGovLocation(raw);
+    const entries = Object.entries(normalized);
+    return {
+      raw,
+      normalized,
+      nonNullFields: entries.filter(([, value]) => value !== null).map(([key]) => key),
+      nullFields: entries.filter(([, value]) => value === null).map(([key]) => key),
+    };
+  });
+  return {
+    pathQueried: `locations?page[number]=${pageNumber}&page[size]=${pageSize}`,
+    sample,
+  };
+}
+
+async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenGovLocationRecord[]): Promise<number> {
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const now = new Date().toISOString();
+  const uniqueLocations = Array.from(
+    new Map(
+      locations
+        .filter((location) => Boolean(location.id))
+        .map((location) => [location.id as string, location]),
+    ).values(),
+  );
+
+  try {
+    for (const location of uniqueLocations) {
+      await db
+        .prepare(
+        `INSERT INTO opengov_locations (
+          id, location_type, street_no, street_name, city, state, postal_code, gis_id, mbl, mat_id, source_type, name, latitude, longitude, owner_name, owner_street_number, owner_street_name,
+          owner_unit, owner_city, owner_state, owner_postal_code, owner_country, owner_email, unit,
+          country, secondary_latitude, secondary_longitude, segment_primary_label, segment_secondary_label,
+          segment_label, segment_length, owner_phone_no, lot_area, occupancy_type, property_use, sewage,
+          water, year_built, zoning, building_type, notes, subdivision, archived, source_updated_at, source_community, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          location_type = excluded.location_type,
+          street_no = excluded.street_no,
+          street_name = excluded.street_name,
+          city = excluded.city,
+          state = excluded.state,
+          postal_code = excluded.postal_code,
+          gis_id = excluded.gis_id,
+          mbl = excluded.mbl,
+          mat_id = excluded.mat_id,
+          source_type = excluded.source_type,
+          name = excluded.name,
+          latitude = excluded.latitude,
+          longitude = excluded.longitude,
+          owner_name = excluded.owner_name,
+          owner_street_number = excluded.owner_street_number,
+          owner_street_name = excluded.owner_street_name,
+          owner_unit = excluded.owner_unit,
+          owner_city = excluded.owner_city,
+          owner_state = excluded.owner_state,
+          owner_postal_code = excluded.owner_postal_code,
+          owner_country = excluded.owner_country,
+          owner_email = excluded.owner_email,
+          unit = excluded.unit,
+          country = excluded.country,
+          secondary_latitude = excluded.secondary_latitude,
+          secondary_longitude = excluded.secondary_longitude,
+          segment_primary_label = excluded.segment_primary_label,
+          segment_secondary_label = excluded.segment_secondary_label,
+          segment_label = excluded.segment_label,
+          segment_length = excluded.segment_length,
+          owner_phone_no = excluded.owner_phone_no,
+          lot_area = excluded.lot_area,
+          occupancy_type = excluded.occupancy_type,
+          property_use = excluded.property_use,
+          sewage = excluded.sewage,
+          water = excluded.water,
+          year_built = excluded.year_built,
+          zoning = excluded.zoning,
+          building_type = excluded.building_type,
+          notes = excluded.notes,
+          subdivision = excluded.subdivision,
+          archived = excluded.archived,
+          source_updated_at = excluded.source_updated_at,
+          source_community = excluded.source_community,
+          updated_at = excluded.updated_at`,
+      )
+      .bind(
+        location.id,
+        location.locationType,
+        location.streetNo,
+        location.streetName,
+        location.city,
+        location.state,
+        location.postalCode,
+        location.gisID,
+        location.mbl,
+        location.matID,
+        location.type,
+        location.name,
+        location.latitude,
+        location.longitude,
+        location.ownerName,
+        location.ownerStreetNumber,
+        location.ownerStreetName,
+        location.ownerUnit,
+        location.ownerCity,
+        location.ownerState,
+        location.ownerPostalCode,
+        location.ownerCountry,
+        location.ownerEmail,
+        location.unit,
+        location.country,
+        location.secondaryLatitude,
+        location.secondaryLongitude,
+        location.segmentPrimaryLabel,
+        location.segmentSecondaryLabel,
+        location.segmentLabel,
+        location.segmentLength,
+        location.ownerPhoneNo,
+        location.lotArea,
+        location.occupancyType,
+        location.propertyUse,
+        location.sewage,
+        location.water,
+        location.yearBuilt,
+        location.zoning,
+        location.buildingType,
+        location.notes,
+        location.subdivision,
+        location.archived,
+        location.sourceUpdatedAt,
+        community,
+        now,
+      )
+        .run();
+    }
+  } catch (error) {
+    throw new Error(
+      `Failed to upsert OpenGov locations. Confirm migrations 0004 and 0006 are applied. ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+
+  return uniqueLocations.length;
+}
+
+async function upsertOpenGovPermitRecords(
+  db: D1Database,
+  env: Env,
+  locationId: string,
+  matchedAddress: string,
+  records: PermitRecord[],
+): Promise<number> {
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const now = new Date().toISOString();
+  let written = 0;
+  try {
+    for (const record of records) {
+      const recordKey = `${locationId}|${record.permitNumber ?? ""}|${record.permitType}|${record.issuedDate}|${normalizeAddress(record.siteAddress)}`;
+      await db
+        .prepare(
+        `INSERT INTO opengov_permit_records (
+          record_key, location_id, matched_address, site_address, permit_type, status, issued_date, permit_number, detail_url, applicant_name, source_community, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(record_key) DO UPDATE SET
+          location_id = excluded.location_id,
+          matched_address = excluded.matched_address,
+          site_address = excluded.site_address,
+          permit_type = excluded.permit_type,
+          status = excluded.status,
+          issued_date = excluded.issued_date,
+          permit_number = excluded.permit_number,
+          detail_url = excluded.detail_url,
+          applicant_name = excluded.applicant_name,
+          source_community = excluded.source_community,
+          updated_at = excluded.updated_at`,
+      )
+      .bind(
+        recordKey,
+        locationId,
+        matchedAddress,
+        record.siteAddress,
+        record.permitType,
+        record.status,
+        record.issuedDate,
+        record.permitNumber,
+        record.detailUrl,
+        record.applicantName,
+        community,
+        now,
+      )
+        .run();
+      written += 1;
+    }
+  } catch (error) {
+    throw new Error(
+      `Failed to upsert OpenGov permit records. Confirm migration 0005 is applied. ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  return written;
+}
+
+async function ingestOpenGovLocationsAndPermitsForBriefs(db: D1Database, env: Env, briefs: CaseBrief[]): Promise<{ locationsStored: number; permitsStored: number; addressesMatched: number }> {
+  const addresses = Array.from(new Set(briefs.flatMap((brief) => brief.addresses).map((value) => normalizeWhitespace(value)).filter(Boolean)));
+  if (!addresses.length) return { locationsStored: 0, permitsStored: 0, addressesMatched: 0 };
+
+  const locationFetch = await fetchOpenGovLocations(env, 5);
+  const locationsStored = await upsertOpenGovLocations(db, env, locationFetch.records);
+  let permitsStored = 0;
+  let addressesMatched = 0;
+
+  for (const address of addresses) {
+    const match = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
+    const locationId = match.bestMatch?.id;
+    if (!locationId) continue;
+    addressesMatched += 1;
+    try {
+      const payload = await fetchOpenGovPlceJson(env, "records", { "filter[locationID]": locationId, "page[size]": "25" });
+      const records = parseOpenGovPermitResults(payload, address);
+      permitsStored += await upsertOpenGovPermitRecords(db, env, locationId, address, records);
+    } catch {
+      continue;
+    }
+  }
+
+  return { locationsStored, permitsStored, addressesMatched };
+}
+
+async function listStoredPermitRecords(db: D1Database, limit = 50): Promise<PermitRecord[]> {
+  try {
+    const rows = await db.prepare(
+      `SELECT applicant_name AS applicantName, site_address AS siteAddress, permit_type AS permitType, status, issued_date AS issuedDate, permit_number AS permitNumber, detail_url AS detailUrl
+       FROM opengov_permit_records
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+    ).bind(limit).all<PermitRecord>();
+    return (rows.results ?? []).map((row) => ({ ...row, source: "OpenGov PLCE records API (stored)" }));
+  } catch {
+    return [];
+  }
+}
+
+function matchOpenGovLocationForAddress(
+  address: string,
+  pathQueried: string,
+  locations: OpenGovLocationRecord[],
+): OpenGovLocationMatchResult {
+  const input = parseAddressParts(address);
+  const parcelCandidates = locations.filter((location) => location.locationType === "PARCEL");
+  const scored = locations
+    .map((location) => ({ location, score: scoreLocationMatch(input, location) }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const bestMatch = scored.length ? scored[0].location : null;
+  const nearMatches = scored.slice(1, 6).map((entry) => entry.location);
+
+  return {
+    input,
+    pathQueried,
+    totalLocationsChecked: locations.length,
+    parcelCandidatesConsidered: parcelCandidates.length,
+    bestMatch,
+    nearMatches,
+  };
+}
+
 async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Record<string, string>): Promise<OpenGovPlceProbeResult> {
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
   const url = new URL(`${OPENGOV_PLCE_BASE_URL}/v2/${community}/${path}`);
@@ -1145,12 +1826,7 @@ async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Reco
       return { test: path, recordType: null, path: `${path}${url.search}`, ok: false, status: 503, parsedCount: 0, error: 'OPENGOV_KEY is not configured.' };
     }
 
-    const response = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Token ${apiKey}`,
-        Accept: 'application/vnd.api+json',
-      },
-    });
+    const response = await fetch(url.toString(), { headers: buildOpenGovDirectAuthHeaders(apiKey) });
     const text = await response.text();
     let parsedCount = 0;
     let preview = '';
@@ -1395,10 +2071,51 @@ async function buildPermitDebugPayload(env?: Env, limit = 8) {
   };
 }
 
-async function buildOpenGovPermitsTestPayload(env: Env) {
+async function buildOpenGovPermitsTestPayload(env: Env, db?: D1Database) {
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
-  const recordTypeGuesses = ['building-permit', 'electrical-permit', 'plumbing-permit', 'sign-permit'];
+  const recordTypeGuesses = ["building-permit", "electrical-permit", "plumbing-permit", "sign-permit"];
+  let recordTypesFetched = 0;
+  let recordTypesStored = 0;
+  let recordTypesSample: Array<{ id: string; name: string | null; slug: string | null; category: string | null; module: string | null; active: boolean | null }> = [];
   const checks: OpenGovPlceProbeResult[] = [];
+  const recordTypesLiveIds: string[] = [];
+
+  const recordTypesProbe = await fetchOpenGovPlceProbe(env, "record-types");
+  checks.push(recordTypesProbe);
+
+  if (recordTypesProbe.ok) {
+    try {
+      const recordTypesPayload = await fetchOpenGovPlceJson(env, "record-types");
+      const rootItems = Array.isArray(recordTypesPayload)
+        ? recordTypesPayload
+        : Array.isArray((recordTypesPayload as { data?: unknown[] })?.data)
+          ? (recordTypesPayload as { data?: unknown[] }).data ?? []
+          : [];
+      recordTypesFetched = rootItems.length;
+      for (const item of rootItems) {
+        if (!item || typeof item !== "object") continue;
+        const candidate = item as Record<string, unknown>;
+        const id = normalizeWhitespace(String(candidate.id ?? candidate.recordTypeId ?? candidate.slug ?? ""));
+        if (!id) continue;
+        if (!recordTypesLiveIds.includes(id)) {
+          recordTypesLiveIds.push(id);
+        }
+      }
+    } catch {
+      // keep guessed tests even if detailed record-type parsing fails
+    }
+  }
+
+  if (db) {
+    try {
+      const ingest = await ingestOpenGovRecordTypes(db, env);
+      recordTypesFetched = ingest.fetched;
+      recordTypesStored = ingest.stored;
+      recordTypesSample = ingest.sample;
+    } catch {
+      // non-fatal for diagnostics
+    }
+  }
 
   checks.push(await fetchOpenGovPlceProbe(env, 'organization'));
   checks.push(await fetchOpenGovPlceProbe(env, 'record-types'));
@@ -1407,14 +2124,23 @@ async function buildOpenGovPermitsTestPayload(env: Env) {
   checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', search: 'danvers' }));
   checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', q: 'danvers' }));
   for (const recordType of recordTypeGuesses) {
-    checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', recordType }));
-    checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', recordTypeId: recordType }));
+    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", recordType }));
+    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", recordTypeId: recordType }));
+  }
+
+  for (const recordTypeId of recordTypesLiveIds.slice(0, 6)) {
+    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", recordTypeId }));
   }
 
   return {
     ok: checks.every((check) => check.ok),
     community,
     recordTypesTested: recordTypeGuesses,
+    recordTypeIdsFromApi: recordTypesLiveIds.slice(0, 10),
+    recordTypesFetched,
+    recordTypesStored,
+    recordTypesSample,
+    experimentalRecordQueryProbes: true,
     checks,
     updatedAt: new Date().toISOString(),
   };
@@ -2226,7 +2952,7 @@ async function createAndPersistStrategicBrief(
 ): Promise<StrategicBrief> {
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
-  const permits: PermitRecord[] = [];
+  const permits: PermitRecord[] = await listStoredPermitRecords(db, 60);
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const parcelContexts = await fetchParcelContextForAddresses(
     Array.from(new Set(briefs.flatMap((brief) => brief.addresses))),
@@ -2710,12 +3436,7 @@ async function fetchOpenGovPlceJson(
     }
   }
 
-  const response = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Token ${apiKey}`,
-      Accept: "application/vnd.api+json",
-    },
-  });
+  const response = await fetch(url.toString(), { headers: buildOpenGovDirectAuthHeaders(apiKey) });
 
   const body = await response.text();
 
@@ -2764,8 +3485,57 @@ function buildOpenGovErrorResponse(
   );
 }
 
-async function buildOpenGovTestPayload(env: Env) {
-  return buildOpenGovPermitsTestPayload(env);
+async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
+  const defaultAddress = "10 Damon Street";
+  const address = normalizeWhitespace(requestedAddress ?? "") || defaultAddress;
+  const base = await buildOpenGovPermitsTestPayload(env, env.OPPORTUNITYDB);
+  let locationFetchError: { message: string; details?: string } | null = null;
+  let matched: OpenGovLocationMatchResult = {
+    input: parseAddressParts(address),
+    pathQueried: "locations?page[number]=1&page[size]=100",
+    totalLocationsChecked: 0,
+    parcelCandidatesConsidered: 0,
+    bestMatch: null,
+    nearMatches: [],
+  };
+  try {
+    const locationFetch = await fetchOpenGovLocations(env);
+    matched = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
+  } catch (error) {
+    locationFetchError = {
+      message: error instanceof Error ? error.message : "OpenGov locations lookup failed.",
+      details: error instanceof OpenGovApiError ? error.details : undefined,
+    };
+  }
+
+  let permitsByLocation: unknown = null;
+  if (matched.bestMatch?.id) {
+    try {
+      permitsByLocation = await fetchOpenGovPlceJson(env, "records", {
+        "page[size]": "25",
+        locationId: matched.bestMatch.id,
+      });
+    } catch (error) {
+      permitsByLocation = {
+        error: error instanceof Error ? error.message : "Permit lookup by locationId failed.",
+      };
+    }
+  }
+
+  return {
+    ...base,
+    addressQueried: address,
+    debug: {
+      normalizedInputAddress: matched.input,
+      plcPathQueried: matched.pathQueried,
+      totalLocationsChecked: matched.totalLocationsChecked,
+      parcelCandidatesConsidered: matched.parcelCandidatesConsidered,
+      bestMatchedLocations: matched.bestMatch ? [matched.bestMatch] : [],
+      nearMatches: matched.nearMatches,
+      permitLookupByLocationId: matched.bestMatch?.id ? { locationId: matched.bestMatch.id, result: permitsByLocation } : null,
+      locationFetchError,
+    },
+  };
 }
 
 function buildOpportunityInputs(
@@ -2789,7 +3559,7 @@ function buildOpportunityInputs(
   return derivedFromBriefs;
 }
 
-async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
+async function runAutomaticIngest(db: D1Database, env: Env): Promise<IngestRunSummary> {
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
   const priorityAddresses = Array.from(
@@ -2800,6 +3570,13 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
 
   const opportunities = buildOpportunityInputs(briefs, parcels);
   const results = await matchAndPersistOpportunities(db, opportunities);
+  if (env.OPENGOV_KEY?.trim()) {
+    try {
+      await ingestOpenGovLocationsAndPermitsForBriefs(db, env, briefs);
+    } catch {
+      // keep ingest operational if OpenGov persistence tables are not migrated yet
+    }
+  }
 
   return {
     parcelsIngested: parcels.length,
@@ -2811,7 +3588,7 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
 
 async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database, env?: Env): Promise<DashboardPayload> {
   const briefs = await buildCaseBriefs(signals);
-  const permits: PermitRecord[] = [];
+  const permits: PermitRecord[] = db ? await listStoredPermitRecords(db, 60) : [];
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const latestStoredBrief = await fetchLatestStrategicBrief(db);
   const parcelContexts = latestStoredBrief
@@ -3931,10 +4708,12 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         openGovTestResults.innerHTML = checks.length
           ? checks.map((check) => {
             const statusLabel = typeof check.status === "number" ? String(check.status) : "n/a";
+            const pathLabel = check.path ? '<p><strong>request:</strong> ' + escapeHtml(String(check.path)) + '</p>' : "";
             const details = check.details ? '<p>' + escapeHtml(String(check.details)) + '</p>' : "";
             return '<li class="recommendation-item">' +
               '<strong>' + escapeHtml(String(check.name || "check")) + ' · ' + escapeHtml(statusLabel) + ' · ' + escapeHtml(check.ok ? "ok" : "failed") + '</strong>' +
               '<p>' + escapeHtml(String(check.message || "")) + '</p>' +
+              pathLabel +
               details +
             '</li>';
           }).join("")
@@ -4595,12 +5374,20 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/api/opengov/record-types") {
       try {
-        const recordTypes = await fetchOpenGovPlceJson(env, "record-types");
+        if (!env.OPPORTUNITYDB) {
+          return withSecurityHeaders(Response.json({ ok: false, error: "OPPORTUNITYDB binding is not configured." }, { status: 503 }));
+        }
+        const ingest = await ingestOpenGovRecordTypes(env.OPPORTUNITYDB, env);
+        const stored = await listStoredOpenGovRecordTypes(env.OPPORTUNITYDB, 250);
         return withSecurityHeaders(
           Response.json({
             ok: true,
             community: env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY,
-            recordTypes,
+            recordTypesFetched: ingest.fetched,
+            recordTypesStored: ingest.stored,
+            recordTypesSample: ingest.sample,
+            storedCount: stored.length,
+            storedRecordTypes: stored,
             updatedAt: new Date().toISOString(),
           }),
         );
@@ -4609,8 +5396,56 @@ export default {
       }
     }
 
+    if (request.method === "GET" && url.pathname === "/api/opengov/locations") {
+      const pagesParam = Number(url.searchParams.get("pages") ?? "1");
+      const pages = Number.isFinite(pagesParam) && pagesParam > 0 ? pagesParam : 1;
+      const persist = url.searchParams.get("persist") === "1";
+      try {
+        const locationFetch = await fetchOpenGovLocations(env, pages);
+        let persisted = 0;
+        if (persist && env.OPPORTUNITYDB) {
+          persisted = await upsertOpenGovLocations(env.OPPORTUNITYDB, env, locationFetch.records);
+        }
+        return withSecurityHeaders(
+          Response.json({
+            ok: true,
+            community: env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY,
+            pagesRequested: pages,
+            pathQueried: locationFetch.path,
+            count: locationFetch.records.length,
+            persisted,
+            locations: locationFetch.records,
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+      } catch (error) {
+        return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov locations lookup failed."));
+      }
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opengov/locations-probe") {
+      try {
+        const probe = await fetchOpenGovLocationNormalizationProbe(env);
+        return withSecurityHeaders(
+          Response.json({
+            ok: true,
+            community: env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY,
+            ...probe,
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+      } catch (error) {
+        return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov location normalization probe failed."));
+      }
+    }
+
     if (request.method === "GET" && url.pathname === "/api/opengov/permits-test") {
-      return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env)));
+      const address = url.searchParams.get("address")?.trim() ?? "";
+      try {
+        return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env, address)));
+      } catch (error) {
+        return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov permits-test lookup failed."));
+      }
     }
 
     if (request.method === "GET" && url.pathname === "/api/debug/signals") {
@@ -4806,7 +5641,7 @@ export default {
       const runId = await startIngestionRun(env.OPPORTUNITYDB, "manual");
 
       try {
-        const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        const summary = await runAutomaticIngest(env.OPPORTUNITYDB, env);
         const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "manual", env);
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
@@ -4846,7 +5681,7 @@ export default {
       const runId = await startIngestionRun(env.OPPORTUNITYDB, "scheduled");
 
       try {
-        const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        const summary = await runAutomaticIngest(env.OPPORTUNITYDB, env);
         const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "scheduled", env);
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
