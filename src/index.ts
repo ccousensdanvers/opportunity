@@ -429,18 +429,18 @@ const SITES: OpportunitySite[] = [
 const ACTIVITIES: ActivityItem[] = [
   {
     time: "08:30",
-    title: "Parcel context is live; permit integration is still gated",
-    detail: "Manual and scheduled runs now screen brief-linked parcels against Danvers assessor, utility, flood, wetlands, and groundwater context. OpenGov permit lookups were tested but are still blocked by platform access controls.",
+    title: "OpenGov test panel now reports exact query params per check",
+    detail: "The PLCE v2 dashboard diagnostics now show each test path and query arguments so staff can see what succeeded, what failed, and what to replay outside the UI.",
   },
   {
     time: "09:15",
-    title: "Parcel drilldowns are live",
-    detail: "Staff can open parcel detail pages from case briefs to see ownership, zoning, value, utility context, environmental flags, and related matched opportunity records.",
+    title: "Record-type tests now include live IDs from OpenGov",
+    detail: "Instead of only trying guessed permit slugs, the Worker now pulls record-types first and tests a sample of IDs returned by the API response.",
   },
   {
     time: "Next",
-    title: "Current build focus: supported permit data access",
-    detail: "Next up is confirming whether Danvers can expose permit data through an OpenGov-supported export, reporting feed, or admin-enabled API instead of blocked public search requests.",
+    title: "Current build focus: move from diagnostics to repeatable permit ingest",
+    detail: "Next up is documenting the best-performing records filters from the new diagnostics and turning those into a stable parcel-linked permit ingestion path.",
   },
 ];
 
@@ -1756,22 +1756,52 @@ async function buildPermitDebugPayload(env?: Env, limit = 8) {
 
 async function buildOpenGovPermitsTestPayload(env: Env) {
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
-  const recordTypeGuesses = ['building-permit', 'electrical-permit', 'plumbing-permit', 'sign-permit'];
+  const recordTypeGuesses = ["building-permit", "electrical-permit", "plumbing-permit", "sign-permit"];
   const checks: OpenGovPlceProbeResult[] = [];
+  const recordTypesLiveIds: string[] = [];
 
-  checks.push(await fetchOpenGovPlceProbe(env, 'record-types'));
-  checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5' }));
-  checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', search: 'danvers' }));
-  checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', q: 'danvers' }));
+  const recordTypesProbe = await fetchOpenGovPlceProbe(env, "record-types");
+  checks.push(recordTypesProbe);
+
+  if (recordTypesProbe.ok) {
+    try {
+      const recordTypesPayload = await fetchOpenGovPlceJson(env, "record-types");
+      const rootItems = Array.isArray(recordTypesPayload)
+        ? recordTypesPayload
+        : Array.isArray((recordTypesPayload as { data?: unknown[] })?.data)
+          ? (recordTypesPayload as { data?: unknown[] }).data ?? []
+          : [];
+      for (const item of rootItems) {
+        if (!item || typeof item !== "object") continue;
+        const candidate = item as Record<string, unknown>;
+        const id = normalizeWhitespace(String(candidate.id ?? candidate.recordTypeId ?? candidate.slug ?? ""));
+        if (!id) continue;
+        if (!recordTypesLiveIds.includes(id)) {
+          recordTypesLiveIds.push(id);
+        }
+      }
+    } catch {
+      // keep guessed tests even if detailed record-type parsing fails
+    }
+  }
+
+  checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5" }));
+  checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", search: "danvers" }));
+  checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", q: "danvers" }));
   for (const recordType of recordTypeGuesses) {
-    checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', recordType }));
-    checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', recordTypeId: recordType }));
+    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", recordType }));
+    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", recordTypeId: recordType }));
+  }
+
+  for (const recordTypeId of recordTypesLiveIds.slice(0, 6)) {
+    checks.push(await fetchOpenGovPlceProbe(env, "records", { "page[size]": "5", recordTypeId }));
   }
 
   return {
     ok: checks.every((check) => check.ok),
     community,
     recordTypesTested: recordTypeGuesses,
+    recordTypeIdsFromApi: recordTypesLiveIds.slice(0, 10),
     checks,
     updatedAt: new Date().toISOString(),
   };
@@ -4339,10 +4369,12 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         openGovTestResults.innerHTML = checks.length
           ? checks.map((check) => {
             const statusLabel = typeof check.status === "number" ? String(check.status) : "n/a";
+            const pathLabel = check.path ? '<p><strong>request:</strong> ' + escapeHtml(String(check.path)) + '</p>' : "";
             const details = check.details ? '<p>' + escapeHtml(String(check.details)) + '</p>' : "";
             return '<li class="recommendation-item">' +
               '<strong>' + escapeHtml(String(check.name || "check")) + ' · ' + escapeHtml(statusLabel) + ' · ' + escapeHtml(check.ok ? "ok" : "failed") + '</strong>' +
               '<p>' + escapeHtml(String(check.message || "")) + '</p>' +
+              pathLabel +
               details +
             '</li>';
           }).join("")
