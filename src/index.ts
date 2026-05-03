@@ -21,6 +21,7 @@ interface Env {
   OPENGOV_KEY?: string;
   OPENGOV_COMMUNITY?: string;
   OPENGOV_RECORDS_ENABLED?: string;
+  OPENGOV_INGEST_MIN_INTERVAL_MINUTES?: string;
 }
 
 interface IngestMessage {
@@ -1896,6 +1897,60 @@ async function listStoredPermitRecords(db: D1Database, limit = 50): Promise<Perm
   }
 }
 
+async function listStoredOpenGovLocations(db: D1Database, limit = 2500): Promise<OpenGovLocationRecord[]> {
+  try {
+    const rows = await db.prepare(`SELECT * FROM opengov_locations ORDER BY updated_at DESC LIMIT ?`).bind(limit).all<Record<string, unknown>>();
+    return (rows.results ?? []).map((row) => ({
+      id: typeof row.id === "string" ? row.id : null,
+      type: typeof row.source_type === "string" ? row.source_type : null,
+      name: typeof row.name === "string" ? row.name : null,
+      latitude: coerceOptionalNumber(row.latitude),
+      longitude: coerceOptionalNumber(row.longitude),
+      locationType: typeof row.location_type === "string" ? row.location_type : null,
+      ownerName: typeof row.owner_name === "string" ? row.owner_name : null,
+      ownerStreetNumber: typeof row.owner_street_number === "string" ? row.owner_street_number : null,
+      ownerStreetName: typeof row.owner_street_name === "string" ? row.owner_street_name : null,
+      ownerUnit: typeof row.owner_unit === "string" ? row.owner_unit : null,
+      ownerCity: typeof row.owner_city === "string" ? row.owner_city : null,
+      ownerState: typeof row.owner_state === "string" ? row.owner_state : null,
+      ownerPostalCode: typeof row.owner_postal_code === "string" ? row.owner_postal_code : null,
+      ownerCountry: typeof row.owner_country === "string" ? row.owner_country : null,
+      ownerEmail: typeof row.owner_email === "string" ? row.owner_email : null,
+      streetNo: typeof row.street_no === "string" ? row.street_no : null,
+      streetName: typeof row.street_name === "string" ? row.street_name : null,
+      unit: typeof row.unit === "string" ? row.unit : null,
+      city: typeof row.city === "string" ? row.city : null,
+      state: typeof row.state === "string" ? row.state : null,
+      postalCode: typeof row.postal_code === "string" ? row.postal_code : null,
+      country: typeof row.country === "string" ? row.country : null,
+      secondaryLatitude: coerceOptionalNumber(row.secondary_latitude),
+      secondaryLongitude: coerceOptionalNumber(row.secondary_longitude),
+      segmentPrimaryLabel: typeof row.segment_primary_label === "string" ? row.segment_primary_label : null,
+      segmentSecondaryLabel: typeof row.segment_secondary_label === "string" ? row.segment_secondary_label : null,
+      segmentLabel: typeof row.segment_label === "string" ? row.segment_label : null,
+      segmentLength: coerceOptionalNumber(row.segment_length),
+      ownerPhoneNo: typeof row.owner_phone_no === "string" ? row.owner_phone_no : null,
+      lotArea: coerceOptionalNumber(row.lot_area),
+      gisID: typeof row.gis_id === "string" ? row.gis_id : null,
+      occupancyType: typeof row.occupancy_type === "string" ? row.occupancy_type : null,
+      propertyUse: typeof row.property_use === "string" ? row.property_use : null,
+      sewage: typeof row.sewage === "string" ? row.sewage : null,
+      water: typeof row.water === "string" ? row.water : null,
+      yearBuilt: coerceOptionalNumber(row.year_built),
+      zoning: typeof row.zoning === "string" ? row.zoning : null,
+      buildingType: typeof row.building_type === "string" ? row.building_type : null,
+      notes: typeof row.notes === "string" ? row.notes : null,
+      subdivision: typeof row.subdivision === "string" ? row.subdivision : null,
+      archived: coerceOptionalBoolean(row.archived),
+      mbl: typeof row.mbl === "string" ? row.mbl : null,
+      matID: typeof row.mat_id === "string" ? row.mat_id : null,
+      sourceUpdatedAt: typeof row.source_updated_at === "string" ? row.source_updated_at : null,
+    }));
+  } catch {
+    return [];
+  }
+}
+
 function matchOpenGovLocationForAddress(
   address: string,
   pathQueried: string,
@@ -3466,46 +3521,42 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
   const defaultAddress = "10 Damon Street";
   const address = normalizeWhitespace(requestedAddress ?? "") || defaultAddress;
   const base = await buildOpenGovPermitsTestPayload(env, env.OPPORTUNITYDB);
-  let locationFetchError: { message: string; details?: string } | null = null;
   let matched: OpenGovLocationMatchResult = {
     input: parseAddressParts(address),
-    pathQueried: "locations?page[number]=1&page[size]=100",
+    pathQueried: "opengov_locations cache",
     totalLocationsChecked: 0,
     parcelCandidatesConsidered: 0,
     bestMatch: null,
     nearMatches: [],
   };
-  let locationsFetchedThisRun = 0;
-  let locationsStoredThisRun = 0;
-  let locationsTotalRecords: number | null = null;
+  let cachedLocationCount = 0;
+  let status = "OpenGov location cache is empty. Run POST /ingest to populate it.";
   let locationSchemaDrift: { table: string; missingColumns: string[]; presentColumns: string[] } | null = null;
   try {
-    const locationFetch = await fetchOpenGovLocations(env);
-    locationsFetchedThisRun = locationFetch.fetched;
-    locationsTotalRecords = locationFetch.totalRecords;
     if (env.OPPORTUNITYDB) {
-      locationsStoredThisRun = await upsertOpenGovLocations(env.OPPORTUNITYDB, env, locationFetch.records);
+      const cachedLocations = await listStoredOpenGovLocations(env.OPPORTUNITYDB, 20000);
+      cachedLocationCount = cachedLocations.length;
+      matched = matchOpenGovLocationForAddress(address, "opengov_locations cache", cachedLocations);
+      if (cachedLocationCount > 0) {
+        status = "OpenGov location cache available. Run POST /ingest to refresh.";
+      }
     }
-    matched = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
   } catch (error) {
     if (env.OPPORTUNITYDB) {
       locationSchemaDrift = await detectOpenGovLocationSchemaDrift(env.OPPORTUNITYDB);
     }
-    locationFetchError = {
-      message: error instanceof Error ? error.message : "OpenGov locations lookup failed.",
-      details: error instanceof OpenGovApiError ? error.details : undefined,
-    };
+    status = error instanceof Error ? error.message : "OpenGov locations lookup failed.";
   }
 
   return {
     ...base,
     addressQueried: address,
-    locationsAvailable: locationsFetchedThisRun > 0,
-    locationsFetchedThisRun,
-    locationsStoredThisRun,
-    locationsTotalRecords,
+    locationsAvailable: cachedLocationCount > 0,
+    locationsFetchedThisRun: 0,
+    locationsStoredThisRun: 0,
+    locationsTotalRecords: cachedLocationCount,
     matchedLocation: matched.bestMatch,
-    status: "OpenGov locations enabled; records unavailable/not enabled",
+    status,
     debug: {
       normalizedInputAddress: matched.input,
       plcPathQueried: matched.pathQueried,
@@ -3513,10 +3564,111 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
       parcelCandidatesConsidered: matched.parcelCandidatesConsidered,
       bestMatchedLocations: matched.bestMatch ? [matched.bestMatch] : [],
       nearMatches: matched.nearMatches,
-      locationFetchError,
+      locationFetchError: null,
       locationSchemaDrift,
     },
   };
+}
+
+async function ensureOpenGovSyncRunsTable(db: D1Database): Promise<void> {
+  await db.prepare(`CREATE TABLE IF NOT EXISTS opengov_sync_runs (
+    id TEXT PRIMARY KEY,
+    sync_type TEXT NOT NULL,
+    source_community TEXT NOT NULL,
+    status TEXT NOT NULL,
+    fetched_count INTEGER DEFAULT 0,
+    stored_count INTEGER DEFAULT 0,
+    total_records INTEGER,
+    pages_fetched INTEGER,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    error_message TEXT
+  );`).run();
+}
+
+async function getLastSuccessfulOpenGovLocationSync(db: D1Database): Promise<string | null> {
+  await ensureOpenGovSyncRunsTable(db);
+  const row = await db.prepare(
+    `SELECT completed_at AS completedAt
+     FROM opengov_sync_runs
+     WHERE sync_type = 'locations' AND status = 'completed' AND completed_at IS NOT NULL
+     ORDER BY completed_at DESC
+     LIMIT 1`,
+  ).first<{ completedAt: string | null }>();
+  return row?.completedAt ?? null;
+}
+
+async function runOpenGovLocationsIngest(db: D1Database, env: Env, force = false): Promise<Record<string, unknown>> {
+  const minIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10) || 1440;
+  const lastSuccessfulIngestAt = await getLastSuccessfulOpenGovLocationSync(db);
+  if (!force && lastSuccessfulIngestAt) {
+    const elapsedMinutes = Math.floor((Date.now() - Date.parse(lastSuccessfulIngestAt)) / 60000);
+    if (Number.isFinite(elapsedMinutes) && elapsedMinutes >= 0 && elapsedMinutes < minIntervalMinutes) {
+      return {
+        mode: "activity-ingest",
+        locationsIngestAttempted: false,
+        locationsFetchedThisRun: 0,
+        locationsStoredThisRun: 0,
+        locationsTotalRecords: 0,
+        pagesFetched: 0,
+        skipped: true,
+        skipReason: `Last successful OpenGov location ingest was less than ${minIntervalMinutes / 60} hours ago.`,
+        lastSuccessfulIngestAt,
+        recordsEnabled: recordsEnabled(env),
+        recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
+        error: null,
+      };
+    }
+  }
+
+  const runId = crypto.randomUUID();
+  const startedAt = new Date().toISOString();
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  await ensureOpenGovSyncRunsTable(db);
+  await db.prepare(`INSERT INTO opengov_sync_runs (id, sync_type, source_community, status, started_at) VALUES (?, 'locations', ?, 'running', ?)`)
+    .bind(runId, community, startedAt).run();
+  try {
+    const locationFetch = await fetchOpenGovLocations(env);
+    const stored = await upsertOpenGovLocations(db, env, locationFetch.records);
+    const completedAt = new Date().toISOString();
+    await db.prepare(`UPDATE opengov_sync_runs SET status='completed', fetched_count=?, stored_count=?, total_records=?, pages_fetched=?, completed_at=? WHERE id=?`)
+      .bind(locationFetch.fetched, stored, locationFetch.totalRecords, locationFetch.pagesFetched, completedAt, runId).run();
+    return {
+      mode: "activity-ingest",
+      locationsAvailable: true,
+      locationsIngestAttempted: true,
+      locationsFetchedThisRun: locationFetch.fetched,
+      locationsStoredThisRun: stored,
+      locationsTotalRecords: locationFetch.totalRecords ?? locationFetch.fetched,
+      pagesFetched: locationFetch.pagesFetched,
+      skipped: false,
+      skipReason: null,
+      lastSuccessfulIngestAt: completedAt,
+      recordsEnabled: recordsEnabled(env),
+      recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
+      error: null,
+    };
+  } catch (error) {
+    const completedAt = new Date().toISOString();
+    const message = error instanceof Error ? error.message : "OpenGov locations ingest failed.";
+    await db.prepare(`UPDATE opengov_sync_runs SET status='failed', completed_at=?, error_message=? WHERE id=?`)
+      .bind(completedAt, message, runId).run();
+    return {
+      mode: "activity-ingest",
+      locationsAvailable: true,
+      locationsIngestAttempted: true,
+      locationsFetchedThisRun: 0,
+      locationsStoredThisRun: 0,
+      locationsTotalRecords: 0,
+      pagesFetched: 0,
+      skipped: false,
+      skipReason: null,
+      lastSuccessfulIngestAt,
+      recordsEnabled: recordsEnabled(env),
+      recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
+      error: message,
+    };
+  }
 }
 
 async function detectOpenGovLocationSchemaDrift(db: D1Database): Promise<{ table: string; missingColumns: string[]; presentColumns: string[] } | null> {
@@ -5656,10 +5808,31 @@ export default {
       }
 
       const runId = await startIngestionRun(env.OPPORTUNITYDB, "manual");
+      const forceOpenGov = url.searchParams.get("opengov") === "force";
 
       try {
         const summary = await runAutomaticIngest(env.OPPORTUNITYDB, env);
         const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "manual", env);
+        let opengov: Record<string, unknown>;
+        if (!env.OPENGOV_KEY?.trim()) {
+          opengov = {
+            mode: "activity-ingest",
+            locationsAvailable: false,
+            locationsIngestAttempted: false,
+            locationsFetchedThisRun: 0,
+            locationsStoredThisRun: 0,
+            locationsTotalRecords: 0,
+            pagesFetched: 0,
+            skipped: true,
+            skipReason: "OpenGov is not configured",
+            lastSuccessfulIngestAt: null,
+            recordsEnabled: recordsEnabled(env),
+            recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
+            error: "OpenGov is not configured",
+          };
+        } else {
+          opengov = await runOpenGovLocationsIngest(env.OPPORTUNITYDB, env, forceOpenGov);
+        }
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
         return withSecurityHeaders(
@@ -5670,6 +5843,7 @@ export default {
               "Manual ingest completed: Danvers parcels refreshed, case briefs rebuilt, opportunities matched, and a strategic brief was saved for the dashboard.",
             summary,
             strategicBrief,
+            opengov,
           }),
         );
       } catch (error) {
