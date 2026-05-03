@@ -73,6 +73,16 @@ interface PermitRecord {
 }
 
 
+
+interface OpenGovLocationMatchResult {
+  targetAddress: string;
+  normalizedTargetAddress: string;
+  matchedLocationIds: string[];
+  matchedLocations: Array<Record<string, unknown>>;
+  totalLocationsChecked: number;
+}
+
+
 class OpenGovApiError extends Error {
   status: number;
   details: string;
@@ -1114,6 +1124,9 @@ interface OpenGovPlceProbeResult {
   status: number;
   parsedCount: number;
   responsePreview?: string;
+  locationPreview?: Array<Record<string, unknown>>;
+  locationIds?: string[];
+  locationAddressFields?: string[];
   error?: string;
 }
 
@@ -1141,10 +1154,39 @@ async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Reco
     const text = await response.text();
     let parsedCount = 0;
     let preview = '';
+    let locationPreview: Array<Record<string, unknown>> = [];
+    let locationIds: string[] = [];
+    let locationAddressFields: string[] = [];
     if (response.ok) {
       try {
         const payload = JSON.parse(text) as { data?: unknown };
-        parsedCount = Array.isArray(payload?.data) ? payload.data.length : 0;
+        const data = Array.isArray(payload?.data)
+          ? payload.data.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+          : [];
+        parsedCount = data.length;
+        if (path === "locations") {
+          locationPreview = data.slice(0, 3).map((location) => {
+            const preview: Record<string, unknown> = {};
+            for (const [key, value] of Object.entries(location)) {
+              if (typeof value === "string" || typeof value === "number") {
+                preview[key] = value;
+              }
+            }
+            return preview;
+          });
+          locationIds = Array.from(new Set(data.map((location) => extractOpenGovLocationId(location)).filter((value): value is string => Boolean(value))));
+          const addressFieldTokens = ["address", "street", "city", "state", "zip", "postal", "location"];
+          const fields = new Set<string>();
+          for (const location of data.slice(0, 10)) {
+            for (const key of Object.keys(location)) {
+              const lowered = key.toLowerCase();
+              if (addressFieldTokens.some((token) => lowered.includes(token))) {
+                fields.add(key);
+              }
+            }
+          }
+          locationAddressFields = Array.from(fields);
+        }
       } catch {
         parsedCount = 0;
       }
@@ -1159,6 +1201,9 @@ async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Reco
       ok: response.ok,
       status: response.status,
       parsedCount,
+      locationPreview: locationPreview.length ? locationPreview : undefined,
+      locationIds: locationIds.length ? locationIds : undefined,
+      locationAddressFields: locationAddressFields.length ? locationAddressFields : undefined,
       responsePreview: preview || undefined,
     };
   } catch (error) {
@@ -1183,13 +1228,121 @@ function buildRecordsQueryCandidates(searchTerm: string): Array<Record<string, s
   ];
 }
 
+
+function getOpenGovLocationAddressCandidates(location: Record<string, unknown>): string[] {
+  const candidates: string[] = [];
+
+  for (const value of Object.values(location)) {
+    if (typeof value === "string") {
+      const normalized = normalizeWhitespace(value);
+      if (normalized) candidates.push(normalized);
+      continue;
+    }
+
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      for (const nestedValue of Object.values(value as Record<string, unknown>)) {
+        if (typeof nestedValue !== "string") continue;
+        const normalized = normalizeWhitespace(nestedValue);
+        if (normalized) candidates.push(normalized);
+      }
+    }
+  }
+
+  return Array.from(new Set(candidates));
+}
+
+function extractOpenGovLocationId(location: Record<string, unknown>): string | null {
+  const idCandidateKeys = ["id", "locationId", "location_id", "uuid", "referenceId"];
+  for (const key of idCandidateKeys) {
+    const value = location[key];
+    if (typeof value === "string" && normalizeWhitespace(value)) {
+      return normalizeWhitespace(value);
+    }
+  }
+  return null;
+}
+
+async function fetchOpenGovLocations(env: Env, pageSize = 100): Promise<Array<Record<string, unknown>>> {
+  const payload = await fetchOpenGovPlceJson(env, "locations", { "page[size]": String(pageSize) });
+  if (Array.isArray(payload)) {
+    return payload.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object");
+  }
+
+  if (payload && typeof payload === "object") {
+    const objectPayload = payload as { data?: unknown; results?: unknown; items?: unknown };
+    const collections = [objectPayload.data, objectPayload.results, objectPayload.items];
+    for (const collection of collections) {
+      if (!Array.isArray(collection)) continue;
+      return collection.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object");
+    }
+  }
+
+  return [];
+}
+
+function findLikelyLocationIdsForAddress(targetAddress: string, locations: Array<Record<string, unknown>>): OpenGovLocationMatchResult {
+  const normalizedTargetAddress = normalizeAddress(targetAddress) || "";
+  if (!normalizedTargetAddress) {
+    return {
+      targetAddress,
+      normalizedTargetAddress,
+      matchedLocationIds: [],
+      matchedLocations: [],
+      totalLocationsChecked: locations.length,
+    };
+  }
+  const matchedLocations = locations.filter((location) => {
+    const candidates = getOpenGovLocationAddressCandidates(location);
+    return candidates.some((candidate) => {
+      const normalizedCandidate = normalizeAddress(candidate) || "";
+      if (!normalizedCandidate) return false;
+      return normalizedCandidate === normalizedTargetAddress || normalizedCandidate.includes(normalizedTargetAddress);
+    });
+  });
+
+  const matchedLocationIds = Array.from(new Set(matchedLocations.map((location) => extractOpenGovLocationId(location)).filter((value): value is string => Boolean(value))));
+
+  return {
+    targetAddress,
+    normalizedTargetAddress,
+    matchedLocationIds,
+    matchedLocations: matchedLocations.slice(0, 5),
+    totalLocationsChecked: locations.length,
+  };
+}
+
 async function fetchPermitRecords(addresses: string[], env?: Env): Promise<PermitRecord[]> {
   if (!env) return [];
   const records: PermitRecord[] = [];
   const seen = new Set<string>();
   const uniqueAddresses = Array.from(new Set(addresses.map((value) => normalizeWhitespace(value)).filter(Boolean))).slice(0, 24);
+  let locationsCache: Array<Record<string, unknown>> | null = null;
 
   for (const address of uniqueAddresses) {
+    if (locationsCache === null) {
+      try {
+        locationsCache = await fetchOpenGovLocations(env, 100);
+      } catch {
+        locationsCache = [];
+      }
+    }
+    const matchedLocationIds = findLikelyLocationIdsForAddress(address, locationsCache).matchedLocationIds;
+    const locationQueries = matchedLocationIds.slice(0, 3).map((locationId) => ({ 'page[size]': '25', locationId }));
+    for (const locationQuery of locationQueries) {
+      try {
+        const payload = await fetchOpenGovPlceJson(env, 'records', locationQuery);
+        const parsed = parseOpenGovPermitResults(payload, address);
+        for (const record of parsed) {
+          const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ''}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          records.push(record);
+        }
+      } catch {
+        continue;
+      }
+    }
+
     for (const variant of buildOpenGovAddressVariants(address)) {
       let matchedVariant = false;
       for (const query of buildRecordsQueryCandidates(variant)) {
@@ -1247,7 +1400,9 @@ async function buildOpenGovPermitsTestPayload(env: Env) {
   const recordTypeGuesses = ['building-permit', 'electrical-permit', 'plumbing-permit', 'sign-permit'];
   const checks: OpenGovPlceProbeResult[] = [];
 
+  checks.push(await fetchOpenGovPlceProbe(env, 'organization'));
   checks.push(await fetchOpenGovPlceProbe(env, 'record-types'));
+  checks.push(await fetchOpenGovPlceProbe(env, 'locations', { 'page[size]': '100' }));
   checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5' }));
   checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', search: 'danvers' }));
   checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', q: 'danvers' }));
