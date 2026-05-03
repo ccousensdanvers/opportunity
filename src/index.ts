@@ -1327,6 +1327,92 @@ async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenG
   return uniqueLocations.length;
 }
 
+async function upsertOpenGovPermitRecords(
+  db: D1Database,
+  env: Env,
+  locationId: string,
+  matchedAddress: string,
+  records: PermitRecord[],
+): Promise<number> {
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const now = new Date().toISOString();
+  let written = 0;
+  for (const record of records) {
+    const recordKey = `${locationId}|${record.permitNumber ?? ""}|${record.permitType}|${record.issuedDate}|${normalizeAddress(record.siteAddress)}`;
+    await db
+      .prepare(
+        `INSERT INTO opengov_permit_records (
+          record_key, location_id, matched_address, site_address, permit_type, status, issued_date, permit_number, detail_url, applicant_name, source_community, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(record_key) DO UPDATE SET
+          location_id = excluded.location_id,
+          matched_address = excluded.matched_address,
+          site_address = excluded.site_address,
+          permit_type = excluded.permit_type,
+          status = excluded.status,
+          issued_date = excluded.issued_date,
+          permit_number = excluded.permit_number,
+          detail_url = excluded.detail_url,
+          applicant_name = excluded.applicant_name,
+          source_community = excluded.source_community,
+          updated_at = excluded.updated_at`,
+      )
+      .bind(
+        recordKey,
+        locationId,
+        matchedAddress,
+        record.siteAddress,
+        record.permitType,
+        record.status,
+        record.issuedDate,
+        record.permitNumber,
+        record.detailUrl,
+        record.applicantName,
+        community,
+        now,
+      )
+      .run();
+    written += 1;
+  }
+  return written;
+}
+
+async function ingestOpenGovLocationsAndPermitsForBriefs(db: D1Database, env: Env, briefs: CaseBrief[]): Promise<{ locationsStored: number; permitsStored: number; addressesMatched: number }> {
+  const addresses = Array.from(new Set(briefs.flatMap((brief) => brief.addresses).map((value) => normalizeWhitespace(value)).filter(Boolean)));
+  if (!addresses.length) return { locationsStored: 0, permitsStored: 0, addressesMatched: 0 };
+
+  const locationFetch = await fetchOpenGovLocations(env, 5);
+  const locationsStored = await upsertOpenGovLocations(db, env, locationFetch.records);
+  let permitsStored = 0;
+  let addressesMatched = 0;
+
+  for (const address of addresses) {
+    const match = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
+    const locationId = match.bestMatch?.id;
+    if (!locationId) continue;
+    addressesMatched += 1;
+    try {
+      const payload = await fetchOpenGovPlceJson(env, "records", { "filter[locationID]": locationId, "page[size]": "25" });
+      const records = parseOpenGovPermitResults(payload, address);
+      permitsStored += await upsertOpenGovPermitRecords(db, env, locationId, address, records);
+    } catch {
+      continue;
+    }
+  }
+
+  return { locationsStored, permitsStored, addressesMatched };
+}
+
+async function listStoredPermitRecords(db: D1Database, limit = 50): Promise<PermitRecord[]> {
+  const rows = await db.prepare(
+    `SELECT applicant_name AS applicantName, site_address AS siteAddress, permit_type AS permitType, status, issued_date AS issuedDate, permit_number AS permitNumber, detail_url AS detailUrl
+     FROM opengov_permit_records
+     ORDER BY updated_at DESC
+     LIMIT ?`,
+  ).bind(limit).all<PermitRecord>();
+  return (rows.results ?? []).map((row) => ({ ...row, source: "OpenGov PLCE records API (stored)" }));
+}
+
 function matchOpenGovLocationForAddress(
   address: string,
   pathQueried: string,
@@ -2301,7 +2387,7 @@ async function createAndPersistStrategicBrief(
 ): Promise<StrategicBrief> {
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
-  const permits: PermitRecord[] = [];
+  const permits: PermitRecord[] = await listStoredPermitRecords(db, 60);
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const parcelContexts = await fetchParcelContextForAddresses(
     Array.from(new Set(briefs.flatMap((brief) => brief.addresses))),
@@ -2908,7 +2994,7 @@ function buildOpportunityInputs(
   return derivedFromBriefs;
 }
 
-async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
+async function runAutomaticIngest(db: D1Database, env: Env): Promise<IngestRunSummary> {
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
   const priorityAddresses = Array.from(
@@ -2919,6 +3005,9 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
 
   const opportunities = buildOpportunityInputs(briefs, parcels);
   const results = await matchAndPersistOpportunities(db, opportunities);
+  if (env.OPENGOV_KEY?.trim()) {
+    await ingestOpenGovLocationsAndPermitsForBriefs(db, env, briefs);
+  }
 
   return {
     parcelsIngested: parcels.length,
@@ -2930,7 +3019,7 @@ async function runAutomaticIngest(db: D1Database): Promise<IngestRunSummary> {
 
 async function buildDashboardPayload(signals: AgendaSignal[], db?: D1Database, env?: Env): Promise<DashboardPayload> {
   const briefs = await buildCaseBriefs(signals);
-  const permits: PermitRecord[] = [];
+  const permits: PermitRecord[] = db ? await listStoredPermitRecords(db, 60) : [];
   const reviewSummary = await fetchDashboardReviewSummary(db);
   const latestStoredBrief = await fetchLatestStrategicBrief(db);
   const parcelContexts = latestStoredBrief
@@ -4957,7 +5046,7 @@ export default {
       const runId = await startIngestionRun(env.OPPORTUNITYDB, "manual");
 
       try {
-        const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        const summary = await runAutomaticIngest(env.OPPORTUNITYDB, env);
         const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "manual", env);
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
@@ -4997,7 +5086,7 @@ export default {
       const runId = await startIngestionRun(env.OPPORTUNITYDB, "scheduled");
 
       try {
-        const summary = await runAutomaticIngest(env.OPPORTUNITYDB);
+        const summary = await runAutomaticIngest(env.OPPORTUNITYDB, env);
         const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "scheduled", env);
         await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
 
