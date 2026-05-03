@@ -1490,6 +1490,15 @@ function scoreLocationMatch(input: ParsedAddressParts, location: OpenGovLocation
   return score;
 }
 
+function classifyOpenGovMatchConfidence(score: number, match?: OpenGovLocationRecord | null): "high" | "medium" | "low" | "none" {
+  if (!match) return "none";
+  const isDanvers = (match.city ?? "").toLowerCase() === "danvers" && (match.state ?? "").toUpperCase() === "MA" && (match.postalCode ?? "") === "01923";
+  if (score >= 320 && match.locationType === "PARCEL" && isDanvers) return "high";
+  if (score >= 260) return "medium";
+  if (score > 0) return "low";
+  return "none";
+}
+
 async function fetchOpenGovLocationsPage(
   env: Env,
   pageNumber = 1,
@@ -1830,16 +1839,18 @@ async function upsertOpenGovLocationMatch(
   matchScore: number,
   matchReason: string,
 ): Promise<void> {
+  const matchConfidence = classifyOpenGovMatchConfidence(matchScore, location);
   const normalizedAddress = normalizeAddress(discoveredAddress);
   const rowId = `${slugify(brief.board)}|${brief.id}|${normalizedAddress}|${location.id ?? ""}`;
   const now = new Date().toISOString();
   await db.prepare(`INSERT INTO opengov_location_matches (
-      id, source_kind, source_id, source_title, discovered_address, normalized_address, location_id, match_score, match_reason,
+      id, source_kind, source_id, source_title, discovered_address, normalized_address, location_id, match_score, match_confidence, match_reason,
       location_type, street_no, street_name, city, state, postal_code, mbl, mat_id, gis_id, owner_name, latitude, longitude, source_updated_at, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       source_title = excluded.source_title,
       match_score = excluded.match_score,
+      match_confidence = excluded.match_confidence,
       match_reason = excluded.match_reason,
       location_type = excluded.location_type,
       street_no = excluded.street_no,
@@ -1864,6 +1875,7 @@ async function upsertOpenGovLocationMatch(
       normalizedAddress,
       location.id,
       Math.round(matchScore),
+      matchConfidence,
       matchReason,
       location.locationType,
       location.streetNo,
@@ -1949,6 +1961,31 @@ async function listStoredOpenGovLocations(db: D1Database, limit = 2500): Promise
   } catch {
     return [];
   }
+}
+
+async function searchStoredOpenGovLocations(db: D1Database, query: string, limit: number): Promise<Record<string, unknown>[]> {
+  const q = query.trim();
+  if (!q) return [];
+  const like = `%${q.toLowerCase()}%`;
+  const rows = await db.prepare(`SELECT id, location_type, street_no, street_name, city, state, postal_code, owner_name, mbl, mat_id, gis_id, latitude, longitude, source_updated_at
+    FROM opengov_locations
+    WHERE LOWER(COALESCE(street_no, '') || ' ' || COALESCE(street_name, '')) LIKE ?
+      OR LOWER(COALESCE(street_name, '')) LIKE ?
+      OR LOWER(COALESCE(owner_name, '')) LIKE ?
+      OR LOWER(COALESCE(mbl, '')) LIKE ?
+      OR LOWER(COALESCE(mat_id, '')) LIKE ?
+      OR LOWER(COALESCE(gis_id, '')) LIKE ?
+      OR id = ?
+    ORDER BY updated_at DESC
+    LIMIT ?`).bind(like, like, like, like, like, like, q, limit).all<Record<string, unknown>>();
+  return rows.results ?? [];
+}
+
+async function listLowConfidenceOpenGovLocationMatches(db: D1Database, limit: number, includeMedium = false): Promise<Record<string, unknown>[]> {
+  const confs = includeMedium ? ["low", "medium"] : ["low"];
+  const marks = confs.map(() => "?").join(",");
+  const rows = await db.prepare(`SELECT * FROM opengov_location_matches WHERE match_confidence IN (${marks}) ORDER BY updated_at DESC LIMIT ?`).bind(...confs, limit).all<Record<string, unknown>>();
+  return rows.results ?? [];
 }
 
 function matchOpenGovLocationForAddress(
@@ -5615,6 +5652,40 @@ export default {
       } catch (error) {
         return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov permits-test lookup failed."));
       }
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opengov/locations/search") {
+      if (!env.OPPORTUNITYDB) return withSecurityHeaders(Response.json({ error: "D1 not configured" }, { status: 500 }));
+      const q = (url.searchParams.get("q") ?? "").trim();
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? "25") || 25, 1), 100);
+      if (q.length < 2) return withSecurityHeaders(Response.json({ query: q, results: [] }));
+      const rows = await searchStoredOpenGovLocations(env.OPPORTUNITYDB, q, limit);
+      const results = rows.map((row) => ({
+        id: row.id,
+        locationType: row.location_type,
+        displayAddress: `${row.street_no ?? ""} ${row.street_name ?? ""}`.trim(),
+        streetNo: row.street_no,
+        streetName: row.street_name,
+        city: row.city,
+        state: row.state,
+        postalCode: row.postal_code,
+        ownerName: row.owner_name,
+        mbl: row.mbl,
+        matID: row.mat_id,
+        gisID: row.gis_id,
+        latitude: row.latitude,
+        longitude: row.longitude,
+        sourceUpdatedAt: row.source_updated_at,
+      }));
+      return withSecurityHeaders(Response.json({ query: q, limit, results }));
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opengov/location-matches/review") {
+      if (!env.OPPORTUNITYDB) return withSecurityHeaders(Response.json({ error: "D1 not configured" }, { status: 500 }));
+      const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? "50") || 50, 1), 200);
+      const includeMedium = ["1", "true", "yes"].includes((url.searchParams.get("includeMedium") ?? "").toLowerCase());
+      const results = await listLowConfidenceOpenGovLocationMatches(env.OPPORTUNITYDB, limit, includeMedium);
+      return withSecurityHeaders(Response.json({ limit, includeMedium, results }));
     }
 
     if (request.method === "GET" && url.pathname === "/api/debug/signals") {
