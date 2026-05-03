@@ -1242,14 +1242,89 @@ function scoreLocationMatch(input: ParsedAddressParts, location: OpenGovLocation
   return score;
 }
 
-async function fetchOpenGovLocations(env: Env): Promise<{ path: string; records: OpenGovLocationRecord[] }> {
-  const path = "locations?page[size]=500";
-  const payload = await fetchOpenGovPlceJson(env, "locations", { "page[size]": "500" }) as { data?: unknown[] };
+async function fetchOpenGovLocationsPage(
+  env: Env,
+  pageNumber = 1,
+  pageSize = 100,
+): Promise<{ path: string; records: OpenGovLocationRecord[]; hasNextPage: boolean }> {
+  const safePageSize = Math.max(1, Math.min(100, Math.trunc(pageSize)));
+  const safePageNumber = Math.max(1, Math.trunc(pageNumber));
+  const path = `locations?page[number]=${safePageNumber}&page[size]=${safePageSize}`;
+  const payload = await fetchOpenGovPlceJson(env, "locations", {
+    "page[number]": String(safePageNumber),
+    "page[size]": String(safePageSize),
+  }) as { data?: unknown[]; links?: { next?: unknown } };
   const data = Array.isArray(payload?.data) ? payload.data : [];
   const records = data
     .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object")
     .map((value) => normalizeOpenGovLocation(value));
-  return { path, records };
+  const hasNextPage = Boolean(payload?.links && typeof payload.links === "object" && payload.links.next);
+  return { path, records, hasNextPage };
+}
+
+async function fetchOpenGovLocations(env: Env, maxPages = 1): Promise<{ path: string; records: OpenGovLocationRecord[] }> {
+  const cappedPages = Math.max(1, Math.min(20, Math.trunc(maxPages)));
+  const allRecords: OpenGovLocationRecord[] = [];
+  const paths: string[] = [];
+  for (let page = 1; page <= cappedPages; page += 1) {
+    const result = await fetchOpenGovLocationsPage(env, page, 100);
+    paths.push(result.path);
+    allRecords.push(...result.records);
+    if (!result.hasNextPage || result.records.length < 100) {
+      break;
+    }
+  }
+  return { path: paths.join(", "), records: allRecords };
+}
+
+async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenGovLocationRecord[]): Promise<number> {
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const now = new Date().toISOString();
+  const uniqueLocations = Array.from(
+    new Map(
+      locations
+        .filter((location) => Boolean(location.id))
+        .map((location) => [location.id as string, location]),
+    ).values(),
+  );
+
+  for (const location of uniqueLocations) {
+    await db
+      .prepare(
+        `INSERT INTO opengov_locations (
+          id, location_type, street_no, street_name, city, state, postal_code, gis_id, mbl, mat_id, source_community, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          location_type = excluded.location_type,
+          street_no = excluded.street_no,
+          street_name = excluded.street_name,
+          city = excluded.city,
+          state = excluded.state,
+          postal_code = excluded.postal_code,
+          gis_id = excluded.gis_id,
+          mbl = excluded.mbl,
+          mat_id = excluded.mat_id,
+          source_community = excluded.source_community,
+          updated_at = excluded.updated_at`,
+      )
+      .bind(
+        location.id,
+        location.locationType,
+        location.streetNo,
+        location.streetName,
+        location.city,
+        location.state,
+        location.postalCode,
+        location.gisID,
+        location.mbl,
+        location.matID,
+        community,
+        now,
+      )
+      .run();
+  }
+
+  return uniqueLocations.length;
 }
 
 function matchOpenGovLocationForAddress(
@@ -2766,7 +2841,7 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
   let locationFetchError: { message: string; details?: string } | null = null;
   let matched: OpenGovLocationMatchResult = {
     input: parseAddressParts(address),
-    pathQueried: "locations?page[size]=500",
+    pathQueried: "locations?page[number]=1&page[size]=100",
     totalLocationsChecked: 0,
     parcelCandidatesConsidered: 0,
     bestMatch: null,
@@ -4650,6 +4725,33 @@ export default {
         );
       } catch (error) {
         return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov record types lookup failed."));
+      }
+    }
+
+    if (request.method === "GET" && url.pathname === "/api/opengov/locations") {
+      const pagesParam = Number(url.searchParams.get("pages") ?? "1");
+      const pages = Number.isFinite(pagesParam) && pagesParam > 0 ? pagesParam : 1;
+      const persist = url.searchParams.get("persist") === "1";
+      try {
+        const locationFetch = await fetchOpenGovLocations(env, pages);
+        let persisted = 0;
+        if (persist && env.OPPORTUNITYDB) {
+          persisted = await upsertOpenGovLocations(env.OPPORTUNITYDB, env, locationFetch.records);
+        }
+        return withSecurityHeaders(
+          Response.json({
+            ok: true,
+            community: env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY,
+            pagesRequested: pages,
+            pathQueried: locationFetch.path,
+            count: locationFetch.records.length,
+            persisted,
+            locations: locationFetch.records,
+            updatedAt: new Date().toISOString(),
+          }),
+        );
+      } catch (error) {
+        return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov locations lookup failed."));
       }
     }
 
