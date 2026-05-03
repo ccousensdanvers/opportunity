@@ -748,23 +748,23 @@ function buildSummaryMetrics(
 
 class HeadingCollector {
   private active = false;
-  private text = "";
+  private textContent = "";
 
   constructor(private onComplete: (value: string) => void) {}
 
   element(element: Element) {
     this.active = true;
-    this.text = "";
+    this.textContent = "";
     element.onEndTag(() => {
       this.active = false;
-      this.onComplete(normalizeWhitespace(this.text));
-      this.text = "";
+      this.onComplete(normalizeWhitespace(this.textContent));
+      this.textContent = "";
     });
   }
 
   text(text: Text) {
     if (this.active) {
-      this.text += text.text;
+      this.textContent += text.text;
     }
   }
 }
@@ -772,7 +772,7 @@ class HeadingCollector {
 class AgendaLinkCollector {
   private active = false;
   private href = "";
-  private text = "";
+  private textContent = "";
 
   constructor(
     private getBoard: () => string | null,
@@ -788,23 +788,23 @@ class AgendaLinkCollector {
 
     this.active = true;
     this.href = href.startsWith("http") ? href : `https://www.danversma.gov${href}`;
-    this.text = "";
+    this.textContent = "";
 
     element.onEndTag(() => {
       this.active = false;
       const board = this.getBoard();
       const meetingDate = this.getMeetingDate();
-      const title = normalizeWhitespace(this.text);
+      const title = normalizeWhitespace(this.textContent);
 
       if (!board || !meetingDate || !title || title === "Agenda" || title === "Previous Versions") {
         this.href = "";
-        this.text = "";
+        this.textContent = "";
         return;
       }
 
       if (board !== "Planning Board" && board !== "Zoning Board of Appeals") {
         this.href = "";
-        this.text = "";
+        this.textContent = "";
         return;
       }
 
@@ -817,13 +817,13 @@ class AgendaLinkCollector {
       });
 
       this.href = "";
-      this.text = "";
+      this.textContent = "";
     });
   }
 
   text(text: Text) {
     if (this.active) {
-      this.text += text.text;
+      this.textContent += text.text;
     }
   }
 }
@@ -1241,31 +1241,6 @@ function normalizeLookupKey(key: string): string {
   return key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function collectNestedObjects(root: unknown): Record<string, unknown>[] {
-  const queue: unknown[] = [root];
-  const seen = new Set<Record<string, unknown>>();
-  const collected: Record<string, unknown>[] = [];
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!isPlainObject(current) || seen.has(current)) continue;
-    seen.add(current);
-    collected.push(current);
-    for (const value of Object.values(current)) {
-      if (isPlainObject(value)) queue.push(value);
-      if (Array.isArray(value)) {
-        for (const entry of value) {
-          if (isPlainObject(entry)) queue.push(entry);
-        }
-      }
-    }
-  }
-  return collected;
-}
-
 export function normalizeOpenGovLocation(candidate: Record<string, unknown>): OpenGovLocationRecord {
   const attributes = (
     candidate.attributes && typeof candidate.attributes === "object"
@@ -1432,7 +1407,7 @@ async function fetchOpenGovLocationNormalizationProbe(env: Env): Promise<{
     "page[size]": String(pageSize),
   }) as { data?: unknown[] };
   const rawRecords = (Array.isArray(payload?.data) ? payload.data : [])
-    .filter((value): value is Record<string, unknown> => isPlainObject(value));
+    .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object");
   const sample = rawRecords.map((raw) => {
     const normalized = normalizeOpenGovLocation(raw);
     const entries = Object.entries(normalized);
