@@ -2763,8 +2763,24 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
   const defaultAddress = "10 Damon Street";
   const address = normalizeWhitespace(requestedAddress ?? "") || defaultAddress;
   const base = await buildOpenGovPermitsTestPayload(env);
-  const locationFetch = await fetchOpenGovLocations(env);
-  const matched = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
+  let locationFetchError: { message: string; details?: string } | null = null;
+  let matched: OpenGovLocationMatchResult = {
+    input: parseAddressParts(address),
+    pathQueried: "locations?page[size]=500",
+    totalLocationsChecked: 0,
+    parcelCandidatesConsidered: 0,
+    bestMatch: null,
+    nearMatches: [],
+  };
+  try {
+    const locationFetch = await fetchOpenGovLocations(env);
+    matched = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
+  } catch (error) {
+    locationFetchError = {
+      message: error instanceof Error ? error.message : "OpenGov locations lookup failed.",
+      details: error instanceof OpenGovApiError ? error.details : undefined,
+    };
+  }
 
   let permitsByLocation: unknown = null;
   if (matched.bestMatch?.id) {
@@ -2791,6 +2807,7 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
       bestMatchedLocations: matched.bestMatch ? [matched.bestMatch] : [],
       nearMatches: matched.nearMatches,
       permitLookupByLocationId: matched.bestMatch?.id ? { locationId: matched.bestMatch.id, result: permitsByLocation } : null,
+      locationFetchError,
     },
   };
 }
@@ -4638,7 +4655,11 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/api/opengov/permits-test") {
       const address = url.searchParams.get("address")?.trim() ?? "";
-      return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env, address)));
+      try {
+        return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env, address)));
+      } catch (error) {
+        return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov permits-test lookup failed."));
+      }
     }
 
     if (request.method === "GET" && url.pathname === "/api/debug/signals") {
