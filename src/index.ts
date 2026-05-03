@@ -22,6 +22,7 @@ interface Env {
   OPENGOV_COMMUNITY?: string;
   OPENGOV_RECORDS_ENABLED?: string;
   OPENGOV_INGEST_MIN_INTERVAL_MINUTES?: string;
+  OPENGOV_LOCATION_INGEST_LIMIT?: string;
 }
 
 interface IngestMessage {
@@ -1538,17 +1539,25 @@ async function fetchOpenGovLocationsPage(
 }
 
 async function fetchOpenGovLocations(env: Env, maxPages = 1000): Promise<{ path: string; records: OpenGovLocationRecord[]; fetched: number; normalized: number; pagesFetched: number; totalPages: number | null; totalRecords: number | null }> {
+  const locationLimit = getOpenGovLocationIngestLimit(env);
   const cappedPages = Math.max(1, Math.min(1000, Math.trunc(maxPages)));
   const allRecords: OpenGovLocationRecord[] = [];
   const paths: string[] = [];
   let totalPages: number | null = null;
   let totalRecords: number | null = null;
+  const pageSize = Math.min(100, locationLimit);
   for (let page = 1; page <= cappedPages; page += 1) {
-    const result = await fetchOpenGovLocationsPage(env, page, 100);
+    const remaining = locationLimit - allRecords.length;
+    if (remaining <= 0) break;
+    const currentPageSize = Math.min(pageSize, remaining);
+    const result = await fetchOpenGovLocationsPage(env, page, currentPageSize);
     paths.push(result.path);
-    allRecords.push(...result.records);
+    allRecords.push(...result.records.slice(0, remaining));
     if (result.totalPages !== null) totalPages = result.totalPages;
     if (result.totalRecords !== null) totalRecords = result.totalRecords;
+    if (allRecords.length >= locationLimit) {
+      break;
+    }
     if (!result.hasNextPage || (result.totalPages !== null && result.page >= result.totalPages)) {
       break;
     }
@@ -1562,6 +1571,13 @@ async function fetchOpenGovLocations(env: Env, maxPages = 1000): Promise<{ path:
     totalPages,
     totalRecords,
   };
+}
+
+function getOpenGovLocationIngestLimit(env: Env): number {
+  const raw = env.OPENGOV_LOCATION_INGEST_LIMIT;
+  const parsed = Number.parseInt(raw ?? "", 10);
+  if (Number.isFinite(parsed) && parsed > 0) return Math.min(parsed, 10000);
+  return 100;
 }
 
 function recordsEnabled(env: Env): boolean {
@@ -3588,6 +3604,7 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
   let status = "OpenGov location cache is empty. Run POST /ingest to populate it.";
   let locationSchemaDrift: { table: string; missingColumns: string[]; presentColumns: string[] } | null = null;
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const locationIngestLimit = getOpenGovLocationIngestLimit(env);
   const parsedMinIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10);
   const minIntervalMinutes = Number.isFinite(parsedMinIntervalMinutes) && parsedMinIntervalMinutes > 0 ? parsedMinIntervalMinutes : 1440;
   let nextIngestAction: "skip" | "refresh" = "refresh";
@@ -3628,6 +3645,7 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
     lastSuccessfulAgeMinutes,
     nextIngestAction,
     forceCommand: 'Invoke-RestMethod -Method Post -Uri "https://development.danversma.gov/ingest?opengov=force"',
+    locationIngestLimit,
     debug: {
       normalizedInputAddress: matched.input,
       plcPathQueried: matched.pathQueried,
@@ -3748,6 +3766,7 @@ async function runOpenGovLocationsIngest(
   const diagnostics = options.diagnostics;
   const parsedMinIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10);
   const minIntervalMinutes = Number.isFinite(parsedMinIntervalMinutes) && parsedMinIntervalMinutes > 0 ? parsedMinIntervalMinutes : 1440;
+  const locationIngestLimit = getOpenGovLocationIngestLimit(env);
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
   const now = new Date();
   const cachedLocationsBefore = await countOpenGovLocations(db);
@@ -3762,10 +3781,10 @@ async function runOpenGovLocationsIngest(
 
   const skipDecision = shouldSkipOpenGovLocationIngest(lastSuccess, now, minIntervalMinutes);
   if (skipRequested) {
-    return { mode: "skip", force, skipRequested: true, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, skipped: true, skipReason: "OpenGov skipped by request parameter.", matchesAttempted: false, matchesStored: 0, matchesCapped: false, matchCap: 100, error: null };
+    return { mode: "skip", force, skipRequested: true, locationsIngestAttempted: false, locationIngestLimit, locationIngestLimited: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, skipped: true, skipReason: "OpenGov skipped by request parameter.", matchesAttempted: false, matchesStored: 0, matchesCapped: false, matchCap: 100, error: null };
   }
   if (!force) {
-    return { mode: enableMatch ? "match" : "activity-ingest", force, skipRequested: false, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: true, skipReason: enableMatch ? "OpenGov location refresh skipped; match generation skipped because current-run source items were not available." : "Full OpenGov location refresh is skipped by default. Use ?opengov=force to refresh.", lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: false, matchesStored: 0, matchesCapped: false, matchCap: 100, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
+    return { mode: enableMatch ? "match" : "activity-ingest", force, skipRequested: false, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: false, locationIngestLimit, locationIngestLimited: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: true, skipReason: enableMatch ? "OpenGov location refresh skipped; match generation skipped because current-run source items were not available." : "Full OpenGov location refresh is skipped by default. Use ?opengov=force to refresh.", lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: false, matchesStored: 0, matchesCapped: false, matchCap: 100, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
   }
 
   const runId = crypto.randomUUID();
@@ -3781,6 +3800,10 @@ async function runOpenGovLocationsIngest(
   try {
     const locationFetch = await fetchOpenGovLocations(env);
     const stored = await upsertOpenGovLocations(db, env, locationFetch.records, diagnostics);
+    const locationIngestLimited = (locationFetch.totalRecords ?? locationFetch.fetched) > locationIngestLimit;
+    const limitNote = locationIngestLimited
+      ? `OpenGov location ingest limited to ${locationIngestLimit} of ${locationFetch.totalRecords ?? locationFetch.fetched} records by OPENGOV_LOCATION_INGEST_LIMIT.`
+      : null;
     const completedAt = new Date().toISOString();
     if (syncTrackingAvailable) {
       try {
@@ -3790,7 +3813,7 @@ async function runOpenGovLocationsIngest(
         // best effort only
       }
     }
-    return { mode: force ? "force" : (enableMatch ? "match" : "activity-ingest"), force, skipRequested: false, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationsFetchedThisRun: locationFetch.fetched, locationsStoredThisRun: stored, locationsTotalRecords: locationFetch.totalRecords ?? locationFetch.fetched, pagesFetched: locationFetch.pagesFetched, skipped: false, skipReason: null, lastSuccessfulIngestAt: completedAt, lastSuccessfulAgeMinutes: 0, syncTrackingAvailable, matchesAttempted: enableMatch, matchesStored: 0, matchesCapped: false, matchCap: 100, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
+    return { mode: force ? "force" : (enableMatch ? "match" : "activity-ingest"), force, skipRequested: false, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationIngestLimit, locationIngestLimited, locationsFetchedThisRun: locationFetch.fetched, locationsStoredThisRun: stored, locationsTotalRecords: locationFetch.totalRecords ?? locationFetch.fetched, pagesFetched: locationFetch.pagesFetched, skipped: false, skipReason: limitNote, lastSuccessfulIngestAt: completedAt, lastSuccessfulAgeMinutes: 0, syncTrackingAvailable, matchesAttempted: enableMatch, matchesStored: 0, matchesCapped: false, matchCap: 100, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
   } catch (error) {
     const completedAt = new Date().toISOString();
     if (syncTrackingAvailable) {
@@ -3801,7 +3824,7 @@ async function runOpenGovLocationsIngest(
         // best effort only
       }
     }
-    return { mode: force ? "force" : (enableMatch ? "match" : "activity-ingest"), force, skipRequested: false, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: false, skipReason: null, lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: enableMatch, matchesStored: 0, matchesCapped: false, matchCap: 100, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: "OpenGov location refresh failed. Using cached OpenGov locations where available." };
+    return { mode: force ? "force" : (enableMatch ? "match" : "activity-ingest"), force, skipRequested: false, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationIngestLimit, locationIngestLimited: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: false, skipReason: null, lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: enableMatch, matchesStored: 0, matchesCapped: false, matchCap: 100, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: { message: "OpenGov location refresh failed. Using cached OpenGov locations where available.", details: error instanceof Error ? error.message : "unknown error" } };
   }
 }
 
@@ -5958,6 +5981,7 @@ export default {
         return withSecurityHeaders(missingDatabaseResponse());
       }
       const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+      const locationIngestLimit = getOpenGovLocationIngestLimit(env);
       const parsedMinIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10);
       const minIntervalMinutes = Number.isFinite(parsedMinIntervalMinutes) && parsedMinIntervalMinutes > 0 ? parsedMinIntervalMinutes : 1440;
       const cachedLocations = await countOpenGovLocations(env.OPPORTUNITYDB);
@@ -5972,6 +5996,7 @@ export default {
       return withSecurityHeaders(Response.json({
         ok: true,
         cachedLocations,
+        locationIngestLimit,
         minIntervalMinutes,
         syncTrackingAvailable,
         lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null,
@@ -6017,6 +6042,8 @@ export default {
             skipRequested: skipOpenGov,
             locationsAvailable: false,
             locationsIngestAttempted: false,
+            locationIngestLimit: getOpenGovLocationIngestLimit(env),
+            locationIngestLimited: false,
             locationsFetchedThisRun: 0,
             locationsStoredThisRun: 0,
             locationsTotalRecords: null,
