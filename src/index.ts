@@ -3478,6 +3478,7 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
   let locationsFetchedThisRun = 0;
   let locationsStoredThisRun = 0;
   let locationsTotalRecords: number | null = null;
+  let locationSchemaDrift: { table: string; missingColumns: string[]; presentColumns: string[] } | null = null;
   try {
     const locationFetch = await fetchOpenGovLocations(env);
     locationsFetchedThisRun = locationFetch.fetched;
@@ -3487,6 +3488,9 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
     }
     matched = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
   } catch (error) {
+    if (env.OPPORTUNITYDB) {
+      locationSchemaDrift = await detectOpenGovLocationSchemaDrift(env.OPPORTUNITYDB);
+    }
     locationFetchError = {
       message: error instanceof Error ? error.message : "OpenGov locations lookup failed.",
       details: error instanceof OpenGovApiError ? error.details : undefined,
@@ -3510,8 +3514,35 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
       bestMatchedLocations: matched.bestMatch ? [matched.bestMatch] : [],
       nearMatches: matched.nearMatches,
       locationFetchError,
+      locationSchemaDrift,
     },
   };
+}
+
+async function detectOpenGovLocationSchemaDrift(db: D1Database): Promise<{ table: string; missingColumns: string[]; presentColumns: string[] } | null> {
+  const expectedColumns = [
+    "id", "location_type", "street_no", "street_name", "city", "state", "postal_code", "gis_id", "mbl", "mat_id", "source_type",
+    "name", "latitude", "longitude", "owner_name", "owner_street_number", "owner_street_name", "owner_unit", "owner_city",
+    "owner_state", "owner_postal_code", "owner_country", "owner_email", "unit", "country", "secondary_latitude", "secondary_longitude",
+    "segment_primary_label", "segment_secondary_label", "segment_label", "segment_length", "owner_phone_no", "lot_area",
+    "occupancy_type", "property_use", "sewage", "water", "year_built", "zoning", "building_type", "notes", "subdivision", "archived",
+    "source_updated_at", "source_community", "updated_at",
+  ];
+  try {
+    const result = await db.prepare("PRAGMA table_info(opengov_locations);").all();
+    const rows = Array.isArray(result?.results) ? result.results : [];
+    const presentColumns = rows
+      .map((row) => (typeof row?.name === "string" ? row.name : ""))
+      .filter((name) => Boolean(name));
+    const missingColumns = expectedColumns.filter((column) => !presentColumns.includes(column));
+    return {
+      table: "opengov_locations",
+      missingColumns,
+      presentColumns,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function buildOpportunityInputs(
