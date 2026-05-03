@@ -1602,7 +1602,12 @@ async function fetchOpenGovLocationNormalizationProbe(env: Env): Promise<{
   };
 }
 
-async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenGovLocationRecord[]): Promise<number> {
+async function upsertOpenGovLocations(
+  db: D1Database,
+  env: Env,
+  locations: OpenGovLocationRecord[],
+  diagnostics?: { opengovLocationRefreshD1Ops: number },
+): Promise<number> {
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
   const now = new Date().toISOString();
   const uniqueLocations = Array.from(
@@ -1614,8 +1619,10 @@ async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenG
   );
 
   try {
-    for (const location of uniqueLocations) {
-      await db
+    const chunkSize = 100;
+    for (let i = 0; i < uniqueLocations.length; i += chunkSize) {
+      const chunk = uniqueLocations.slice(i, i + chunkSize);
+      const statements = chunk.map((location) => db
         .prepare(
         `INSERT INTO opengov_locations (
           id, location_type, street_no, street_name, city, state, postal_code, gis_id, mbl, mat_id, source_type, name, latitude, longitude, owner_name, owner_street_number, owner_street_name,
@@ -1718,8 +1725,9 @@ async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenG
         location.sourceUpdatedAt,
         community,
         now,
-      )
-        .run();
+      ));
+      await db.batch(statements);
+      if (diagnostics) diagnostics.opengovLocationRefreshD1Ops += 1;
     }
   } catch (error) {
     throw new Error(
@@ -3719,7 +3727,15 @@ async function recordOpenGovSyncRun(db: D1Database, input: {
     .run();
 }
 
-async function runOpenGovLocationsIngest(db: D1Database, env: Env, force = false): Promise<Record<string, unknown>> {
+async function runOpenGovLocationsIngest(
+  db: D1Database,
+  env: Env,
+  options: { force?: boolean; skipRequested?: boolean; enableMatch?: boolean; diagnostics?: { opengovLocationRefreshD1Ops: number; opengovMatchD1Ops: number; syncRunD1Ops: number } } = {},
+): Promise<Record<string, unknown>> {
+  const force = options.force === true;
+  const skipRequested = options.skipRequested === true;
+  const enableMatch = options.enableMatch === true;
+  const diagnostics = options.diagnostics;
   const parsedMinIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10);
   const minIntervalMinutes = Number.isFinite(parsedMinIntervalMinutes) && parsedMinIntervalMinutes > 0 ? parsedMinIntervalMinutes : 1440;
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
@@ -3735,9 +3751,12 @@ async function runOpenGovLocationsIngest(db: D1Database, env: Env, force = false
   }
 
   const skipDecision = shouldSkipOpenGovLocationIngest(lastSuccess, now, minIntervalMinutes);
+  if (skipRequested) {
+    return { mode: "skip", force, skipRequested: true, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, skipped: true, skipReason: "OpenGov skipped by request parameter.", matchesAttempted: false, matchesStored: 0, matchesCapped: false, matchCap: 100, error: null };
+  }
   const shouldSkipForMissingTracking = !syncTrackingAvailable && cachedLocationsBefore > 0;
-  if (!force && cachedLocationsBefore > 0 && (skipDecision.skip || shouldSkipForMissingTracking)) {
-    return { mode: "activity-ingest", force, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: true, skipReason: shouldSkipForMissingTracking ? "OpenGov sync tracking unavailable; using existing cached locations. Apply migrations to enable 24-hour tracking." : skipDecision.reason, lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: true, matchesStored: 0, matchesSkippedReason: "Historical rematch is disabled during normal ingest.", recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
+  if (!force && cachedLocationsBefore > 0) {
+    return { mode: enableMatch ? "match" : "activity-ingest", force, skipRequested: false, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: true, skipReason: shouldSkipForMissingTracking ? "OpenGov sync tracking unavailable; using existing cached locations. Apply migrations to enable 24-hour tracking." : "Full OpenGov location refresh is due but skipped by default. Use ?opengov=force to refresh.", lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: enableMatch, matchesStored: 0, matchesCapped: false, matchCap: 100, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
   }
 
   const runId = crypto.randomUUID();
@@ -3745,32 +3764,35 @@ async function runOpenGovLocationsIngest(db: D1Database, env: Env, force = false
   try {
     await ensureOpenGovSyncRunsTable(db);
     await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "running", startedAt });
+    if (diagnostics) diagnostics.syncRunD1Ops += 2;
   } catch {
     syncTrackingAvailable = false;
   }
 
   try {
     const locationFetch = await fetchOpenGovLocations(env);
-    const stored = await upsertOpenGovLocations(db, env, locationFetch.records);
+    const stored = await upsertOpenGovLocations(db, env, locationFetch.records, diagnostics);
     const completedAt = new Date().toISOString();
     if (syncTrackingAvailable) {
       try {
         await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "success", startedAt, completedAt, fetchedCount: locationFetch.fetched, storedCount: stored, totalRecords: locationFetch.totalRecords, pagesFetched: locationFetch.pagesFetched });
+        if (diagnostics) diagnostics.syncRunD1Ops += 1;
       } catch {
         // best effort only
       }
     }
-    return { mode: "activity-ingest", force, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationsFetchedThisRun: locationFetch.fetched, locationsStoredThisRun: stored, locationsTotalRecords: locationFetch.totalRecords ?? locationFetch.fetched, pagesFetched: locationFetch.pagesFetched, skipped: false, skipReason: null, lastSuccessfulIngestAt: completedAt, lastSuccessfulAgeMinutes: 0, syncTrackingAvailable, matchesAttempted: true, matchesStored: 0, matchesSkippedReason: "Historical rematch is disabled during normal ingest.", recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
+    return { mode: force ? "force" : (enableMatch ? "match" : "activity-ingest"), force, skipRequested: false, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationsFetchedThisRun: locationFetch.fetched, locationsStoredThisRun: stored, locationsTotalRecords: locationFetch.totalRecords ?? locationFetch.fetched, pagesFetched: locationFetch.pagesFetched, skipped: false, skipReason: null, lastSuccessfulIngestAt: completedAt, lastSuccessfulAgeMinutes: 0, syncTrackingAvailable, matchesAttempted: enableMatch, matchesStored: 0, matchesCapped: false, matchCap: 100, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
   } catch (error) {
     const completedAt = new Date().toISOString();
     if (syncTrackingAvailable) {
       try {
         await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "error", startedAt, completedAt, errorMessage: error instanceof Error ? error.message : "OpenGov locations ingest failed." });
+        if (diagnostics) diagnostics.syncRunD1Ops += 1;
       } catch {
         // best effort only
       }
     }
-    return { mode: "activity-ingest", force, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: false, skipReason: null, lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: true, matchesStored: 0, matchesSkippedReason: "Historical rematch is disabled during normal ingest.", recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: "OpenGov location refresh failed. Using cached OpenGov locations where available." };
+    return { mode: force ? "force" : (enableMatch ? "match" : "activity-ingest"), force, skipRequested: false, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: false, skipReason: null, lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: enableMatch, matchesStored: 0, matchesCapped: false, matchCap: 100, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: "OpenGov location refresh failed. Using cached OpenGov locations where available." };
   }
 }
 
@@ -5973,10 +5995,17 @@ export default {
       }
 
       const runId = await startIngestionRun(env.OPPORTUNITYDB, "manual");
-      const forceOpenGov = url.searchParams.get("opengov") === "force";
+      const opengovParam = (url.searchParams.get("opengov") ?? "").toLowerCase();
+      const forceOpenGov = opengovParam === "force";
+      const skipOpenGov = opengovParam === "skip";
+      const matchRequested = opengovParam === "match" || url.searchParams.get("match") === "true";
+      const debug = url.searchParams.get("debug") === "true";
+      const d1Ops = { coreIngestD1Ops: 1, opengovLocationRefreshD1Ops: 0, opengovMatchD1Ops: 0, syncRunD1Ops: 0 };
 
       try {
+        const started = Date.now();
         const summary = await runAutomaticIngest(env.OPPORTUNITYDB, env);
+        d1Ops.coreIngestD1Ops += 1;
         const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "manual", env);
         let opengov: Record<string, unknown>;
         if (!env.OPENGOV_KEY?.trim()) {
@@ -5984,6 +6013,7 @@ export default {
             mode: "activity-ingest",
             minIntervalMinutes: 1440,
             force: forceOpenGov,
+            skipRequested: skipOpenGov,
             locationsAvailable: false,
             locationsIngestAttempted: false,
             locationsFetchedThisRun: 0,
@@ -5996,28 +6026,48 @@ export default {
             lastSuccessfulAgeMinutes: null,
             matchesAttempted: false,
             matchesStored: 0,
+            matchesCapped: false,
+            matchCap: 100,
             recordsEnabled: recordsEnabled(env),
             recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
             error: "OpenGov is not configured",
           };
         } else {
-          opengov = await runOpenGovLocationsIngest(env.OPPORTUNITYDB, env, forceOpenGov);
+          opengov = await runOpenGovLocationsIngest(env.OPPORTUNITYDB, env, {
+            force: forceOpenGov,
+            skipRequested: skipOpenGov,
+            enableMatch: matchRequested,
+            diagnostics: d1Ops,
+          });
         }
-        await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
+        let finishedRun = true;
+        try {
+          await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
+          d1Ops.syncRunD1Ops += 1;
+        } catch (error) {
+          finishedRun = false;
+          console.error("finishIngestionRun failed", error);
+        }
 
         return withSecurityHeaders(
           Response.json({
-            accepted: true,
+            accepted: finishedRun,
             message: buildIngestMessage("manual"),
-            detail:
-              "Manual ingest completed: Danvers parcels refreshed, case briefs rebuilt, opportunities matched, and a strategic brief was saved for the dashboard.",
+            detail: finishedRun
+              ? "Manual ingest completed: Danvers parcels refreshed, case briefs rebuilt, opportunities matched, and a strategic brief was saved for the dashboard."
+              : "Ingest completed partially but failed to record completion.",
             summary,
             strategicBrief,
             opengov,
+            ...(debug ? { timing: { phases: { totalMs: Date.now() - started } }, d1Ops: { ...d1Ops, totalEstimatedD1Ops: d1Ops.coreIngestD1Ops + d1Ops.opengovLocationRefreshD1Ops + d1Ops.opengovMatchD1Ops + d1Ops.syncRunD1Ops } } : {}),
           }),
         );
       } catch (error) {
-        await finishIngestionRun(env.OPPORTUNITYDB, runId, "failed");
+        try {
+          await finishIngestionRun(env.OPPORTUNITYDB, runId, "failed");
+        } catch (finishError) {
+          console.error("finishIngestionRun failed", finishError);
+        }
 
         return withSecurityHeaders(
           Response.json(
