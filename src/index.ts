@@ -19,7 +19,6 @@ type Readiness = "Early" | "Emerging" | "Advancing";
 interface Env {
   OPPORTUNITYDB?: D1Database;
   OPENGOV_TURNSTILE_TOKEN?: string;
-  OPENGOV_CLIENT_ID?: string;
   OPENGOV_KEY?: string;
   OPENGOV_COMMUNITY?: string;
 }
@@ -86,11 +85,6 @@ interface OpenGovPermitAttemptDebug {
   error?: string;
 }
 
-interface OpenGovTokenResponse {
-  access_token?: string;
-  token_type?: string;
-  expires_in?: number;
-}
 
 class OpenGovApiError extends Error {
   status: number;
@@ -183,7 +177,6 @@ const ZBA_RSS_URL =
 const PROJECTS_PAGE_URL = "https://www.danversma.gov/235/Projects";
 const DANVERS_OPENGOV_SEARCH_URL = "https://api-east.viewpointcloud.com/v2/danversma/search_results";
 const DANVERS_OPENGOV_PORTAL_URL = "https://danversma.portal.opengov.com/search";
-const OPENGOV_OAUTH_URL = "https://accounts.viewpointcloud.com/oauth/token";
 const OPENGOV_PLCE_BASE_URL = "https://api.plce.opengov.com/plce";
 const DEFAULT_OPENGOV_COMMUNITY = "danversma";
 const DANVERS_PARCELS_LAYER_URL =
@@ -550,7 +543,7 @@ function buildStatusPayload(env?: Env) {
         queue: Boolean(env?.OPPORTUNITYDB),
         strategicBriefs: Boolean(env?.OPPORTUNITYDB),
         parcelContext: true,
-        openGovPlceCredentials: Boolean(env?.OPENGOV_CLIENT_ID && env?.OPENGOV_KEY),
+        openGovPlceCredentials: Boolean(env?.OPENGOV_KEY),
       },
     },
   };
@@ -2548,46 +2541,16 @@ async function fetchParcelContextForAddresses(addresses: string[]): Promise<Parc
   return contexts;
 }
 
-async function fetchOpenGovAccessToken(env: Env): Promise<string> {
-  if (!env.OPENGOV_CLIENT_ID || !env.OPENGOV_KEY) {
-    throw new OpenGovApiError(503, "OpenGov credentials are not configured.");
-  }
-
-  const response = await fetch(OPENGOV_OAUTH_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-    },
-    body: new URLSearchParams({
-      grant_type: "client_credentials",
-      client_id: env.OPENGOV_CLIENT_ID,
-      client_secret: env.OPENGOV_KEY,
-    }).toString(),
-  });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new OpenGovApiError(
-      response.status,
-      `OpenGov token request failed with ${response.status}`,
-      body.slice(0, 300),
-    );
-  }
-
-  const payload = await response.json() as OpenGovTokenResponse;
-  if (!payload.access_token) {
-    throw new OpenGovApiError(502, "OpenGov token response did not include an access token.");
-  }
-
-  return payload.access_token;
-}
-
 async function fetchOpenGovPlceJson(
   env: Env,
   path: string,
   searchParams?: Record<string, string>,
 ): Promise<unknown> {
-  const bearerToken = await fetchOpenGovAccessToken(env);
+  const apiKey = env.OPENGOV_KEY?.trim();
+  if (!apiKey) {
+    throw new OpenGovApiError(503, "OpenGov API key is not configured.");
+  }
+
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
   const url = new URL(`${OPENGOV_PLCE_BASE_URL}/v2/${community}/${path}`);
 
@@ -2599,8 +2562,8 @@ async function fetchOpenGovPlceJson(
 
   const response = await fetch(url.toString(), {
     headers: {
-      Authorization: `Bearer ${bearerToken}`,
-      Accept: "application/json",
+      Authorization: `Token ${apiKey}`,
+      Accept: "application/vnd.api+json",
     },
   });
 
@@ -2637,15 +2600,15 @@ function buildOpenGovErrorResponse(
       error: message,
       details: details || undefined,
       diagnosis: authLikely
-        ? "The Worker reached the PLCE v2 OAuth flow, but the client credentials were rejected or do not have access to this API."
+        ? "The Worker reached the PLCE v2 endpoint, but the API key was rejected or lacks access to this resource."
         : status === 503
-          ? "The Worker does not have the required PLCE v2 OAuth credentials configured."
+          ? "The Worker does not have the required PLCE v2 API key configured."
           : "The Worker reached OpenGov, but the PLCE v2 request failed before returning a usable payload.",
       nextStep: authLikely
-        ? "Verify OPENGOV_CLIENT_ID and OPENGOV_KEY with OpenGov and confirm they are enabled for the Permitting & Licensing API v2."
+        ? "Verify OPENGOV_KEY with OpenGov and confirm it is enabled for the Permitting & Licensing API v2."
         : status === 503
-          ? "Add OPENGOV_CLIENT_ID and OPENGOV_KEY to the Worker environment and retry."
-          : "Confirm the OpenGov community slug and API access scope for the Permitting & Licensing API v2, then retry.",
+          ? "Add OPENGOV_KEY to the Worker environment and retry."
+          : "Confirm the OpenGov community slug and API key access scope for the Permitting & Licensing API v2, then retry.",
     },
     { status },
   );
@@ -2653,7 +2616,7 @@ function buildOpenGovErrorResponse(
 
 async function buildOpenGovTestPayload(env: Env) {
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
-  const configured = Boolean(env.OPENGOV_CLIENT_ID && env.OPENGOV_KEY);
+  const configured = Boolean(env.OPENGOV_KEY);
 
   if (!configured) {
     return {
@@ -2662,10 +2625,10 @@ async function buildOpenGovTestPayload(env: Env) {
       configured,
       checks: [
         {
-          name: "oauth",
+          name: "api-key",
           ok: false,
           status: 503,
-          message: "PLCE v2 OAuth credentials are not configured.",
+          message: "PLCE v2 API key is not configured.",
         },
       ],
       updatedAt: new Date().toISOString(),
@@ -2679,36 +2642,6 @@ async function buildOpenGovTestPayload(env: Env) {
     message: string;
     details?: string;
   }> = [];
-
-  try {
-    await fetchOpenGovAccessToken(env);
-    checks.push({
-      name: "oauth",
-      ok: true,
-      status: 200,
-      message: "OAuth token request succeeded. The Worker can authenticate to PLCE v2.",
-    });
-  } catch (error) {
-    const known = error instanceof OpenGovApiError ? error : new OpenGovApiError(500, "OAuth test failed.");
-    checks.push({
-      name: "oauth",
-      ok: false,
-      status: known.status,
-      message:
-        known.status === 401
-          ? "OAuth credentials were rejected by OpenGov before any community-specific API call was made."
-          : known.message,
-      details: known.details || undefined,
-    });
-
-    return {
-      ok: false,
-      community,
-      configured,
-      checks,
-      updatedAt: new Date().toISOString(),
-    };
-  }
 
   for (const target of [
     { name: "organization", path: "organization" },
@@ -3900,13 +3833,10 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         const community = payload && payload.community ? String(payload.community) : "unknown";
         const configured = Boolean(payload && payload.configured);
         const overallOk = Boolean(payload && payload.ok);
-        const oauthCheck = checks.find((check) => check && check.name === "oauth");
 
         openGovTestSummary.textContent = !configured
-          ? "PLCE v2 OAuth credentials are not configured in the Worker."
-          : oauthCheck && oauthCheck.status === 401
-            ? "OAuth credentials were rejected before the Worker reached the community-specific PLCE v2 endpoints. This points to OPENGOV_CLIENT_ID or OPENGOV_KEY, not the community slug."
-            : ("Community " + community + " · " + (overallOk ? "all configured checks passed" : "one or more checks failed"));
+          ? "PLCE v2 API key is not configured in the Worker."
+          : ("Community " + community + " · " + (overallOk ? "all configured checks passed" : "one or more checks failed"));
 
         openGovTestResults.innerHTML = checks.length
           ? checks.map((check) => {
