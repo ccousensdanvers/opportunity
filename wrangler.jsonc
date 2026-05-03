@@ -3,14 +3,17 @@
   "name": "opportunity",
   "main": "src/index.ts",
   "compatibility_date": "2026-04-27",
-  // Fill in the real D1 database ID for the OPPORTUNITY database before deploy.
+  // Primary D1 binding: OPPORTUNITYDB2 (fallback OPPORTUNITYDB supported in code).
   "d1_databases": [
     {
-      "binding": "OPPORTUNITYDB",
-      "database_name": "OPPORTUNITY",
-      "database_id": "45d3fae2-4ea2-4453-8638-be065b8d9b0d"
+      "binding": "OPPORTUNITYDB2",
+      "database_name": "opportunity2",
+      "database_id": "8a4ebca0-5f53-4752-9f42-2accaefba8a8"
     }
   ],
+  "vars": {
+    "OPENGOV_LOCATION_INGEST_LIMIT": "100"
+  },
   "observability": {
     "enabled": true
   },

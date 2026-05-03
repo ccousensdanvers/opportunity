@@ -18,6 +18,7 @@ type Readiness = "Early" | "Emerging" | "Advancing";
 
 interface Env {
   OPPORTUNITYDB?: D1Database;
+  OPPORTUNITYDB2?: D1Database;
   OPENGOV_KEY?: string;
   OPENGOV_COMMUNITY?: string;
   OPENGOV_RECORDS_ENABLED?: string;
@@ -515,6 +516,16 @@ async function finishIngestionRun(
     .run();
 }
 
+function getOpportunityDb(env: Env): D1Database | null {
+  return env.OPPORTUNITYDB2 ?? env.OPPORTUNITYDB ?? null;
+}
+
+function getOpportunityDbBindingName(env: Env): string | null {
+  if (env.OPPORTUNITYDB2) return "OPPORTUNITYDB2";
+  if (env.OPPORTUNITYDB) return "OPPORTUNITYDB";
+  return null;
+}
+
 function buildStatusPayload(env?: Env) {
   return {
     service: "danvers-opportunity-agent",
@@ -528,9 +539,9 @@ function buildStatusPayload(env?: Env) {
         agendaSignals: true,
         caseExtraction: true,
         scheduledChecks: true,
-        database: Boolean(env?.OPPORTUNITYDB),
-        queue: Boolean(env?.OPPORTUNITYDB),
-        strategicBriefs: Boolean(env?.OPPORTUNITYDB),
+        database: Boolean(env ? getOpportunityDb(env) : null),
+        queue: Boolean(env ? getOpportunityDb(env) : null),
+        strategicBriefs: Boolean(env ? getOpportunityDb(env) : null),
         parcelContext: true,
         openGovPlceCredentials: Boolean(env?.OPENGOV_KEY),
       },
@@ -542,9 +553,9 @@ function missingDatabaseResponse() {
   return Response.json(
     {
       ok: false,
-      error: "OPPORTUNITYDB binding is not configured.",
+      error: "Missing D1 database binding. Expected OPPORTUNITYDB2 or OPPORTUNITYDB.",
       nextStep:
-        "Add the OPPORTUNITYDB D1 binding in wrangler.jsonc and apply migrations.",
+        "Add the OPPORTUNITYDB2 D1 binding in wrangler.jsonc (fallback OPPORTUNITYDB supported) and apply migrations.",
     },
     { status: 503 },
   );
@@ -3588,10 +3599,10 @@ function buildOpenGovErrorResponse(
   );
 }
 
-async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
+async function buildOpenGovTestPayload(env: Env, requestedAddress?: string, db?: D1Database) {
   const defaultAddress = "10 Damon Street";
   const address = normalizeWhitespace(requestedAddress ?? "") || defaultAddress;
-  const base = await buildOpenGovPermitsTestPayload(env, env.OPPORTUNITYDB);
+  const base = await buildOpenGovPermitsTestPayload(env, db);
   let matched: OpenGovLocationMatchResult = {
     input: parseAddressParts(address),
     pathQueried: "opengov_locations cache",
@@ -3611,13 +3622,13 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
   let lastSuccessfulIngestAt: string | null = null;
   let lastSuccessfulAgeMinutes: number | null = null;
   try {
-    if (env.OPPORTUNITYDB) {
-      const lastSuccess = await getLastSuccessfulOpenGovSync(env.OPPORTUNITYDB, community, "locations");
+    if (db) {
+      const lastSuccess = await getLastSuccessfulOpenGovSync(db, community, "locations");
       const skipDecision = shouldSkipOpenGovLocationIngest(lastSuccess, new Date(), minIntervalMinutes);
       lastSuccessfulIngestAt = lastSuccess?.completedAt ?? null;
       lastSuccessfulAgeMinutes = skipDecision.ageMinutes;
       nextIngestAction = skipDecision.skip ? "skip" : "refresh";
-      const cachedLocations = await listStoredOpenGovLocations(env.OPPORTUNITYDB, 20000);
+      const cachedLocations = await listStoredOpenGovLocations(db, 20000);
       cachedLocationCount = cachedLocations.length;
       matched = matchOpenGovLocationForAddress(address, "opengov_locations cache", cachedLocations);
       if (cachedLocationCount > 0) {
@@ -3625,8 +3636,8 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
       }
     }
   } catch (error) {
-    if (env.OPPORTUNITYDB) {
-      locationSchemaDrift = await detectOpenGovLocationSchemaDrift(env.OPPORTUNITYDB);
+    if (db) {
+      locationSchemaDrift = await detectOpenGovLocationSchemaDrift(db);
     }
     status = error instanceof Error ? error.message : "OpenGov locations lookup failed.";
   }
@@ -5556,10 +5567,12 @@ function renderWatchlistDetailPage(payload: WatchlistDetailPayload, nonce: strin
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const db = getOpportunityDb(env);
+    const databaseBinding = getOpportunityDbBindingName(env);
 
     if (request.method === "GET" && url.pathname === "/") {
       const signals = await fetchAgendaSignals();
-      const payload = await buildDashboardPayload(signals, env.OPPORTUNITYDB, env);
+      const payload = await buildDashboardPayload(signals, db ?? undefined, env);
       const nonce = generateCspNonce();
       return withSecurityHeaders(
         new Response(renderDashboard(payload, nonce), {
@@ -5582,7 +5595,7 @@ export default {
         );
       }
 
-      const payload = await buildParcelDetailPayload(address, env.OPPORTUNITYDB, env);
+      const payload = await buildParcelDetailPayload(address, db ?? undefined, env);
       const nonce = generateCspNonce();
       return withSecurityHeaders(
         new Response(renderParcelDetailPage(payload, nonce), {
@@ -5627,7 +5640,7 @@ export default {
         );
       }
 
-      const payload = await buildParcelDetailPayload(address, env.OPPORTUNITYDB, env);
+      const payload = await buildParcelDetailPayload(address, db ?? undefined, env);
       return withSecurityHeaders(
         Response.json({
           ok: true,
@@ -5688,11 +5701,11 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/api/opengov/record-types") {
       try {
-        if (!env.OPPORTUNITYDB) {
-          return withSecurityHeaders(Response.json({ ok: false, error: "OPPORTUNITYDB binding is not configured." }, { status: 503 }));
+        if (!db) {
+          return withSecurityHeaders(Response.json({ ok: false, error: "Missing D1 database binding. Expected OPPORTUNITYDB2 or OPPORTUNITYDB." }, { status: 503 }));
         }
-        const ingest = await ingestOpenGovRecordTypes(env.OPPORTUNITYDB, env);
-        const stored = await listStoredOpenGovRecordTypes(env.OPPORTUNITYDB, 250);
+        const ingest = await ingestOpenGovRecordTypes(db, env);
+        const stored = await listStoredOpenGovRecordTypes(db, 250);
         return withSecurityHeaders(
           Response.json({
             ok: true,
@@ -5718,8 +5731,8 @@ export default {
       try {
         const locationFetch = await fetchOpenGovLocations(env, pages);
         let persisted = 0;
-        if (persist && env.OPPORTUNITYDB) {
-          persisted = await upsertOpenGovLocations(env.OPPORTUNITYDB, env, locationFetch.records);
+        if (persist && db) {
+          persisted = await upsertOpenGovLocations(db, env, locationFetch.records);
         }
         return withSecurityHeaders(
           Response.json({
@@ -5757,21 +5770,24 @@ export default {
     if (request.method === "GET" && url.pathname === "/api/opengov/permits-test") {
       const address = url.searchParams.get("address")?.trim() ?? "";
       try {
-        if (!env.OPPORTUNITYDB) {
+        if (!db) {
           return withSecurityHeaders(missingDatabaseResponse());
         }
-        return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env, address)));
+        return withSecurityHeaders(Response.json({
+          ...(await buildOpenGovTestPayload(env, address, db ?? undefined)),
+          databaseBinding,
+        }));
       } catch (error) {
         return withSecurityHeaders(buildOpenGovErrorResponse(error, "OpenGov permits-test lookup failed."));
       }
     }
 
     if (request.method === "GET" && url.pathname === "/api/opengov/locations/search") {
-      if (!env.OPPORTUNITYDB) return withSecurityHeaders(Response.json({ error: "D1 not configured" }, { status: 500 }));
+      if (!db) return withSecurityHeaders(Response.json({ error: "D1 not configured" }, { status: 500 }));
       const q = (url.searchParams.get("q") ?? "").trim();
       const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? "25") || 25, 1), 100);
       if (q.length < 2) return withSecurityHeaders(Response.json({ query: q, results: [] }));
-      const rows = await searchStoredOpenGovLocations(env.OPPORTUNITYDB, q, limit);
+      const rows = await searchStoredOpenGovLocations(db, q, limit);
       const results = rows.map((row) => ({
         id: row.id,
         locationType: row.location_type,
@@ -5793,10 +5809,10 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/api/opengov/location-matches/review") {
-      if (!env.OPPORTUNITYDB) return withSecurityHeaders(Response.json({ error: "D1 not configured" }, { status: 500 }));
+      if (!db) return withSecurityHeaders(Response.json({ error: "D1 not configured" }, { status: 500 }));
       const limit = Math.min(Math.max(Number(url.searchParams.get("limit") ?? "50") || 50, 1), 200);
       const includeMedium = ["1", "true", "yes"].includes((url.searchParams.get("includeMedium") ?? "").toLowerCase());
-      const results = await listLowConfidenceOpenGovLocationMatches(env.OPPORTUNITYDB, limit, includeMedium);
+      const results = await listLowConfidenceOpenGovLocationMatches(db, limit, includeMedium);
       return withSecurityHeaders(Response.json({ limit, includeMedium, results }));
     }
 
@@ -5849,8 +5865,8 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/api/strategic-briefs") {
       const limitParam = Number(url.searchParams.get("limit") ?? "10");
-      const briefs = env.OPPORTUNITYDB
-        ? await listStrategicBriefs(env.OPPORTUNITYDB, limitParam)
+      const briefs = db
+        ? await listStrategicBriefs(db, limitParam)
         : [];
       return withSecurityHeaders(
         Response.json({
@@ -5865,11 +5881,11 @@ export default {
       return withSecurityHeaders(
         Response.json(
           {
-            enabled: Boolean(env.OPPORTUNITYDB),
-            detail: env.OPPORTUNITYDB
+            enabled: Boolean(db),
+            detail: db
               ? "D1 binding is available for automated parcel ingest, parcel matching, stored strategic briefs, and parcel-context screening including flood, wetlands, groundwater, and utility context."
               : "D1 binding is not configured yet.",
-            nextStep: env.OPPORTUNITYDB
+            nextStep: db
               ? "Manual and scheduled ingest now refresh Danvers parcel records, build agenda briefs, match them to parcels, screen brief-linked parcels against assessor, flood, wetlands, groundwater, and utility context, and save a strategic brief for the dashboard."
               : "Attach D1 and persist case briefs, then map briefs to parcels, corridors, and recurring strategic briefs.",
           },
@@ -5879,7 +5895,7 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/api/parcels/upsert") {
-      if (!env.OPPORTUNITYDB) {
+      if (!db) {
         return withSecurityHeaders(missingDatabaseResponse());
       }
 
@@ -5893,7 +5909,7 @@ export default {
         );
       }
 
-      await upsertParcels(env.OPPORTUNITYDB, body.parcels);
+      await upsertParcels(db, body.parcels);
 
       return withSecurityHeaders(
         Response.json({
@@ -5904,7 +5920,7 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/api/opportunities/match") {
-      if (!env.OPPORTUNITYDB) {
+      if (!db) {
         return withSecurityHeaders(missingDatabaseResponse());
       }
 
@@ -5918,7 +5934,7 @@ export default {
         );
       }
 
-      const results = await matchAndPersistOpportunities(env.OPPORTUNITYDB, body.opportunities);
+      const results = await matchAndPersistOpportunities(db, body.opportunities);
 
       return withSecurityHeaders(
         Response.json({
@@ -5931,13 +5947,13 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/api/opportunities/review") {
-      if (!env.OPPORTUNITYDB) {
+      if (!db) {
         return withSecurityHeaders(missingDatabaseResponse());
       }
 
       const limitParam = Number(url.searchParams.get("limit") ?? "25");
       const needsReviewOnly = url.searchParams.get("needsReviewOnly") !== "false";
-      const queue = await listParcelReviewQueue(env.OPPORTUNITYDB, {
+      const queue = await listParcelReviewQueue(db, {
         limit: Number.isFinite(limitParam) ? limitParam : 25,
         needsReviewOnly,
       });
@@ -5953,7 +5969,7 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/api/debug/parcel-lookup") {
-      if (!env.OPPORTUNITYDB) {
+      if (!db) {
         return withSecurityHeaders(missingDatabaseResponse());
       }
 
@@ -5967,7 +5983,7 @@ export default {
         );
       }
 
-      const result = await debugLookupParcelAddress(env.OPPORTUNITYDB, address);
+      const result = await debugLookupParcelAddress(db, address);
       return withSecurityHeaders(
         Response.json({
           ok: true,
@@ -5977,24 +5993,25 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/api/opengov/locations/status") {
-      if (!env.OPPORTUNITYDB) {
+      if (!db) {
         return withSecurityHeaders(missingDatabaseResponse());
       }
       const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
       const locationIngestLimit = getOpenGovLocationIngestLimit(env);
       const parsedMinIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10);
       const minIntervalMinutes = Number.isFinite(parsedMinIntervalMinutes) && parsedMinIntervalMinutes > 0 ? parsedMinIntervalMinutes : 1440;
-      const cachedLocations = await countOpenGovLocations(env.OPPORTUNITYDB);
+      const cachedLocations = await countOpenGovLocations(db);
       let syncTrackingAvailable = true;
       let lastSuccess: OpenGovSyncSnapshot | null = null;
       try {
-        lastSuccess = await getLastSuccessfulOpenGovSync(env.OPPORTUNITYDB, community, "locations");
+        lastSuccess = await getLastSuccessfulOpenGovSync(db, community, "locations");
       } catch {
         syncTrackingAvailable = false;
       }
       const skipDecision = shouldSkipOpenGovLocationIngest(lastSuccess, new Date(), minIntervalMinutes);
       return withSecurityHeaders(Response.json({
         ok: true,
+        databaseBinding,
         cachedLocations,
         locationIngestLimit,
         minIntervalMinutes,
@@ -6007,7 +6024,7 @@ export default {
     }
 
     if (request.method === "POST" && url.pathname === "/ingest") {
-      if (!env.OPPORTUNITYDB) {
+      if (!db) {
         return withSecurityHeaders(
           Response.json(
             {
@@ -6020,7 +6037,7 @@ export default {
         );
       }
 
-      const runId = await startIngestionRun(env.OPPORTUNITYDB, "manual");
+      const runId = await startIngestionRun(db, "manual");
       const opengovParam = (url.searchParams.get("opengov") ?? "").toLowerCase();
       const forceOpenGov = opengovParam === "force";
       const skipOpenGov = opengovParam === "skip";
@@ -6030,12 +6047,13 @@ export default {
 
       try {
         const started = Date.now();
-        const summary = await runAutomaticIngest(env.OPPORTUNITYDB, env);
+        const summary = await runAutomaticIngest(db, env);
         d1Ops.coreIngest += 1;
-        const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "manual", env);
+        const strategicBrief = await createAndPersistStrategicBrief(db, "manual", env);
         let opengov: Record<string, unknown>;
         if (!env.OPENGOV_KEY?.trim()) {
           opengov = {
+            databaseBinding,
             mode: "activity-ingest",
             minIntervalMinutes: 1440,
             force: forceOpenGov,
@@ -6061,7 +6079,7 @@ export default {
             error: "OpenGov is not configured",
           };
         } else {
-          opengov = await runOpenGovLocationsIngest(env.OPPORTUNITYDB, env, {
+          opengov = await runOpenGovLocationsIngest(db, env, {
             force: forceOpenGov,
             skipRequested: skipOpenGov,
             enableMatch: matchRequested,
@@ -6070,7 +6088,7 @@ export default {
         }
         let finishedRun = true;
         try {
-          await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
+          await finishIngestionRun(db, runId, "completed");
           d1Ops.syncTracking += 1;
         } catch (error) {
           finishedRun = false;
@@ -6088,12 +6106,13 @@ export default {
             summary,
             strategicBrief,
             opengov,
+            databaseBinding,
             ...(debug ? { timing: { phases: { totalMs: Date.now() - started } }, d1OpsEstimate: { ...d1Ops, total: d1Ops.coreIngest + d1Ops.opengovLocationRefresh + d1Ops.opengovMatches + d1Ops.syncTracking } } : {}),
           }),
         );
       } catch (error) {
         try {
-          await finishIngestionRun(env.OPPORTUNITYDB, runId, "failed");
+          await finishIngestionRun(db, runId, "failed");
         } catch (finishError) {
           console.error("finishIngestionRun failed", finishError);
         }
@@ -6119,14 +6138,16 @@ export default {
 
   async scheduled(controller: { cron: string }, env: Env): Promise<void> {
     const timestamp = new Date().toISOString();
+    const db = getOpportunityDb(env);
+    const databaseBinding = getOpportunityDbBindingName(env);
 
-    if (env.OPPORTUNITYDB) {
-      const runId = await startIngestionRun(env.OPPORTUNITYDB, "scheduled");
+    if (db) {
+      const runId = await startIngestionRun(db, "scheduled");
 
       try {
-        const summary = await runAutomaticIngest(env.OPPORTUNITYDB, env);
-        const strategicBrief = await createAndPersistStrategicBrief(env.OPPORTUNITYDB, "scheduled", env);
-        await finishIngestionRun(env.OPPORTUNITYDB, runId, "completed");
+        const summary = await runAutomaticIngest(db, env);
+        const strategicBrief = await createAndPersistStrategicBrief(db, "scheduled", env);
+        await finishIngestionRun(db, runId, "completed");
 
         console.log(
           JSON.stringify({
@@ -6134,13 +6155,14 @@ export default {
             cron: controller.cron,
             at: timestamp,
             databaseConfigured: true,
+            databaseBinding,
             summary,
             strategicBriefGeneratedAt: strategicBrief.generatedAt,
           }),
         );
         return;
       } catch (error) {
-        await finishIngestionRun(env.OPPORTUNITYDB, runId, "failed");
+        await finishIngestionRun(db, runId, "failed");
 
         console.error(
           JSON.stringify({
@@ -6148,6 +6170,7 @@ export default {
             cron: controller.cron,
             at: timestamp,
             databaseConfigured: true,
+            databaseBinding,
             error: error instanceof Error ? error.message : "Unknown ingest failure",
           }),
         );
@@ -6160,7 +6183,8 @@ export default {
         event: "scheduled-run",
         cron: controller.cron,
         at: timestamp,
-        databaseConfigured: Boolean(env.OPPORTUNITYDB),
+        databaseConfigured: Boolean(db),
+        databaseBinding,
       }),
     );
   },
