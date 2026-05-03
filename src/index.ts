@@ -1154,7 +1154,7 @@ async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Reco
 
     return {
       test: path,
-      recordType: searchParams?.['filter[recordType]'] ?? null,
+      recordType: searchParams?.recordType ?? searchParams?.recordTypeId ?? null,
       path: `${path}${url.search}`,
       ok: response.ok,
       status: response.status,
@@ -1164,7 +1164,7 @@ async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Reco
   } catch (error) {
     return {
       test: path,
-      recordType: searchParams?.['filter[recordType]'] ?? null,
+      recordType: searchParams?.recordType ?? searchParams?.recordTypeId ?? null,
       path: `${path}${url.search}`,
       ok: false,
       status: 500,
@@ -1172,6 +1172,15 @@ async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Reco
       error: error instanceof Error ? error.message : 'Unknown fetch error',
     };
   }
+}
+
+
+function buildRecordsQueryCandidates(searchTerm: string): Array<Record<string, string>> {
+  return [
+    { "page[size]": "25", search: searchTerm },
+    { "page[size]": "25", q: searchTerm },
+    { "page[size]": "25", query: searchTerm },
+  ];
 }
 
 async function fetchPermitRecords(addresses: string[], env?: Env): Promise<PermitRecord[]> {
@@ -1182,18 +1191,26 @@ async function fetchPermitRecords(addresses: string[], env?: Env): Promise<Permi
 
   for (const address of uniqueAddresses) {
     for (const variant of buildOpenGovAddressVariants(address)) {
-      const payload = await fetchOpenGovPlceJson(env, 'records', {
-        'page[size]': '25',
-        'filter[search]': variant,
-      });
-      const parsed = parseOpenGovPermitResults(payload, address);
-      for (const record of parsed) {
-        const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ''}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        records.push(record);
+      let matchedVariant = false;
+      for (const query of buildRecordsQueryCandidates(variant)) {
+        try {
+          const payload = await fetchOpenGovPlceJson(env, 'records', query);
+          const parsed = parseOpenGovPermitResults(payload, address);
+          for (const record of parsed) {
+            const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ''}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            records.push(record);
+          }
+          if (parsed.length) {
+            matchedVariant = true;
+            break;
+          }
+        } catch {
+          continue;
+        }
       }
-      if (parsed.length) {
+      if (matchedVariant) {
         break;
       }
     }
@@ -1212,7 +1229,7 @@ async function buildPermitDebugPayload(env?: Env, limit = 8) {
     const variants = buildOpenGovAddressVariants(address).slice(0, 3);
     const attempts: OpenGovPlceProbeResult[] = [];
     for (const variant of variants) {
-      attempts.push(await fetchOpenGovPlceProbe((env ?? {}) as Env, 'records', { 'page[size]': '10', 'filter[search]': variant }));
+      for (const query of buildRecordsQueryCandidates(variant)) { attempts.push(await fetchOpenGovPlceProbe((env ?? {}) as Env, 'records', { 'page[size]': '10', ...query })); }
     }
     searches.push({ address, attempts });
   }
@@ -1232,9 +1249,11 @@ async function buildOpenGovPermitsTestPayload(env: Env) {
 
   checks.push(await fetchOpenGovPlceProbe(env, 'record-types'));
   checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5' }));
-  checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', 'filter[search]': 'danvers' }));
+  checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', search: 'danvers' }));
+  checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', q: 'danvers' }));
   for (const recordType of recordTypeGuesses) {
-    checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', 'filter[recordType]': recordType }));
+    checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', recordType }));
+    checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', recordTypeId: recordType }));
   }
 
   return {
