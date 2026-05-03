@@ -1500,8 +1500,12 @@ async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenG
       )
         .run();
     }
-  } catch {
-    return 0;
+  } catch (error) {
+    throw new Error(
+      `Failed to upsert OpenGov locations. Confirm migrations 0004 and 0006 are applied. ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
 
   return uniqueLocations.length;
@@ -1555,8 +1559,12 @@ async function upsertOpenGovPermitRecords(
         .run();
       written += 1;
     }
-  } catch {
-    return written;
+  } catch (error) {
+    throw new Error(
+      `Failed to upsert OpenGov permit records. Confirm migration 0005 is applied. ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
   }
   return written;
 }
