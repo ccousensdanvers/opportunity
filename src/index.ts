@@ -1117,6 +1117,166 @@ interface OpenGovPlceProbeResult {
   error?: string;
 }
 
+interface OpenGovLocationRecord {
+  id: string | null;
+  locationType: string | null;
+  streetNo: string | null;
+  streetName: string | null;
+  city: string | null;
+  state: string | null;
+  postalCode: string | null;
+  gisID: string | null;
+  mbl: string | null;
+  matID: string | null;
+}
+
+interface ParsedAddressParts {
+  original: string;
+  normalized: string;
+  streetNo: string;
+  streetNoBase: string;
+  streetNoSuffix: string;
+  streetName: string;
+}
+
+interface OpenGovLocationMatchResult {
+  input: ParsedAddressParts;
+  pathQueried: string;
+  totalLocationsChecked: number;
+  parcelCandidatesConsidered: number;
+  bestMatch: OpenGovLocationRecord | null;
+  nearMatches: OpenGovLocationRecord[];
+}
+
+function buildOpenGovDirectAuthHeaders(apiKey: string): HeadersInit {
+  return {
+    Authorization: `Token ${apiKey}`,
+    Accept: "application/vnd.api+json",
+  };
+}
+
+function normalizeStreetName(value: string): string {
+  return normalizeWhitespace(value)
+    .toLowerCase()
+    .replace(/[.,]/g, "")
+    .replace(/\bstreet\b/g, "st")
+    .replace(/\bavenue\b/g, "ave")
+    .replace(/\broad\b/g, "rd")
+    .replace(/\bdrive\b/g, "dr")
+    .replace(/\blane\b/g, "ln")
+    .replace(/\bcourt\b/g, "ct")
+    .replace(/\bplace\b/g, "pl")
+    .replace(/\bterrace\b/g, "ter")
+    .replace(/\bboulevard\b/g, "blvd");
+}
+
+function parseAddressParts(address: string): ParsedAddressParts {
+  const normalized = normalizeWhitespace(address);
+  const match = normalized.match(/^(\d+)([a-zA-Z]?)\s+(.*)$/);
+  if (!match) {
+    return {
+      original: address,
+      normalized: normalized.toLowerCase(),
+      streetNo: "",
+      streetNoBase: "",
+      streetNoSuffix: "",
+      streetName: normalizeStreetName(normalized),
+    };
+  }
+
+  return {
+    original: address,
+    normalized: normalized.toLowerCase(),
+    streetNo: `${match[1]}${match[2]}`.toLowerCase(),
+    streetNoBase: match[1],
+    streetNoSuffix: match[2].toLowerCase(),
+    streetName: normalizeStreetName(match[3]),
+  };
+}
+
+function normalizeOpenGovLocation(candidate: Record<string, unknown>): OpenGovLocationRecord {
+  return {
+    id: coerceOptionalString(candidate.id),
+    locationType: coerceOptionalString(candidate.locationType),
+    streetNo: coerceOptionalString(candidate.streetNo),
+    streetName: coerceOptionalString(candidate.streetName),
+    city: coerceOptionalString(candidate.city),
+    state: coerceOptionalString(candidate.state),
+    postalCode: coerceOptionalString(candidate.postalCode),
+    gisID: coerceOptionalString(candidate.gisID),
+    mbl: coerceOptionalString(candidate.mbl),
+    matID: coerceOptionalString(candidate.matID),
+  };
+}
+
+function scoreLocationMatch(input: ParsedAddressParts, location: OpenGovLocationRecord): number {
+  const locNo = (location.streetNo ?? "").toLowerCase();
+  const locNoMatch = locNo.match(/^(\d+)([a-zA-Z]?)$/);
+  const locBase = locNoMatch?.[1] ?? "";
+  const locSuffix = (locNoMatch?.[2] ?? "").toLowerCase();
+  const locStreet = normalizeStreetName(location.streetName ?? "");
+  let score = 0;
+
+  if (location.locationType === "PARCEL") {
+    score += 100;
+  } else if (location.locationType === "SEGMENT") {
+    score += 15;
+  }
+
+  if ((location.city ?? "").toLowerCase() === "danvers") score += 25;
+  if ((location.state ?? "").toUpperCase() === "MA") score += 20;
+  if ((location.postalCode ?? "").startsWith("01923")) score += 20;
+
+  if (input.streetName && locStreet === input.streetName) {
+    score += 70;
+  } else if (input.streetName && locStreet.includes(input.streetName)) {
+    score += 25;
+  }
+
+  if (input.streetNo && locNo === input.streetNo) {
+    score += 80;
+  } else if (input.streetNoBase && locBase === input.streetNoBase) {
+    score += input.streetNoSuffix === "" || locSuffix === "" ? 45 : 30;
+  }
+
+  return score;
+}
+
+async function fetchOpenGovLocations(env: Env): Promise<{ path: string; records: OpenGovLocationRecord[] }> {
+  const path = "locations?page[size]=500";
+  const payload = await fetchOpenGovPlceJson(env, "locations", { "page[size]": "500" }) as { data?: unknown[] };
+  const data = Array.isArray(payload?.data) ? payload.data : [];
+  const records = data
+    .filter((value): value is Record<string, unknown> => Boolean(value) && typeof value === "object")
+    .map((value) => normalizeOpenGovLocation(value));
+  return { path, records };
+}
+
+function matchOpenGovLocationForAddress(
+  address: string,
+  pathQueried: string,
+  locations: OpenGovLocationRecord[],
+): OpenGovLocationMatchResult {
+  const input = parseAddressParts(address);
+  const parcelCandidates = locations.filter((location) => location.locationType === "PARCEL");
+  const scored = locations
+    .map((location) => ({ location, score: scoreLocationMatch(input, location) }))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score);
+
+  const bestMatch = scored.length ? scored[0].location : null;
+  const nearMatches = scored.slice(1, 6).map((entry) => entry.location);
+
+  return {
+    input,
+    pathQueried,
+    totalLocationsChecked: locations.length,
+    parcelCandidatesConsidered: parcelCandidates.length,
+    bestMatch,
+    nearMatches,
+  };
+}
+
 async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Record<string, string>): Promise<OpenGovPlceProbeResult> {
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
   const url = new URL(`${OPENGOV_PLCE_BASE_URL}/v2/${community}/${path}`);
@@ -1132,12 +1292,7 @@ async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Reco
       return { test: path, recordType: null, path: `${path}${url.search}`, ok: false, status: 503, parsedCount: 0, error: 'OPENGOV_KEY is not configured.' };
     }
 
-    const response = await fetch(url.toString(), {
-      headers: {
-        Authorization: `Token ${apiKey}`,
-        Accept: 'application/vnd.api+json',
-      },
-    });
+    const response = await fetch(url.toString(), { headers: buildOpenGovDirectAuthHeaders(apiKey) });
     const text = await response.text();
     let parsedCount = 0;
     let preview = '';
@@ -2555,12 +2710,7 @@ async function fetchOpenGovPlceJson(
     }
   }
 
-  const response = await fetch(url.toString(), {
-    headers: {
-      Authorization: `Token ${apiKey}`,
-      Accept: "application/vnd.api+json",
-    },
-  });
+  const response = await fetch(url.toString(), { headers: buildOpenGovDirectAuthHeaders(apiKey) });
 
   const body = await response.text();
 
@@ -2609,8 +2759,40 @@ function buildOpenGovErrorResponse(
   );
 }
 
-async function buildOpenGovTestPayload(env: Env) {
-  return buildOpenGovPermitsTestPayload(env);
+async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
+  const defaultAddress = "10 Damon Street";
+  const address = normalizeWhitespace(requestedAddress ?? "") || defaultAddress;
+  const base = await buildOpenGovPermitsTestPayload(env);
+  const locationFetch = await fetchOpenGovLocations(env);
+  const matched = matchOpenGovLocationForAddress(address, locationFetch.path, locationFetch.records);
+
+  let permitsByLocation: unknown = null;
+  if (matched.bestMatch?.id) {
+    try {
+      permitsByLocation = await fetchOpenGovPlceJson(env, "records", {
+        "page[size]": "25",
+        locationId: matched.bestMatch.id,
+      });
+    } catch (error) {
+      permitsByLocation = {
+        error: error instanceof Error ? error.message : "Permit lookup by locationId failed.",
+      };
+    }
+  }
+
+  return {
+    ...base,
+    addressQueried: address,
+    debug: {
+      normalizedInputAddress: matched.input,
+      plcPathQueried: matched.pathQueried,
+      totalLocationsChecked: matched.totalLocationsChecked,
+      parcelCandidatesConsidered: matched.parcelCandidatesConsidered,
+      bestMatchedLocations: matched.bestMatch ? [matched.bestMatch] : [],
+      nearMatches: matched.nearMatches,
+      permitLookupByLocationId: matched.bestMatch?.id ? { locationId: matched.bestMatch.id, result: permitsByLocation } : null,
+    },
+  };
 }
 
 function buildOpportunityInputs(
@@ -4455,7 +4637,8 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/api/opengov/permits-test") {
-      return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env)));
+      const address = url.searchParams.get("address")?.trim() ?? "";
+      return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env, address)));
     }
 
     if (request.method === "GET" && url.pathname === "/api/debug/signals") {
