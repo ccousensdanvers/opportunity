@@ -49,7 +49,7 @@ npm run dev
 
 4. Create the D1 database and queue resources once you are ready to enable persistence and background ingestion.
 
-5. Add the real `OPPORTUNITYDB` D1 binding values in `wrangler.jsonc`, then apply migrations:
+5. Add the real D1 binding values in `wrangler.jsonc` (Primary binding: `OPPORTUNITYDB2`; fallback supported: `OPPORTUNITYDB`), then apply migrations:
 
 ```bash
 npm run migrate:local
@@ -61,6 +61,10 @@ Helpful shortcuts once `wrangler` is available in your environment:
 npm run cf:migrate:local
 npm run cf:migrate:remote
 npm run cf:smoke
+
+# Wrangler binding-specific commands
+npx wrangler d1 migrations apply OPPORTUNITYDB2 --remote
+npx wrangler d1 execute OPPORTUNITYDB2 --remote --command "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name;"
 ```
 
 ## Current Routes
