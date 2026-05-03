@@ -1119,15 +1119,58 @@ interface OpenGovPlceProbeResult {
 
 interface OpenGovLocationRecord {
   id: string | null;
+  type: string | null;
+  name: string | null;
+  latitude: number | null;
+  longitude: number | null;
   locationType: string | null;
+  ownerName: string | null;
+  ownerStreetNumber: string | null;
+  ownerStreetName: string | null;
+  ownerUnit: string | null;
+  ownerCity: string | null;
+  ownerState: string | null;
+  ownerPostalCode: string | null;
+  ownerCountry: string | null;
+  ownerEmail: string | null;
   streetNo: string | null;
   streetName: string | null;
+  unit: string | null;
   city: string | null;
   state: string | null;
   postalCode: string | null;
+  country: string | null;
+  secondaryLatitude: number | null;
+  secondaryLongitude: number | null;
+  segmentPrimaryLabel: string | null;
+  segmentSecondaryLabel: string | null;
+  segmentLabel: string | null;
+  segmentLength: number | null;
+  ownerPhoneNo: string | null;
+  lotArea: number | null;
   gisID: string | null;
+  occupancyType: string | null;
+  propertyUse: string | null;
+  sewage: string | null;
+  water: string | null;
+  yearBuilt: number | null;
+  zoning: string | null;
+  buildingType: string | null;
+  notes: string | null;
+  subdivision: string | null;
+  archived: boolean | null;
   mbl: string | null;
   matID: string | null;
+  sourceUpdatedAt: string | null;
+}
+
+function coerceOptionalBoolean(value: unknown): boolean | null {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (value.toLowerCase() === "true") return true;
+    if (value.toLowerCase() === "false") return false;
+  }
+  return null;
 }
 
 interface ParsedAddressParts {
@@ -1195,17 +1238,57 @@ function parseAddressParts(address: string): ParsedAddressParts {
 }
 
 function normalizeOpenGovLocation(candidate: Record<string, unknown>): OpenGovLocationRecord {
+  const attributes = (
+    candidate.attributes && typeof candidate.attributes === "object"
+      ? candidate.attributes
+      : {}
+  ) as Record<string, unknown>;
+
   return {
     id: coerceOptionalString(candidate.id),
-    locationType: coerceOptionalString(candidate.locationType),
-    streetNo: coerceOptionalString(candidate.streetNo),
-    streetName: coerceOptionalString(candidate.streetName),
-    city: coerceOptionalString(candidate.city),
-    state: coerceOptionalString(candidate.state),
-    postalCode: coerceOptionalString(candidate.postalCode),
-    gisID: coerceOptionalString(candidate.gisID),
-    mbl: coerceOptionalString(candidate.mbl),
-    matID: coerceOptionalString(candidate.matID),
+    type: coerceOptionalString(candidate.type),
+    name: coerceOptionalString(attributes.name),
+    latitude: coerceOptionalNumber(attributes.latitude),
+    longitude: coerceOptionalNumber(attributes.longitude),
+    locationType: coerceOptionalString(attributes.locationType),
+    ownerName: coerceOptionalString(attributes.ownerName),
+    ownerStreetNumber: coerceOptionalString(attributes.ownerStreetNumber),
+    ownerStreetName: coerceOptionalString(attributes.ownerStreetName),
+    ownerUnit: coerceOptionalString(attributes.ownerUnit),
+    ownerCity: coerceOptionalString(attributes.ownerCity),
+    ownerState: coerceOptionalString(attributes.ownerState),
+    ownerPostalCode: coerceOptionalString(attributes.ownerPostalCode),
+    ownerCountry: coerceOptionalString(attributes.ownerCountry),
+    ownerEmail: coerceOptionalString(attributes.ownerEmail),
+    streetNo: coerceOptionalString(attributes.streetNo),
+    streetName: coerceOptionalString(attributes.streetName),
+    unit: coerceOptionalString(attributes.unit),
+    city: coerceOptionalString(attributes.city),
+    state: coerceOptionalString(attributes.state),
+    postalCode: coerceOptionalString(attributes.postalCode),
+    country: coerceOptionalString(attributes.country),
+    secondaryLatitude: coerceOptionalNumber(attributes.secondaryLatitude),
+    secondaryLongitude: coerceOptionalNumber(attributes.secondaryLongitude),
+    segmentPrimaryLabel: coerceOptionalString(attributes.segmentPrimaryLabel),
+    segmentSecondaryLabel: coerceOptionalString(attributes.segmentSecondaryLabel),
+    segmentLabel: coerceOptionalString(attributes.segmentLabel),
+    segmentLength: coerceOptionalNumber(attributes.segmentLength),
+    ownerPhoneNo: coerceOptionalString(attributes.ownerPhoneNo),
+    lotArea: coerceOptionalNumber(attributes.lotArea),
+    gisID: coerceOptionalString(attributes.gisID),
+    mbl: coerceOptionalString(attributes.mbl),
+    matID: coerceOptionalString(attributes.matID),
+    occupancyType: coerceOptionalString(attributes.occupancyType),
+    propertyUse: coerceOptionalString(attributes.propertyUse),
+    sewage: coerceOptionalString(attributes.sewage),
+    water: coerceOptionalString(attributes.water),
+    yearBuilt: coerceOptionalNumber(attributes.yearBuilt),
+    zoning: coerceOptionalString(attributes.zoning),
+    buildingType: coerceOptionalString(attributes.buildingType),
+    notes: coerceOptionalString(attributes.notes),
+    subdivision: coerceOptionalString(attributes.subdivision),
+    archived: coerceOptionalBoolean(attributes.archived),
+    sourceUpdatedAt: coerceOptionalString(attributes.updatedAt),
   };
 }
 
@@ -1293,8 +1376,12 @@ async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenG
       await db
         .prepare(
         `INSERT INTO opengov_locations (
-          id, location_type, street_no, street_name, city, state, postal_code, gis_id, mbl, mat_id, source_community, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          id, location_type, street_no, street_name, city, state, postal_code, gis_id, mbl, mat_id, source_type, name, latitude, longitude, owner_name, owner_street_number, owner_street_name,
+          owner_unit, owner_city, owner_state, owner_postal_code, owner_country, owner_email, unit,
+          country, secondary_latitude, secondary_longitude, segment_primary_label, segment_secondary_label,
+          segment_label, segment_length, owner_phone_no, lot_area, occupancy_type, property_use, sewage,
+          water, year_built, zoning, building_type, notes, subdivision, archived, source_updated_at, source_community, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           location_type = excluded.location_type,
           street_no = excluded.street_no,
@@ -1305,6 +1392,40 @@ async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenG
           gis_id = excluded.gis_id,
           mbl = excluded.mbl,
           mat_id = excluded.mat_id,
+          source_type = excluded.source_type,
+          name = excluded.name,
+          latitude = excluded.latitude,
+          longitude = excluded.longitude,
+          owner_name = excluded.owner_name,
+          owner_street_number = excluded.owner_street_number,
+          owner_street_name = excluded.owner_street_name,
+          owner_unit = excluded.owner_unit,
+          owner_city = excluded.owner_city,
+          owner_state = excluded.owner_state,
+          owner_postal_code = excluded.owner_postal_code,
+          owner_country = excluded.owner_country,
+          owner_email = excluded.owner_email,
+          unit = excluded.unit,
+          country = excluded.country,
+          secondary_latitude = excluded.secondary_latitude,
+          secondary_longitude = excluded.secondary_longitude,
+          segment_primary_label = excluded.segment_primary_label,
+          segment_secondary_label = excluded.segment_secondary_label,
+          segment_label = excluded.segment_label,
+          segment_length = excluded.segment_length,
+          owner_phone_no = excluded.owner_phone_no,
+          lot_area = excluded.lot_area,
+          occupancy_type = excluded.occupancy_type,
+          property_use = excluded.property_use,
+          sewage = excluded.sewage,
+          water = excluded.water,
+          year_built = excluded.year_built,
+          zoning = excluded.zoning,
+          building_type = excluded.building_type,
+          notes = excluded.notes,
+          subdivision = excluded.subdivision,
+          archived = excluded.archived,
+          source_updated_at = excluded.source_updated_at,
           source_community = excluded.source_community,
           updated_at = excluded.updated_at`,
       )
@@ -1319,6 +1440,40 @@ async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenG
         location.gisID,
         location.mbl,
         location.matID,
+        location.type,
+        location.name,
+        location.latitude,
+        location.longitude,
+        location.ownerName,
+        location.ownerStreetNumber,
+        location.ownerStreetName,
+        location.ownerUnit,
+        location.ownerCity,
+        location.ownerState,
+        location.ownerPostalCode,
+        location.ownerCountry,
+        location.ownerEmail,
+        location.unit,
+        location.country,
+        location.secondaryLatitude,
+        location.secondaryLongitude,
+        location.segmentPrimaryLabel,
+        location.segmentSecondaryLabel,
+        location.segmentLabel,
+        location.segmentLength,
+        location.ownerPhoneNo,
+        location.lotArea,
+        location.occupancyType,
+        location.propertyUse,
+        location.sewage,
+        location.water,
+        location.yearBuilt,
+        location.zoning,
+        location.buildingType,
+        location.notes,
+        location.subdivision,
+        location.archived,
+        location.sourceUpdatedAt,
         community,
         now,
       )
