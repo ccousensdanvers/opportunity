@@ -3655,7 +3655,6 @@ async function getLastSuccessfulOpenGovSync(
   community: string,
   syncType: string,
 ): Promise<OpenGovSyncSnapshot | null> {
-  await ensureOpenGovSyncRunsTable(db);
   const row = await db.prepare(
     `SELECT completed_at AS completedAt, fetched_count AS fetchedCount, stored_count AS storedCount, total_records AS totalRecords, pages_fetched AS pagesFetched
      FROM opengov_sync_runs
@@ -3667,7 +3666,6 @@ async function getLastSuccessfulOpenGovSync(
 }
 
 async function getRecentRunningOpenGovSync(db: D1Database, community: string, syncType: string, sinceIso: string): Promise<string | null> {
-  await ensureOpenGovSyncRunsTable(db);
   const row = await db.prepare(
     `SELECT started_at AS startedAt
      FROM opengov_sync_runs
@@ -3676,6 +3674,11 @@ async function getRecentRunningOpenGovSync(db: D1Database, community: string, sy
      LIMIT 1`,
   ).bind(community, syncType, sinceIso).first<{ startedAt: string | null }>();
   return row?.startedAt ?? null;
+}
+
+async function countOpenGovLocations(db: D1Database): Promise<number> {
+  const row = await db.prepare("SELECT COUNT(*) AS count FROM opengov_locations").first<{ count: number | string | null }>();
+  return Number(row?.count ?? 0);
 }
 
 function shouldSkipOpenGovLocationIngest(
@@ -3720,73 +3723,54 @@ async function runOpenGovLocationsIngest(db: D1Database, env: Env, force = false
   const parsedMinIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10);
   const minIntervalMinutes = Number.isFinite(parsedMinIntervalMinutes) && parsedMinIntervalMinutes > 0 ? parsedMinIntervalMinutes : 1440;
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
-  const lastSuccess = await getLastSuccessfulOpenGovSync(db, community, "locations");
   const now = new Date();
-  const skipDecision = shouldSkipOpenGovLocationIngest(lastSuccess, now, minIntervalMinutes);
-  if (!force && skipDecision.skip) {
-    return { mode: "activity-ingest", minIntervalMinutes, force, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: null, pagesFetched: 0, skipped: true, skipReason: skipDecision.reason, lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null, matchesAttempted: true, matchesStored: 0 };
+  const cachedLocationsBefore = await countOpenGovLocations(db);
+  let syncTrackingAvailable = true;
+  let lastSuccess: OpenGovSyncSnapshot | null = null;
+
+  try {
+    lastSuccess = await getLastSuccessfulOpenGovSync(db, community, "locations");
+  } catch {
+    syncTrackingAvailable = false;
   }
-  const runningSince = new Date(now.getTime() - (30 * 60000)).toISOString();
-  if (!force) {
-    const runningStartedAt = await getRecentRunningOpenGovSync(db, community, "locations", runningSince);
-    if (runningStartedAt) {
-      return { mode: "activity-ingest", minIntervalMinutes, force, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: null, pagesFetched: 0, skipped: true, skipReason: "OpenGov location ingest already appears to be running.", lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null, matchesAttempted: true, matchesStored: 0 };
-    }
+
+  const skipDecision = shouldSkipOpenGovLocationIngest(lastSuccess, now, minIntervalMinutes);
+  const shouldSkipForMissingTracking = !syncTrackingAvailable && cachedLocationsBefore > 0;
+  if (!force && cachedLocationsBefore > 0 && (skipDecision.skip || shouldSkipForMissingTracking)) {
+    return { mode: "activity-ingest", force, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: true, skipReason: shouldSkipForMissingTracking ? "OpenGov sync tracking unavailable; using existing cached locations. Apply migrations to enable 24-hour tracking." : skipDecision.reason, lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: true, matchesStored: 0, matchesSkippedReason: "Historical rematch is disabled during normal ingest.", recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
   }
 
   const runId = crypto.randomUUID();
   const startedAt = now.toISOString();
-  await ensureOpenGovSyncRunsTable(db);
-  await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "running", startedAt });
+  try {
+    await ensureOpenGovSyncRunsTable(db);
+    await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "running", startedAt });
+  } catch {
+    syncTrackingAvailable = false;
+  }
+
   try {
     const locationFetch = await fetchOpenGovLocations(env);
     const stored = await upsertOpenGovLocations(db, env, locationFetch.records);
     const completedAt = new Date().toISOString();
-    await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "success", startedAt, completedAt, fetchedCount: locationFetch.fetched, storedCount: stored, totalRecords: locationFetch.totalRecords, pagesFetched: locationFetch.pagesFetched });
-    return {
-      mode: "activity-ingest",
-      minIntervalMinutes,
-      force,
-      locationsAvailable: true,
-      locationsIngestAttempted: true,
-      locationsFetchedThisRun: locationFetch.fetched,
-      locationsStoredThisRun: stored,
-      locationsTotalRecords: locationFetch.totalRecords ?? locationFetch.fetched,
-      pagesFetched: locationFetch.pagesFetched,
-      skipped: false,
-      skipReason: null,
-      lastSuccessfulIngestAt: completedAt,
-      lastSuccessfulAgeMinutes: 0,
-      recordsEnabled: recordsEnabled(env),
-      recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
-      error: null,
-      matchesAttempted: true,
-      matchesStored: 0,
-    };
+    if (syncTrackingAvailable) {
+      try {
+        await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "success", startedAt, completedAt, fetchedCount: locationFetch.fetched, storedCount: stored, totalRecords: locationFetch.totalRecords, pagesFetched: locationFetch.pagesFetched });
+      } catch {
+        // best effort only
+      }
+    }
+    return { mode: "activity-ingest", force, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationsFetchedThisRun: locationFetch.fetched, locationsStoredThisRun: stored, locationsTotalRecords: locationFetch.totalRecords ?? locationFetch.fetched, pagesFetched: locationFetch.pagesFetched, skipped: false, skipReason: null, lastSuccessfulIngestAt: completedAt, lastSuccessfulAgeMinutes: 0, syncTrackingAvailable, matchesAttempted: true, matchesStored: 0, matchesSkippedReason: "Historical rematch is disabled during normal ingest.", recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null };
   } catch (error) {
     const completedAt = new Date().toISOString();
-    const message = error instanceof Error ? error.message : "OpenGov locations ingest failed.";
-    await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "error", startedAt, completedAt, errorMessage: message });
-    return {
-      mode: "activity-ingest",
-      minIntervalMinutes,
-      force,
-      locationsAvailable: true,
-      locationsIngestAttempted: true,
-      locationsFetchedThisRun: 0,
-      locationsStoredThisRun: 0,
-      locationsTotalRecords: null,
-      pagesFetched: 0,
-      skipped: false,
-      skipReason: null,
-      lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null,
-      lastSuccessfulAgeMinutes: skipDecision.ageMinutes,
-      recordsEnabled: recordsEnabled(env),
-      recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
-      error: "OpenGov location refresh failed. Using cached OpenGov locations where available.",
-      matchesAttempted: true,
-      matchesStored: 0,
-    };
+    if (syncTrackingAvailable) {
+      try {
+        await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "error", startedAt, completedAt, errorMessage: error instanceof Error ? error.message : "OpenGov locations ingest failed." });
+      } catch {
+        // best effort only
+      }
+    }
+    return { mode: "activity-ingest", force, minIntervalMinutes, cachedLocationsBefore, locationsIngestAttempted: true, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: cachedLocationsBefore, pagesFetched: 0, skipped: false, skipReason: null, lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, syncTrackingAvailable, matchesAttempted: true, matchesStored: 0, matchesSkippedReason: "Historical rematch is disabled during normal ingest.", recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: "OpenGov location refresh failed. Using cached OpenGov locations where available." };
   }
 }
 
@@ -5946,6 +5930,34 @@ export default {
       );
     }
 
+    if (request.method === "GET" && url.pathname === "/api/opengov/locations/status") {
+      if (!env.OPPORTUNITYDB) {
+        return withSecurityHeaders(missingDatabaseResponse());
+      }
+      const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+      const parsedMinIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10);
+      const minIntervalMinutes = Number.isFinite(parsedMinIntervalMinutes) && parsedMinIntervalMinutes > 0 ? parsedMinIntervalMinutes : 1440;
+      const cachedLocations = await countOpenGovLocations(env.OPPORTUNITYDB);
+      let syncTrackingAvailable = true;
+      let lastSuccess: OpenGovSyncSnapshot | null = null;
+      try {
+        lastSuccess = await getLastSuccessfulOpenGovSync(env.OPPORTUNITYDB, community, "locations");
+      } catch {
+        syncTrackingAvailable = false;
+      }
+      const skipDecision = shouldSkipOpenGovLocationIngest(lastSuccess, new Date(), minIntervalMinutes);
+      return withSecurityHeaders(Response.json({
+        ok: true,
+        cachedLocations,
+        minIntervalMinutes,
+        syncTrackingAvailable,
+        lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null,
+        lastSuccessfulAgeMinutes: skipDecision.ageMinutes,
+        wouldSkipFullRefresh: cachedLocations > 0 && (skipDecision.skip || !syncTrackingAvailable),
+        forceCommand: 'Invoke-RestMethod -Method Post -Uri "https://development.danversma.gov/ingest?opengov=force"',
+      }));
+    }
+
     if (request.method === "POST" && url.pathname === "/ingest") {
       if (!env.OPPORTUNITYDB) {
         return withSecurityHeaders(
@@ -6012,7 +6024,9 @@ export default {
             {
               accepted: false,
               message: buildIngestMessage("manual"),
-              error: error instanceof Error ? error.message : "Ingest failed.",
+              error: "POST /ingest failed",
+              detail: error instanceof Error ? error.message : "Ingest failed.",
+              updatedAt: new Date().toISOString(),
             },
             { status: 500 },
           ),
