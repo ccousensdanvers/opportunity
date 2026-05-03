@@ -3569,8 +3569,19 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
   let cachedLocationCount = 0;
   let status = "OpenGov location cache is empty. Run POST /ingest to populate it.";
   let locationSchemaDrift: { table: string; missingColumns: string[]; presentColumns: string[] } | null = null;
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const parsedMinIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10);
+  const minIntervalMinutes = Number.isFinite(parsedMinIntervalMinutes) && parsedMinIntervalMinutes > 0 ? parsedMinIntervalMinutes : 1440;
+  let nextIngestAction: "skip" | "refresh" = "refresh";
+  let lastSuccessfulIngestAt: string | null = null;
+  let lastSuccessfulAgeMinutes: number | null = null;
   try {
     if (env.OPPORTUNITYDB) {
+      const lastSuccess = await getLastSuccessfulOpenGovSync(env.OPPORTUNITYDB, community, "locations");
+      const skipDecision = shouldSkipOpenGovLocationIngest(lastSuccess, new Date(), minIntervalMinutes);
+      lastSuccessfulIngestAt = lastSuccess?.completedAt ?? null;
+      lastSuccessfulAgeMinutes = skipDecision.ageMinutes;
+      nextIngestAction = skipDecision.skip ? "skip" : "refresh";
       const cachedLocations = await listStoredOpenGovLocations(env.OPPORTUNITYDB, 20000);
       cachedLocationCount = cachedLocations.length;
       matched = matchOpenGovLocationForAddress(address, "opengov_locations cache", cachedLocations);
@@ -3594,6 +3605,11 @@ async function buildOpenGovTestPayload(env: Env, requestedAddress?: string) {
     locationsTotalRecords: cachedLocationCount,
     matchedLocation: matched.bestMatch,
     status,
+    minIntervalMinutes,
+    lastSuccessfulIngestAt,
+    lastSuccessfulAgeMinutes,
+    nextIngestAction,
+    forceCommand: 'Invoke-RestMethod -Method Post -Uri "https://development.danversma.gov/ingest?opengov=force"',
     debug: {
       normalizedInputAddress: matched.input,
       plcPathQueried: matched.pathQueried,
@@ -3621,57 +3637,116 @@ async function ensureOpenGovSyncRunsTable(db: D1Database): Promise<void> {
     completed_at TEXT,
     error_message TEXT
   );`).run();
+  await db.prepare(
+    "CREATE INDEX IF NOT EXISTS idx_opengov_sync_runs_type_started ON opengov_sync_runs(sync_type, started_at DESC);",
+  ).run();
 }
 
-async function getLastSuccessfulOpenGovLocationSync(db: D1Database): Promise<string | null> {
+type OpenGovSyncSnapshot = {
+  completedAt: string;
+  fetchedCount: number;
+  storedCount: number;
+  totalRecords: number | null;
+  pagesFetched: number | null;
+};
+
+async function getLastSuccessfulOpenGovSync(
+  db: D1Database,
+  community: string,
+  syncType: string,
+): Promise<OpenGovSyncSnapshot | null> {
   await ensureOpenGovSyncRunsTable(db);
   const row = await db.prepare(
-    `SELECT completed_at AS completedAt
+    `SELECT completed_at AS completedAt, fetched_count AS fetchedCount, stored_count AS storedCount, total_records AS totalRecords, pages_fetched AS pagesFetched
      FROM opengov_sync_runs
-     WHERE sync_type = 'locations' AND status = 'completed' AND completed_at IS NOT NULL
+     WHERE source_community = ? AND sync_type = ? AND status = 'success' AND completed_at IS NOT NULL
      ORDER BY completed_at DESC
      LIMIT 1`,
-  ).first<{ completedAt: string | null }>();
-  return row?.completedAt ?? null;
+  ).bind(community, syncType).first<OpenGovSyncSnapshot>();
+  return row?.completedAt ? row : null;
+}
+
+async function getRecentRunningOpenGovSync(db: D1Database, community: string, syncType: string, sinceIso: string): Promise<string | null> {
+  await ensureOpenGovSyncRunsTable(db);
+  const row = await db.prepare(
+    `SELECT started_at AS startedAt
+     FROM opengov_sync_runs
+     WHERE source_community = ? AND sync_type = ? AND status = 'running' AND started_at >= ?
+     ORDER BY started_at DESC
+     LIMIT 1`,
+  ).bind(community, syncType, sinceIso).first<{ startedAt: string | null }>();
+  return row?.startedAt ?? null;
+}
+
+function shouldSkipOpenGovLocationIngest(
+  lastSuccess: OpenGovSyncSnapshot | null,
+  now: Date,
+  minIntervalMinutes: number,
+): { skip: boolean; reason: string | null; ageMinutes: number | null } {
+  if (!lastSuccess?.completedAt) return { skip: false, reason: null, ageMinutes: null };
+  const ageMinutes = Math.floor((now.getTime() - Date.parse(lastSuccess.completedAt)) / 60000);
+  if (!Number.isFinite(ageMinutes) || ageMinutes < 0) return { skip: false, reason: null, ageMinutes: null };
+  if (ageMinutes < minIntervalMinutes) {
+    return { skip: true, reason: "Last successful OpenGov location ingest was less than 24 hours ago.", ageMinutes };
+  }
+  return { skip: false, reason: null, ageMinutes };
+}
+
+async function recordOpenGovSyncRun(db: D1Database, input: {
+  runId: string;
+  syncType: string;
+  community: string;
+  status: "running" | "success" | "error" | "skipped";
+  startedAt: string;
+  completedAt?: string | null;
+  fetchedCount?: number;
+  storedCount?: number;
+  totalRecords?: number | null;
+  pagesFetched?: number | null;
+  errorMessage?: string | null;
+}): Promise<void> {
+  const isStart = input.status === "running";
+  if (isStart) {
+    await db.prepare(`INSERT INTO opengov_sync_runs (id, sync_type, source_community, status, started_at) VALUES (?, ?, ?, ?, ?)`)
+      .bind(input.runId, input.syncType, input.community, input.status, input.startedAt).run();
+    return;
+  }
+  await db.prepare(`UPDATE opengov_sync_runs SET status=?, fetched_count=?, stored_count=?, total_records=?, pages_fetched=?, completed_at=?, error_message=? WHERE id=?`)
+    .bind(input.status, input.fetchedCount ?? 0, input.storedCount ?? 0, input.totalRecords ?? null, input.pagesFetched ?? null, input.completedAt ?? null, input.errorMessage ?? null, input.runId)
+    .run();
 }
 
 async function runOpenGovLocationsIngest(db: D1Database, env: Env, force = false): Promise<Record<string, unknown>> {
-  const minIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10) || 1440;
-  const lastSuccessfulIngestAt = await getLastSuccessfulOpenGovLocationSync(db);
-  if (!force && lastSuccessfulIngestAt) {
-    const elapsedMinutes = Math.floor((Date.now() - Date.parse(lastSuccessfulIngestAt)) / 60000);
-    if (Number.isFinite(elapsedMinutes) && elapsedMinutes >= 0 && elapsedMinutes < minIntervalMinutes) {
-      return {
-        mode: "activity-ingest",
-        locationsIngestAttempted: false,
-        locationsFetchedThisRun: 0,
-        locationsStoredThisRun: 0,
-        locationsTotalRecords: 0,
-        pagesFetched: 0,
-        skipped: true,
-        skipReason: `Last successful OpenGov location ingest was less than ${minIntervalMinutes / 60} hours ago.`,
-        lastSuccessfulIngestAt,
-        recordsEnabled: recordsEnabled(env),
-        recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
-        error: null,
-      };
+  const parsedMinIntervalMinutes = Number.parseInt(env.OPENGOV_INGEST_MIN_INTERVAL_MINUTES?.trim() ?? "", 10);
+  const minIntervalMinutes = Number.isFinite(parsedMinIntervalMinutes) && parsedMinIntervalMinutes > 0 ? parsedMinIntervalMinutes : 1440;
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const lastSuccess = await getLastSuccessfulOpenGovSync(db, community, "locations");
+  const now = new Date();
+  const skipDecision = shouldSkipOpenGovLocationIngest(lastSuccess, now, minIntervalMinutes);
+  if (!force && skipDecision.skip) {
+    return { mode: "activity-ingest", minIntervalMinutes, force, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: null, pagesFetched: 0, skipped: true, skipReason: skipDecision.reason, lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null, matchesAttempted: true, matchesStored: 0 };
+  }
+  const runningSince = new Date(now.getTime() - (30 * 60000)).toISOString();
+  if (!force) {
+    const runningStartedAt = await getRecentRunningOpenGovSync(db, community, "locations", runningSince);
+    if (runningStartedAt) {
+      return { mode: "activity-ingest", minIntervalMinutes, force, locationsIngestAttempted: false, locationsFetchedThisRun: 0, locationsStoredThisRun: 0, locationsTotalRecords: null, pagesFetched: 0, skipped: true, skipReason: "OpenGov location ingest already appears to be running.", lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null, lastSuccessfulAgeMinutes: skipDecision.ageMinutes, recordsEnabled: recordsEnabled(env), recordsStatus: recordsEnabled(env) ? "enabled" : "disabled", error: null, matchesAttempted: true, matchesStored: 0 };
     }
   }
 
   const runId = crypto.randomUUID();
-  const startedAt = new Date().toISOString();
-  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const startedAt = now.toISOString();
   await ensureOpenGovSyncRunsTable(db);
-  await db.prepare(`INSERT INTO opengov_sync_runs (id, sync_type, source_community, status, started_at) VALUES (?, 'locations', ?, 'running', ?)`)
-    .bind(runId, community, startedAt).run();
+  await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "running", startedAt });
   try {
     const locationFetch = await fetchOpenGovLocations(env);
     const stored = await upsertOpenGovLocations(db, env, locationFetch.records);
     const completedAt = new Date().toISOString();
-    await db.prepare(`UPDATE opengov_sync_runs SET status='completed', fetched_count=?, stored_count=?, total_records=?, pages_fetched=?, completed_at=? WHERE id=?`)
-      .bind(locationFetch.fetched, stored, locationFetch.totalRecords, locationFetch.pagesFetched, completedAt, runId).run();
+    await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "success", startedAt, completedAt, fetchedCount: locationFetch.fetched, storedCount: stored, totalRecords: locationFetch.totalRecords, pagesFetched: locationFetch.pagesFetched });
     return {
       mode: "activity-ingest",
+      minIntervalMinutes,
+      force,
       locationsAvailable: true,
       locationsIngestAttempted: true,
       locationsFetchedThisRun: locationFetch.fetched,
@@ -3681,29 +3756,36 @@ async function runOpenGovLocationsIngest(db: D1Database, env: Env, force = false
       skipped: false,
       skipReason: null,
       lastSuccessfulIngestAt: completedAt,
+      lastSuccessfulAgeMinutes: 0,
       recordsEnabled: recordsEnabled(env),
       recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
       error: null,
+      matchesAttempted: true,
+      matchesStored: 0,
     };
   } catch (error) {
     const completedAt = new Date().toISOString();
     const message = error instanceof Error ? error.message : "OpenGov locations ingest failed.";
-    await db.prepare(`UPDATE opengov_sync_runs SET status='failed', completed_at=?, error_message=? WHERE id=?`)
-      .bind(completedAt, message, runId).run();
+    await recordOpenGovSyncRun(db, { runId, syncType: "locations", community, status: "error", startedAt, completedAt, errorMessage: message });
     return {
       mode: "activity-ingest",
+      minIntervalMinutes,
+      force,
       locationsAvailable: true,
       locationsIngestAttempted: true,
       locationsFetchedThisRun: 0,
       locationsStoredThisRun: 0,
-      locationsTotalRecords: 0,
+      locationsTotalRecords: null,
       pagesFetched: 0,
       skipped: false,
       skipReason: null,
-      lastSuccessfulIngestAt,
+      lastSuccessfulIngestAt: lastSuccess?.completedAt ?? null,
+      lastSuccessfulAgeMinutes: skipDecision.ageMinutes,
       recordsEnabled: recordsEnabled(env),
       recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
-      error: message,
+      error: "OpenGov location refresh failed. Using cached OpenGov locations where available.",
+      matchesAttempted: true,
+      matchesStored: 0,
     };
   }
 }
@@ -5888,15 +5970,20 @@ export default {
         if (!env.OPENGOV_KEY?.trim()) {
           opengov = {
             mode: "activity-ingest",
+            minIntervalMinutes: 1440,
+            force: forceOpenGov,
             locationsAvailable: false,
             locationsIngestAttempted: false,
             locationsFetchedThisRun: 0,
             locationsStoredThisRun: 0,
-            locationsTotalRecords: 0,
+            locationsTotalRecords: null,
             pagesFetched: 0,
             skipped: true,
             skipReason: "OpenGov is not configured",
             lastSuccessfulIngestAt: null,
+            lastSuccessfulAgeMinutes: null,
+            matchesAttempted: false,
+            matchesStored: 0,
             recordsEnabled: recordsEnabled(env),
             recordsStatus: recordsEnabled(env) ? "enabled" : "disabled",
             error: "OpenGov is not configured",
