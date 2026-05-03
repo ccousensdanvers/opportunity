@@ -18,7 +18,6 @@ type Readiness = "Early" | "Emerging" | "Advancing";
 
 interface Env {
   OPPORTUNITYDB?: D1Database;
-  OPENGOV_TURNSTILE_TOKEN?: string;
   OPENGOV_KEY?: string;
   OPENGOV_COMMUNITY?: string;
 }
@@ -71,18 +70,6 @@ interface PermitRecord {
   permitNumber: string | null;
   detailUrl: string | null;
   source: string;
-}
-
-interface OpenGovPermitAttemptDebug {
-  address: string;
-  variant: string;
-  requestUrl: string;
-  ok: boolean;
-  status: number | null;
-  statusText: string | null;
-  parsedCount: number;
-  bodyPreview: string;
-  error?: string;
 }
 
 
@@ -175,9 +162,8 @@ const PLANNING_BOARD_RSS_URL =
 const ZBA_RSS_URL =
   "https://www.danversma.gov/RSSFeed.aspx?CID=Zoning-Board-of-Appeals-18&ModID=65";
 const PROJECTS_PAGE_URL = "https://www.danversma.gov/235/Projects";
-const DANVERS_OPENGOV_SEARCH_URL = "https://api-east.viewpointcloud.com/v2/danversma/search_results";
-const DANVERS_OPENGOV_PORTAL_URL = "https://danversma.portal.opengov.com/search";
 const OPENGOV_PLCE_BASE_URL = "https://api.plce.opengov.com/plce";
+const DANVERS_OPENGOV_PORTAL_URL = "https://danversma.portal.opengov.com/search";
 const DEFAULT_OPENGOV_COMMUNITY = "danversma";
 const DANVERS_PARCELS_LAYER_URL =
   "https://gis.danversma.gov/danversexternal/rest/services/DanversMA_Parcels_AGOL/MapServer/1/query";
@@ -1068,7 +1054,7 @@ function normalizePermitRecord(
     issuedDate,
     permitNumber,
     detailUrl,
-    source: "OpenGov permitting search",
+    source: "OpenGov PLCE records API",
   };
 }
 
@@ -1120,125 +1106,96 @@ function buildOpenGovAddressVariants(address: string): string[] {
   return Array.from(variants).map((value) => normalizeWhitespace(value)).filter(Boolean);
 }
 
-async function queryOpenGovPermitRecordsForAddress(
-  address: string,
-  env?: Env,
-): Promise<{ records: PermitRecord[]; attempts: OpenGovPermitAttemptDebug[] }> {
-  const normalizedAddress = normalizeWhitespace(address);
-  if (!normalizedAddress) {
-    return { records: [], attempts: [] };
-  }
+interface OpenGovPlceProbeResult {
+  test: string;
+  recordType: string | null;
+  path: string;
+  ok: boolean;
+  status: number;
+  parsedCount: number;
+  responsePreview?: string;
+  error?: string;
+}
 
-  const seen = new Set<string>();
-  const records: PermitRecord[] = [];
-  const attempts: OpenGovPermitAttemptDebug[] = [];
-
-  for (const variant of buildOpenGovAddressVariants(normalizedAddress)) {
-    const requestUrl = new URL(DANVERS_OPENGOV_SEARCH_URL);
-    requestUrl.searchParams.set("criteria", "location");
-    requestUrl.searchParams.set("key", variant);
-    requestUrl.searchParams.set("timeStamp", String(Date.now()));
-    requestUrl.searchParams.set("ignoreCommunity", "true");
-
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 12000);
-      const headers: Record<string, string> = {
-        accept: "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        priority: "u=1, i",
-        referer: DANVERS_OPENGOV_PORTAL_URL,
-        "sec-fetch-dest": "empty",
-        "sec-fetch-mode": "cors",
-        "sec-fetch-site": "cross-site",
-        sourceapp: "storefront",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-      };
-
-      if (env?.OPENGOV_TURNSTILE_TOKEN) {
-        headers["cf-turnstile-token"] = env.OPENGOV_TURNSTILE_TOKEN;
-      }
-
-      const response = await fetch(requestUrl.toString(), {
-        signal: controller.signal,
-        headers,
-      });
-      const body = await response.text();
-      clearTimeout(timeout);
-
-      if (!response.ok) {
-        attempts.push({
-          address: normalizedAddress,
-          variant,
-          requestUrl: requestUrl.toString(),
-          ok: false,
-          status: response.status,
-          statusText: response.statusText,
-          parsedCount: 0,
-          bodyPreview: body.slice(0, 400),
-        });
-        continue;
-      }
-
-      const payload = JSON.parse(body) as unknown;
-      const parsed = parseOpenGovPermitResults(payload, normalizedAddress);
-      attempts.push({
-        address: normalizedAddress,
-        variant,
-        requestUrl: requestUrl.toString(),
-        ok: true,
-        status: response.status,
-        statusText: response.statusText,
-        parsedCount: parsed.length,
-        bodyPreview: body.slice(0, 400),
-      });
-      for (const record of parsed) {
-        const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ""}`;
-        if (seen.has(key)) {
-          continue;
-        }
-
-        seen.add(key);
-        records.push(record);
-      }
-    } catch (error) {
-      attempts.push({
-        address: normalizedAddress,
-        variant,
-        requestUrl: requestUrl.toString(),
-        ok: false,
-        status: null,
-        statusText: null,
-        parsedCount: 0,
-        bodyPreview: "",
-        error: error instanceof Error ? error.message : "Unknown fetch error",
-      });
-      continue;
+async function fetchOpenGovPlceProbe(env: Env, path: string, searchParams?: Record<string, string>): Promise<OpenGovPlceProbeResult> {
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const url = new URL(`${OPENGOV_PLCE_BASE_URL}/v2/${community}/${path}`);
+  if (searchParams) {
+    for (const [key, value] of Object.entries(searchParams)) {
+      url.searchParams.set(key, value);
     }
   }
 
-  return { records, attempts };
-}
+  try {
+    const apiKey = env.OPENGOV_KEY?.trim();
+    if (!apiKey) {
+      return { test: path, recordType: null, path: `${path}${url.search}`, ok: false, status: 503, parsedCount: 0, error: 'OPENGOV_KEY is not configured.' };
+    }
 
-async function fetchOpenGovPermitRecordsForAddress(address: string, env?: Env): Promise<PermitRecord[]> {
-  const result = await queryOpenGovPermitRecordsForAddress(address, env);
-  return result.records;
+    const response = await fetch(url.toString(), {
+      headers: {
+        Authorization: `Token ${apiKey}`,
+        Accept: 'application/vnd.api+json',
+      },
+    });
+    const text = await response.text();
+    let parsedCount = 0;
+    let preview = '';
+    if (response.ok) {
+      try {
+        const payload = JSON.parse(text) as { data?: unknown };
+        parsedCount = Array.isArray(payload?.data) ? payload.data.length : 0;
+      } catch {
+        parsedCount = 0;
+      }
+    } else {
+      preview = text.slice(0, 240);
+    }
+
+    return {
+      test: path,
+      recordType: searchParams?.['filter[recordType]'] ?? null,
+      path: `${path}${url.search}`,
+      ok: response.ok,
+      status: response.status,
+      parsedCount,
+      responsePreview: preview || undefined,
+    };
+  } catch (error) {
+    return {
+      test: path,
+      recordType: searchParams?.['filter[recordType]'] ?? null,
+      path: `${path}${url.search}`,
+      ok: false,
+      status: 500,
+      parsedCount: 0,
+      error: error instanceof Error ? error.message : 'Unknown fetch error',
+    };
+  }
 }
 
 async function fetchPermitRecords(addresses: string[], env?: Env): Promise<PermitRecord[]> {
+  if (!env) return [];
   const records: PermitRecord[] = [];
   const seen = new Set<string>();
+  const uniqueAddresses = Array.from(new Set(addresses.map((value) => normalizeWhitespace(value)).filter(Boolean))).slice(0, 24);
 
-  for (const address of Array.from(new Set(addresses.map((value) => normalizeWhitespace(value)).filter(Boolean))).slice(0, 24)) {
-    const addressRecords = await fetchOpenGovPermitRecordsForAddress(address, env);
-    for (const record of addressRecords) {
-      const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ""}`;
-      if (seen.has(key)) {
-        continue;
+  for (const address of uniqueAddresses) {
+    for (const variant of buildOpenGovAddressVariants(address)) {
+      const payload = await fetchOpenGovPlceJson(env, 'records', {
+        'page[size]': '25',
+        'filter[search]': variant,
+      });
+      const parsed = parseOpenGovPermitResults(payload, address);
+      for (const record of parsed) {
+        const key = `${normalizeAddress(record.siteAddress)}|${record.permitType}|${record.issuedDate}|${record.permitNumber ?? ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        records.push(record);
       }
-
-      seen.add(key);
-      records.push(record);
+      if (parsed.length) {
+        break;
+      }
     }
   }
 
@@ -1249,24 +1206,43 @@ async function buildPermitDebugPayload(env?: Env, limit = 8) {
   const signals = await fetchAgendaSignals();
   const briefs = await buildCaseBriefs(signals);
   const addresses = Array.from(new Set(briefs.flatMap((brief) => brief.addresses).map((value) => normalizeWhitespace(value)).filter(Boolean))).slice(0, limit);
-  const searches = [];
 
+  const searches = [];
   for (const address of addresses) {
-    const result = await queryOpenGovPermitRecordsForAddress(address, env);
-    searches.push({
-      address,
-      recordCount: result.records.length,
-      records: result.records,
-      attempts: result.attempts,
-    });
+    const variants = buildOpenGovAddressVariants(address).slice(0, 3);
+    const attempts: OpenGovPlceProbeResult[] = [];
+    for (const variant of variants) {
+      attempts.push(await fetchOpenGovPlceProbe((env ?? {}) as Env, 'records', { 'page[size]': '10', 'filter[search]': variant }));
+    }
+    searches.push({ address, attempts });
   }
 
   return {
     searchedAddresses: addresses,
     addressCount: addresses.length,
-    hasTurnstileToken: Boolean(env?.OPENGOV_TURNSTILE_TOKEN),
-    source: DANVERS_OPENGOV_SEARCH_URL,
+    source: 'PLCE v2 records',
     searches,
+  };
+}
+
+async function buildOpenGovPermitsTestPayload(env: Env) {
+  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
+  const recordTypeGuesses = ['building-permit', 'electrical-permit', 'plumbing-permit', 'sign-permit'];
+  const checks: OpenGovPlceProbeResult[] = [];
+
+  checks.push(await fetchOpenGovPlceProbe(env, 'record-types'));
+  checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5' }));
+  checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', 'filter[search]': 'danvers' }));
+  for (const recordType of recordTypeGuesses) {
+    checks.push(await fetchOpenGovPlceProbe(env, 'records', { 'page[size]': '5', 'filter[recordType]': recordType }));
+  }
+
+  return {
+    ok: checks.every((check) => check.ok),
+    community,
+    recordTypesTested: recordTypeGuesses,
+    checks,
+    updatedAt: new Date().toISOString(),
   };
 }
 
@@ -2615,67 +2591,7 @@ function buildOpenGovErrorResponse(
 }
 
 async function buildOpenGovTestPayload(env: Env) {
-  const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
-  const configured = Boolean(env.OPENGOV_KEY);
-
-  if (!configured) {
-    return {
-      ok: false,
-      community,
-      configured,
-      checks: [
-        {
-          name: "api-key",
-          ok: false,
-          status: 503,
-          message: "PLCE v2 API key is not configured.",
-        },
-      ],
-      updatedAt: new Date().toISOString(),
-    };
-  }
-
-  const checks: Array<{
-    name: string;
-    ok: boolean;
-    status: number;
-    message: string;
-    details?: string;
-  }> = [];
-
-  for (const target of [
-    { name: "organization", path: "organization" },
-    { name: "record-types", path: "record-types" },
-  ]) {
-    try {
-      await fetchOpenGovPlceJson(env, target.path);
-      checks.push({
-        name: target.name,
-        ok: true,
-        status: 200,
-        message: `${target.name} request succeeded.`,
-      });
-    } catch (error) {
-      const known = error instanceof OpenGovApiError
-        ? error
-        : new OpenGovApiError(500, `${target.name} test failed.`);
-      checks.push({
-        name: target.name,
-        ok: false,
-        status: known.status,
-        message: known.message,
-        details: known.details || undefined,
-      });
-    }
-  }
-
-  return {
-    ok: checks.every((check) => check.ok),
-    community,
-    configured,
-    checks,
-    updatedAt: new Date().toISOString(),
-  };
+  return buildOpenGovPermitsTestPayload(env);
 }
 
 function buildOpportunityInputs(
@@ -3697,14 +3613,14 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
               <div>
                 <p class="eyebrow">OpenGov API Test</p>
                 <h3>PLCE v2 connectivity</h3>
-                <p>Use this panel to check OAuth, organization, and record-type access from the Worker.</p>
+                <p>Use this panel to check PLC authentication, record types, and records query access from the Worker.</p>
               </div>
               <button id="opengov-test-button" class="status-pill" type="button" style="border:0; cursor:pointer;">Run test</button>
             </div>
             <div id="opengov-test-summary" class="strategic-meta">Waiting to run OpenGov test.</div>
             <ul id="opengov-test-results" class="recommendation-list">
               <li class="recommendation-item">
-                <strong>OAuth</strong>
+                <strong>PLC</strong>
                 <p>No test has been run yet.</p>
               </li>
             </ul>
@@ -3857,10 +3773,10 @@ function renderDashboard(payload: DashboardPayload, nonce: string): string {
         }
 
         openGovTestSummary.textContent = "Running OpenGov PLCE v2 test through the Worker.";
-        openGovTestResults.innerHTML = '<li class="recommendation-item"><strong>Testing</strong><p>Checking OAuth, organization, and record-types.</p></li>';
+        openGovTestResults.innerHTML = '<li class="recommendation-item"><strong>Testing</strong><p>Checking PLC record-types and records queries.</p></li>';
 
         try {
-          const response = await fetch("/api/opengov/test", {
+          const response = await fetch("/api/opengov/permits-test", {
             headers: {
               accept: "application/json",
             },
@@ -4481,7 +4397,7 @@ export default {
         Response.json({
           permits,
           count: permits.length,
-          source: DANVERS_OPENGOV_SEARCH_URL,
+          source: "PLCE v2 records",
           updatedAt: new Date().toISOString(),
         }),
       );
@@ -4519,7 +4435,7 @@ export default {
       }
     }
 
-    if (request.method === "GET" && url.pathname === "/api/opengov/test") {
+    if (request.method === "GET" && url.pathname === "/api/opengov/permits-test") {
       return withSecurityHeaders(Response.json(await buildOpenGovTestPayload(env)));
     }
 
