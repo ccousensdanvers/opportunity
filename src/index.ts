@@ -1288,9 +1288,10 @@ async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenG
     ).values(),
   );
 
-  for (const location of uniqueLocations) {
-    await db
-      .prepare(
+  try {
+    for (const location of uniqueLocations) {
+      await db
+        .prepare(
         `INSERT INTO opengov_locations (
           id, location_type, street_no, street_name, city, state, postal_code, gis_id, mbl, mat_id, source_community, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1321,7 +1322,10 @@ async function upsertOpenGovLocations(db: D1Database, env: Env, locations: OpenG
         community,
         now,
       )
-      .run();
+        .run();
+    }
+  } catch {
+    return 0;
   }
 
   return uniqueLocations.length;
@@ -1337,10 +1341,11 @@ async function upsertOpenGovPermitRecords(
   const community = env.OPENGOV_COMMUNITY?.trim() || DEFAULT_OPENGOV_COMMUNITY;
   const now = new Date().toISOString();
   let written = 0;
-  for (const record of records) {
-    const recordKey = `${locationId}|${record.permitNumber ?? ""}|${record.permitType}|${record.issuedDate}|${normalizeAddress(record.siteAddress)}`;
-    await db
-      .prepare(
+  try {
+    for (const record of records) {
+      const recordKey = `${locationId}|${record.permitNumber ?? ""}|${record.permitType}|${record.issuedDate}|${normalizeAddress(record.siteAddress)}`;
+      await db
+        .prepare(
         `INSERT INTO opengov_permit_records (
           record_key, location_id, matched_address, site_address, permit_type, status, issued_date, permit_number, detail_url, applicant_name, source_community, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1371,8 +1376,11 @@ async function upsertOpenGovPermitRecords(
         community,
         now,
       )
-      .run();
-    written += 1;
+        .run();
+      written += 1;
+    }
+  } catch {
+    return written;
   }
   return written;
 }
@@ -1404,13 +1412,17 @@ async function ingestOpenGovLocationsAndPermitsForBriefs(db: D1Database, env: En
 }
 
 async function listStoredPermitRecords(db: D1Database, limit = 50): Promise<PermitRecord[]> {
-  const rows = await db.prepare(
-    `SELECT applicant_name AS applicantName, site_address AS siteAddress, permit_type AS permitType, status, issued_date AS issuedDate, permit_number AS permitNumber, detail_url AS detailUrl
-     FROM opengov_permit_records
-     ORDER BY updated_at DESC
-     LIMIT ?`,
-  ).bind(limit).all<PermitRecord>();
-  return (rows.results ?? []).map((row) => ({ ...row, source: "OpenGov PLCE records API (stored)" }));
+  try {
+    const rows = await db.prepare(
+      `SELECT applicant_name AS applicantName, site_address AS siteAddress, permit_type AS permitType, status, issued_date AS issuedDate, permit_number AS permitNumber, detail_url AS detailUrl
+       FROM opengov_permit_records
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+    ).bind(limit).all<PermitRecord>();
+    return (rows.results ?? []).map((row) => ({ ...row, source: "OpenGov PLCE records API (stored)" }));
+  } catch {
+    return [];
+  }
 }
 
 function matchOpenGovLocationForAddress(
@@ -3006,7 +3018,11 @@ async function runAutomaticIngest(db: D1Database, env: Env): Promise<IngestRunSu
   const opportunities = buildOpportunityInputs(briefs, parcels);
   const results = await matchAndPersistOpportunities(db, opportunities);
   if (env.OPENGOV_KEY?.trim()) {
-    await ingestOpenGovLocationsAndPermitsForBriefs(db, env, briefs);
+    try {
+      await ingestOpenGovLocationsAndPermitsForBriefs(db, env, briefs);
+    } catch {
+      // keep ingest operational if OpenGov persistence tables are not migrated yet
+    }
   }
 
   return {
