@@ -1243,52 +1243,73 @@ function normalizeOpenGovLocation(candidate: Record<string, unknown>): OpenGovLo
       ? candidate.attributes
       : {}
   ) as Record<string, unknown>;
+  const readString = (...keys: string[]): string | null => {
+    for (const key of keys) {
+      const value = coerceOptionalString(attributes[key]);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+  const readNumber = (...keys: string[]): number | null => {
+    for (const key of keys) {
+      const value = coerceOptionalNumber(attributes[key]);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+  const readBoolean = (...keys: string[]): boolean | null => {
+    for (const key of keys) {
+      const value = coerceOptionalBoolean(attributes[key]);
+      if (value !== null) return value;
+    }
+    return null;
+  };
 
   return {
     id: coerceOptionalString(candidate.id),
     type: coerceOptionalString(candidate.type),
-    name: coerceOptionalString(attributes.name),
-    latitude: coerceOptionalNumber(attributes.latitude),
-    longitude: coerceOptionalNumber(attributes.longitude),
-    locationType: coerceOptionalString(attributes.locationType),
-    ownerName: coerceOptionalString(attributes.ownerName),
-    ownerStreetNumber: coerceOptionalString(attributes.ownerStreetNumber),
-    ownerStreetName: coerceOptionalString(attributes.ownerStreetName),
-    ownerUnit: coerceOptionalString(attributes.ownerUnit),
-    ownerCity: coerceOptionalString(attributes.ownerCity),
-    ownerState: coerceOptionalString(attributes.ownerState),
-    ownerPostalCode: coerceOptionalString(attributes.ownerPostalCode),
-    ownerCountry: coerceOptionalString(attributes.ownerCountry),
-    ownerEmail: coerceOptionalString(attributes.ownerEmail),
-    streetNo: coerceOptionalString(attributes.streetNo),
-    streetName: coerceOptionalString(attributes.streetName),
-    unit: coerceOptionalString(attributes.unit),
-    city: coerceOptionalString(attributes.city),
-    state: coerceOptionalString(attributes.state),
-    postalCode: coerceOptionalString(attributes.postalCode),
-    country: coerceOptionalString(attributes.country),
-    secondaryLatitude: coerceOptionalNumber(attributes.secondaryLatitude),
-    secondaryLongitude: coerceOptionalNumber(attributes.secondaryLongitude),
-    segmentPrimaryLabel: coerceOptionalString(attributes.segmentPrimaryLabel),
-    segmentSecondaryLabel: coerceOptionalString(attributes.segmentSecondaryLabel),
-    segmentLabel: coerceOptionalString(attributes.segmentLabel),
-    segmentLength: coerceOptionalNumber(attributes.segmentLength),
-    ownerPhoneNo: coerceOptionalString(attributes.ownerPhoneNo),
-    lotArea: coerceOptionalNumber(attributes.lotArea),
-    gisID: coerceOptionalString(attributes.gisID),
-    mbl: coerceOptionalString(attributes.mbl),
-    matID: coerceOptionalString(attributes.matID),
-    occupancyType: coerceOptionalString(attributes.occupancyType),
-    propertyUse: coerceOptionalString(attributes.propertyUse),
-    sewage: coerceOptionalString(attributes.sewage),
-    water: coerceOptionalString(attributes.water),
-    yearBuilt: coerceOptionalNumber(attributes.yearBuilt),
-    zoning: coerceOptionalString(attributes.zoning),
-    buildingType: coerceOptionalString(attributes.buildingType),
-    notes: coerceOptionalString(attributes.notes),
-    subdivision: coerceOptionalString(attributes.subdivision),
-    archived: coerceOptionalBoolean(attributes.archived),
-    sourceUpdatedAt: coerceOptionalString(attributes.updatedAt),
+    name: readString("name"),
+    latitude: readNumber("latitude"),
+    longitude: readNumber("longitude"),
+    locationType: readString("locationType", "location_type"),
+    ownerName: readString("ownerName", "owner_name"),
+    ownerStreetNumber: readString("ownerStreetNumber", "owner_street_number"),
+    ownerStreetName: readString("ownerStreetName", "owner_street_name"),
+    ownerUnit: readString("ownerUnit", "owner_unit"),
+    ownerCity: readString("ownerCity", "owner_city"),
+    ownerState: readString("ownerState", "owner_state"),
+    ownerPostalCode: readString("ownerPostalCode", "owner_postal_code"),
+    ownerCountry: readString("ownerCountry", "owner_country"),
+    ownerEmail: readString("ownerEmail", "owner_email"),
+    streetNo: readString("streetNo", "street_no"),
+    streetName: readString("streetName", "street_name"),
+    unit: readString("unit"),
+    city: readString("city"),
+    state: readString("state"),
+    postalCode: readString("postalCode", "postal_code"),
+    country: readString("country"),
+    secondaryLatitude: readNumber("secondaryLatitude", "secondary_latitude"),
+    secondaryLongitude: readNumber("secondaryLongitude", "secondary_longitude"),
+    segmentPrimaryLabel: readString("segmentPrimaryLabel", "segment_primary_label"),
+    segmentSecondaryLabel: readString("segmentSecondaryLabel", "segment_secondary_label"),
+    segmentLabel: readString("segmentLabel", "segment_label"),
+    segmentLength: readNumber("segmentLength", "segment_length"),
+    ownerPhoneNo: readString("ownerPhoneNo", "owner_phone_no"),
+    lotArea: readNumber("lotArea", "lot_area"),
+    gisID: readString("gisID", "gis_id"),
+    mbl: readString("mbl"),
+    matID: readString("matID", "mat_id"),
+    occupancyType: readString("occupancyType", "occupancy_type"),
+    propertyUse: readString("propertyUse", "property_use"),
+    sewage: readString("sewage"),
+    water: readString("water"),
+    yearBuilt: readNumber("yearBuilt", "year_built"),
+    zoning: readString("zoning"),
+    buildingType: readString("buildingType", "building_type"),
+    notes: readString("notes"),
+    subdivision: readString("subdivision"),
+    archived: readBoolean("archived"),
+    sourceUpdatedAt: readString("updatedAt", "updated_at"),
   };
 }
 
